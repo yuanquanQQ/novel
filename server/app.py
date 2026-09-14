@@ -13,12 +13,17 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from engine.settings import NOVELS_DIR, load_config  # noqa: E402
-from engine.novel_creator import NovelCreationError, create_novel  # noqa: E402
+from engine.novel_creator import (  # noqa: E402
+    NovelCreationError,
+    _resolve_model_env,
+    create_novel,
+)
 from engine.theme_generator import (  # noqa: E402
     ThemeConfigurationError,
     ThemeGenerationError,
     generate_themes,
 )
+from engine import model_config  # noqa: E402
 from engine.db import NovelDB  # noqa: E402
 from engine.style_kit import scanner  # noqa: E402
 from server import tasks as T  # noqa: E402
@@ -96,18 +101,74 @@ class CreateNovelBody(BaseModel):
     words_per_chapter: int = 3000
     genre: str = ""
     description: str = ""
+    model: dict | None = None
 
 
 @app.post("/api/novels", status_code=201)
 def api_create_novel(body: CreateNovelBody):
     try:
+        model_env = _resolve_model_env(body.model)
         path = create_novel(body.id, body.title, body.chapter_count,
-                            body.words_per_chapter, body.genre, body.description)
+                            body.words_per_chapter, body.genre, body.description,
+                            model_env=model_env)
     except FileExistsError as exc:
         raise HTTPException(409, str(exc))
-    except (NovelCreationError, ValueError) as exc:
+    except (NovelCreationError, model_config.ModelConfigError, ValueError) as exc:
         raise HTTPException(400, str(exc))
-    return {"id": body.id, "title": body.title, "path": str(path)}
+    return {"id": body.id, "title": body.title, "path": str(path),
+            "model_configured": sorted(model_env) if model_env else []}
+
+
+class ModelConfigBody(BaseModel):
+    api_key: str | None = None
+    base_url: str | None = None
+    theme_model: str | None = None
+    models: dict[str, str] | None = None      # {env或attr: 模型名}
+    quick: dict | None = None                 # {chat_model, reasoner_model}
+
+
+@app.get("/api/novels/{name}/model-config")
+def api_model_config_get(name: str):
+    novel_dir(name)
+    try:
+        return model_config.get_view(name)
+    except Exception as exc:
+        raise HTTPException(500, f"读取配置失败: {exc}")
+
+
+@app.put("/api/novels/{name}/model-config")
+def api_model_config_put(name: str, body: ModelConfigBody):
+    novel_dir(name)
+    explicit = {k: v for k, v in {
+        "API_KEY": body.api_key, "API_BASE_URL": body.base_url,
+        "THEME_MODEL": body.theme_model,
+    }.items() if v}
+    try:
+        updates = model_config.expand_quick(body.quick)
+        if body.models:
+            updates.update(model_config.sanitize_input(body.models))
+        updates.update(model_config.sanitize_input(
+            {k: v for k, v in explicit.items()}))
+        result = model_config.save(name, updates)
+    except model_config.ModelConfigError as exc:
+        raise HTTPException(400, str(exc))
+    except Exception as exc:
+        raise HTTPException(500, f"保存失败: {exc}")
+    return result
+
+
+@app.post("/api/novels/{name}/model-config/test")
+def api_model_config_test(name: str, body: dict):
+    novel_dir(name)
+    model = body.get("model") or model_config.read_env_file(
+        model_config.env_path(novel_dir(name))).get("WRITER_MODEL") or "deepseek-chat"
+    try:
+        return model_config.test_connection(
+            novel_dir(name), model,
+            api_key=(body.get("api_key") or "").strip(),
+            base_url=(body.get("base_url") or "").strip())
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)[:300]}
 
 
 @app.get("/api/novels/{name}/status")
@@ -538,9 +599,119 @@ def api_style_doc(doc: str):
     return PlainTextResponse(fp.read_text(encoding="utf-8"))
 
 
+# ----------------------------------------------------------------- pipeline
+def _volume_of(cfg, chapter: int):
+    for vk, v in cfg.volume_config.items():
+        lo, hi = v["chapters"]
+        if lo <= chapter <= hi:
+            return vk, dict(v, key=vk)
+    last_key = list(cfg.volume_config)[-1]
+    return last_key, dict(cfg.volume_config[last_key], key=last_key)
+
+
+@app.get("/api/novels/{name}/pipeline")
+def api_pipeline(name: str):
+    """返回生产流水线状态：每个环节的完成判定 + 建议的下一步。"""
+    d = novel_dir(name)
+    cfg = load_config(name)
+    b = d / "bible"
+    gen = d / "generated"
+
+    written = []
+    for fp in (gen.glob("chapter_*.md")):
+        m = re.fullmatch(r"chapter_(\d+)\.md", fp.name)
+        if m:
+            written.append(int(m.group(1)))
+    written = sorted(set(written))
+    missing = [c for c in range(1, (written[-1] + 1) if written else 1) if c not in written]
+
+    outline_fp = b / "outline.md"
+    outline_text = outline_fp.read_text(encoding="utf-8") if outline_fp.exists() else ""
+    outline_chapters = len(set(re.findall(r"第(\d+)章", outline_text))) if outline_text else 0
+
+    titles_ready, titles_total, titles_auto = False, 0, 0
+    tf = b / "chapter_titles.json"
+    if tf.exists():
+        try:
+            td = json.loads(tf.read_text(encoding="utf-8"))
+            for v in td.get("volumes", {}).values():
+                for t in v.get("chapters", {}).values():
+                    titles_total += 1
+                    if re.fullmatch(r"第?\d+章", str(t)):
+                        titles_auto += 1
+            titles_ready = titles_total > 0
+        except Exception:
+            pass
+
+    next_chapter = (written[-1] + 1) if written else 1
+    while next_chapter <= cfg.chapter_count and next_chapter in written:
+        next_chapter += 1
+    gaps = [c for c in range(1, min(next_chapter, cfg.chapter_count + 1))
+            if c not in written]
+    if gaps:
+        next_chapter = gaps[0]
+    missing = gaps
+    vol_key, vol = _volume_of(cfg, min(next_chapter, cfg.chapter_count))
+    lo, hi = vol["chapters"]
+
+    # 待总结的卷 = 章节全部写完 但 summary 文件不存在
+    pending_summaries = []
+    for vk, v in cfg.volume_config.items():
+        vlo, vhi = v["chapters"]
+        vdone = len([c for c in written if vlo <= c <= vhi])
+        vnum = vk.rsplit("_", 1)[-1]
+        has_summary = (gen / f"volume_{vnum}_summary.md").exists()
+        if vdone >= (vhi - vlo + 1) and vdone > 0 and not has_summary:
+            pending_summaries.append({"key": vk, "num": int(vnum), "name": v["name"]})
+    vol_done = len([c for c in written if lo <= c <= hi])
+
+    if not outline_text:
+        stage = "outline"
+    elif not titles_ready:
+        stage = "titles"
+    elif missing:
+        stage = "fill_gaps"
+    elif pending_summaries:
+        stage = "volume_summary"
+    elif next_chapter > cfg.chapter_count:
+        stage = "publish"
+    else:
+        stage = "write"
+
+    target_summary = pending_summaries[0] if pending_summaries else None
+    steps = [
+        {"key": "outline", "title": "① 生成全书大纲", "file": "bible/outline.md",
+         "done": bool(outline_text), "detected": outline_chapters,
+         "unit": "章条目", "available": True},
+        {"key": "titles", "title": "② 提取章名库", "file": "bible/chapter_titles.json",
+         "done": titles_ready, "detected": titles_total, "auto_named": titles_auto,
+         "unit": "章名", "available": bool(outline_text)},
+        {"key": "write", "title": f"③ 逐章写作 · {vol['name']}", "file": "generated/",
+         "done": next_chapter > cfg.chapter_count, "detected": len(written),
+         "unit": f"/ {cfg.chapter_count} 章", "available": titles_ready,
+         "detail": {"volume": vol["name"], "range": [lo, hi], "volume_done": vol_done,
+                    "volume_total": hi - lo + 1, "next_chapter": next_chapter,
+                    "missing": missing[:20]}},
+        {"key": "summary",
+         "title": f"④ 卷末总结 · {target_summary['name'] if target_summary else '按卷收尾'}",
+         "file": (f"generated/volume_{target_summary['num']}_summary.md"
+                  if target_summary else "generated/volume_N_summary.md"),
+         "done": not pending_summaries and bool(written),
+         "pending": pending_summaries, "unit": "",
+         "available": bool(pending_summaries)},
+        {"key": "publish", "title": "⑤ 发布与宣传", "file": "",
+         "done": next_chapter > cfg.chapter_count and not pending_summaries, "unit": "",
+         "available": True},
+    ]
+    return {"stage": stage, "steps": steps, "next_chapter": next_chapter,
+            "written": written[-1] if written else 0, "written_count": len(written),
+            "chapter_count": cfg.chapter_count, "current_volume": vol_key}
+
+
 # -------------------------------------------------------------------- tasks
 class TaskBody(BaseModel):
     chapter: int | None = None
+    chapter_end: int | None = None
     volume: int | None = None
     prompt: str = ""
 
@@ -559,10 +730,24 @@ async def api_task(name: str, action: str, body: TaskBody):
     if action not in ALLOWED:
         raise HTTPException(400, f"不支持: {action}")
     args: list[str] = []
+    steps = None
     if action == "generate":
         if body.chapter is None or body.chapter <= 0:
             raise HTTPException(400, "chapter 必须为正数")
-        args = [str(body.chapter)] + (["-p", body.prompt] if body.prompt else [])
+        cfg = load_config(name)
+        start = body.chapter
+        end = body.chapter_end or start
+        if end < start:
+            raise HTTPException(400, "chapter_end 不能小于 chapter")
+        if end > cfg.chapter_count:
+            raise HTTPException(400, f"超出本章总数 {cfg.chapter_count}")
+        if end - start + 1 > 20:
+            raise HTTPException(422, "单次批量最多连续 20 章，成本高且便于中断")
+        if end > start:
+            steps = [{"action": "generate",
+                      "args": [str(n)] + (["-p", body.prompt] if body.prompt else [])}
+                     for n in range(start, end + 1)]
+        args = [str(start)] + (["-p", body.prompt] if body.prompt else [])
     elif action == "revise":
         if body.chapter is None or body.chapter <= 0 or not body.prompt:
             raise HTTPException(400, "chapter 必须为正数且 prompt 不能为空")
@@ -580,10 +765,10 @@ async def api_task(name: str, action: str, body: TaskBody):
     if T.running_task(name):
         raise HTTPException(409, "该小说已有任务运行中")
     try:
-        tid = T.submit(name, action, args)
+        tid = T.submit(name, action, args) if steps is None else T.submit(name, action, args, steps=steps)
     except T.BusyError as e:
         raise HTTPException(409, str(e))
-    return {"task_id": tid}
+    return {"task_id": tid, "steps": len(steps or [1])}
 
 
 @app.get("/api/tasks/{tid}/events")

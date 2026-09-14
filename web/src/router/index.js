@@ -6,6 +6,7 @@ const routes = [
   { path: '/novels/:name/chapters', name: 'chapters', component: () => import('../views/Chapters.vue'), meta: { title: '章节' } },
   { path: '/novels/:name/console', name: 'console', component: () => import('../views/Console.vue'), meta: { title: '生成控制台' } },
   { path: '/novels/:name/bible', name: 'bible', component: () => import('../views/Bible.vue'), meta: { title: '知识库' } },
+  { path: '/novels/:name/model', name: 'model', component: () => import('../views/ModelConfig.vue'), meta: { title: '模型配置' } },
   { path: '/style', name: 'style', component: () => import('../views/StyleKit.vue'), meta: { title: '风格工坊' } },
 ]
 

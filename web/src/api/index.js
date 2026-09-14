@@ -41,6 +41,11 @@ export const api = {
 
   tasks: (n) => http.get(`/novels/${n}/tasks`).then(r => r.data),
   runTask: (n, action, body) => http.post(`/novels/${n}/tasks/${action}`, body).then(r => r.data),
+
+  pipeline: (n) => http.get(`/novels/${n}/pipeline`).then(r => r.data),
+  modelConfig: (n) => http.get(`/novels/${n}/model-config`).then(r => r.data),
+  saveModelConfig: (n, body) => http.put(`/novels/${n}/model-config`, body).then(r => r.data),
+  testModelConfig: (n, body) => http.post(`/novels/${n}/model-config/test`, body).then(r => r.data),
 }
 
 export function taskEventSource(tid) {

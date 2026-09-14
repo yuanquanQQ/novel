@@ -21,6 +21,7 @@
           <el-menu-item index="chapters" :route="novelRoute('chapters')"><el-icon><Document /></el-icon><span>章节</span></el-menu-item>
           <el-menu-item index="console" :route="novelRoute('console')"><el-icon><VideoPlay /></el-icon><span>生成控制台</span></el-menu-item>
           <el-menu-item index="bible" :route="novelRoute('bible')"><el-icon><Collection /></el-icon><span>知识库</span></el-menu-item>
+          <el-menu-item index="model" :route="novelRoute('model')"><el-icon><Cpu /></el-icon><span>模型配置</span></el-menu-item>
         </template>
         <el-menu-item index="style" :route="{ name: 'style' }"><el-icon><MagicStick /></el-icon><span>风格工坊</span></el-menu-item>
       </el-menu>
@@ -73,6 +74,24 @@
       </div>
       <el-form-item label="类型" prop="genre"><el-input v-model="form.genre" placeholder="如：都市悬疑、奇幻冒险" /></el-form-item>
       <el-form-item label="故事简介" prop="description"><el-input v-model="form.description" type="textarea" :rows="4" placeholder="简要描述故事背景、人物与核心冲突" /></el-form-item>
+
+      <el-collapse v-model="createPanels" class="model-collapse">
+        <el-collapse-item name="model">
+          <template #title><span class="collapse-title"><el-icon><Cpu /></el-icon> 模型配置（可选）<span class="muted">　不填则用系统环境变量 / 默认 DeepSeek，创建后可在「模型配置」页修改</span></span></template>
+          <div class="model-grid">
+            <el-form-item label="API Key"><el-input v-model="modelForm.api_key" type="password" show-password placeholder="sk-…（仅存本书 .env，不进 git）" /></el-form-item>
+            <el-form-item label="Base URL"><el-input v-model="modelForm.base_url" placeholder="https://api.deepseek.com/v1" /></el-form-item>
+            <el-form-item label="创作/对话模型"><el-input v-model="modelForm.chat_model" placeholder="deepseek-chat" /></el-form-item>
+            <el-form-item label="推理/审阅模型"><el-input v-model="modelForm.reasoner_model" placeholder="deepseek-reasoner" /></el-form-item>
+          </div>
+          <details class="adv-models">
+            <summary>逐 Agent 精确覆盖（一般不用）</summary>
+            <div class="adv-grid">
+              <el-input v-for="role in AGENT_ROLES" :key="role.env" v-model="modelForm.models[role.env]" size="small" :placeholder="`${role.label} · ${role.default}`"><template #prepend>{{ role.env }}</template></el-input>
+            </div>
+          </details>
+        </el-collapse-item>
+      </el-collapse>
     </el-form>
     <template #footer>
       <el-button @click="createVisible = false">取消</el-button>
@@ -98,6 +117,21 @@ const themeOptions = ref([])
 const themeRequest = reactive({ inspiration: '', genre: '' })
 const createFormRef = ref(null)
 const form = reactive({ id: '', title: '', chapter_count: 200, words_per_chapter: 3000, genre: '', description: '' })
+const createPanels = ref([])
+const AGENT_ROLES = [
+  { env: 'PLANNER_MODEL', label: '规划', default: 'deepseek-reasoner' },
+  { env: 'RESEARCHER_MODEL', label: '检索', default: 'deepseek-reasoner' },
+  { env: 'WRITER_MODEL', label: '写作', default: 'deepseek-chat' },
+  { env: 'IMMEDIATE_REVIEWER_MODEL', label: '即审', default: 'deepseek-chat' },
+  { env: 'HEAVY_REVIEWER_MODEL', label: '重审', default: 'deepseek-reasoner' },
+  { env: 'KEEPER_MODEL', label: '记忆', default: 'deepseek-chat' },
+  { env: 'ARCHIVIST_MODEL', label: '归档', default: 'deepseek-chat' },
+  { env: 'FORESHADOWING_STEWARD_MODEL', label: '伏笔', default: 'deepseek-reasoner' },
+  { env: 'READER_PROXY_MODEL', label: '读者', default: 'deepseek-chat' },
+  { env: 'MARKETER_MODEL', label: '宣传', default: 'deepseek-chat' },
+]
+const emptyModelForm = () => ({ api_key: '', base_url: '', chat_model: '', reasoner_model: '', models: {} })
+const modelForm = reactive(emptyModelForm())
 const rules = {
   id: [
     { required: true, message: '请输入小说 ID', trigger: 'blur' },
@@ -125,6 +159,8 @@ onMounted(async () => {
 
 function openCreate() {
   Object.assign(form, { id: '', title: '', chapter_count: 200, words_per_chapter: 3000, genre: '', description: '' })
+  Object.assign(modelForm, emptyModelForm())
+  createPanels.value = []
   Object.assign(themeRequest, { inspiration: '', genre: '' })
   themeOptions.value = []
   themeError.value = ''
@@ -169,7 +205,17 @@ async function submitCreate() {
   try {
     await createFormRef.value.validate()
     creating.value = true
-    const created = await api.createNovel({ ...form })
+    const quick = {}
+    if (modelForm.api_key) quick.api_key = modelForm.api_key
+    if (modelForm.base_url) quick.base_url = modelForm.base_url
+    if (modelForm.chat_model) quick.chat_model = modelForm.chat_model
+    if (modelForm.reasoner_model) quick.reasoner_model = modelForm.reasoner_model
+    const models = {}
+    for (const [k, v] of Object.entries(modelForm.models)) if (v) models[k] = v
+    const model = (Object.keys(quick).length || Object.keys(models).length)
+      ? { quick: Object.keys(quick).length ? quick : undefined, models: Object.keys(models).length ? models : undefined }
+      : undefined
+    const created = await api.createNovel({ ...form, model })
     await novelStore.reload(created.id)
     createVisible.value = false
     await router.push({ name: 'dashboard' })
@@ -218,6 +264,14 @@ async function submitCreate() {
 .theme-card-action { display: flex; align-items: center; gap: 4px; margin-top: auto; padding-top: 3px; color: var(--primary); font-size: 12px; }
 .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0 16px; }
 .form-grid :deep(.el-input-number) { width: 100%; }
+.model-collapse { margin-top: 4px; border-top-color: var(--border-light); }
+.model-collapse :deep(.el-collapse-item__header) { height: 44px; color: var(--text); font-weight: 600; }
+.collapse-title { display: inline-flex; align-items: center; gap: 6px; font-size: 14px; }
+.model-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0 20px; margin-top: 10px; }
+.adv-models { margin: 10px 0 18px; color: var(--muted); font-size: 13px; }
+.adv-models summary { cursor: pointer; color: var(--primary); margin-bottom: 10px; }
+.adv-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.adv-grid :deep(.el-input-group__prepend) { background: var(--surface-soft); font-family: var(--mono); font-size: 11px; padding: 0 10px; }
 .field-tip { margin-top: 5px; color: var(--muted); font-size: 12px; line-height: 1.4; }
 @media (max-width: 760px) {
   .app-shell { display: block; }
@@ -230,7 +284,7 @@ async function submitCreate() {
   .side :deep(.el-menu) { display: flex; overflow-x: auto; padding: 4px 8px 8px; }
   .side :deep(.el-menu-item) { flex: 0 0 auto; padding: 0 13px; }
   .side-footer { display: none; }
-  .theme-inputs, .theme-cards, .form-grid { grid-template-columns: 1fr; }
+  .theme-inputs, .theme-cards, .form-grid, .model-grid, .adv-grid { grid-template-columns: 1fr; }
   .theme-heading { align-items: flex-start; }
 }
 </style>

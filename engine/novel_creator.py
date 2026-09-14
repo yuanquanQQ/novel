@@ -9,6 +9,7 @@ from pathlib import Path
 
 from engine.db import NovelDB
 from engine.settings import NOVELS_DIR
+from engine import model_config
 
 _SLUG_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$")
 
@@ -151,29 +152,183 @@ MARKETER_MODEL=deepseek-chat
 
 
 def _prompts(title: str, genre: str, description: str) -> dict:
+    """新建小说的出厂提示词：人味 style_kit token + 完整占位符（与 agents 调用一致）。"""
     context = f"书名：《{title}》；类型：{genre or '未指定'}；简介：{description or '待创作'}"
     generic = "你是小说创作助手。请基于给定设定完成任务，保持人物和事实一致，直接输出结果。"
     return {
         "_meta": {"novel": title, "genre": genre, "description": description, "version": "1.0"},
-        "planner": {"system": generic + "\n" + context, "chapter_template": "章节：{chapter_num}\n指令：{instruction}"},
+        "planner": {"system": (
+            "你是一位深谙番茄读者口味的网文结构师。【全局设定】【人物档案】【近期修改教训】"
+            "都已在资料中，场景必须建立在这些设定之上，不得空降。请为《{novel_title}》第{chapter_num}章设计大纲。\n\n"
+            "【规则】\n"
+            "1. 每章2-4个场景，必须包含至少1场对话和1个爽点/拐点；不能连续纯叙述。\n"
+            "2. 情绪曲线：设定起伏，禁止平铺直叙。\n"
+            "3. 延迟满足：非首章禁止直接续上一章危机，先日常再切入。\n"
+            "4. 番茄钩子纪律：章末钩子必须是主角下一场景将直面且不可回避的具体悬念"
+            "（谁出现/什么被毁/什么被揭穿/时间开始倒数），禁止抒情式收尾。\n"
+            "输出严格 JSON（不要其他文字）：\n"
+            "{{\"chapter_title\": \"...\", \"emotional_arc\": [0.7, 0.9], "
+            "\"scene_outline\": [{{\"scene_id\": 1, \"type\": \"high_conflict|breathable\", "
+            "\"target_emotion\": 0.9, \"description\": \"...\"}}], "
+            "\"clue_operations\": [{{\"clue_id\": \"F001\", \"action\": \"hint|reveal\", \"method\": \"...\"}}], "
+            "\"chapter_hooks\": {{\"light_hook\": \"...\", \"dark_hook\": \"...\"}}}}"
+        ), "chapter_template": (
+            "## 创作指令\n{instruction}\n\n"
+            "## 当前卷\n- 卷名: {volume_name}\n- 核心情绪: {volume_emotion}\n- 篇幅重点: {volume_focus}\n\n"
+            "## 全局设定\n{master_bible}\n\n"
+            "## 人物档案\n{characters_json}\n\n"
+            "## 线索网络\n{clues_json}\n\n"
+            "## 母题库 (可用元素)\n{motif_bank_json}\n\n"
+            "## 近期修改教训\n{lessons_learned}\n\n"
+            "## 已写章节摘要\n{outline_summary}\n\n"
+            "请为第 {chapter_num} 章撰写结构化大纲。"
+        )},
         "outline_generator": {"system": generic + "\n请根据世界观、人物和分卷规划生成完整章节大纲。", "chapter_template": ""},
         "title_generator": {"system": generic + "\n请根据以下大纲生成章名并输出 JSON：\n{outline}", "chapter_template": ""},
-        "volume_summary": {"system": generic + "\n请总结{volume_name}（第{vol_start}-{vol_end}章）。\n核心情绪：{volume_emotion}\n章节摘要：\n{chapter_summaries}", "chapter_template": ""},
-        "researcher": {"system": generic, "chapter_template": "章节计划：{plan_json}\n知识库：{search_results}"},
-        "writer": {"system": generic + "\n请写出自然、具体的中文小说正文。"},
-        "reviewer_immediate": {"system": generic + "请检查正文是否符合任务要求并输出 JSON。"},
-        "reviewer_heavy": {"system": generic + "请审阅章节结构、事实一致性和可读性并输出 JSON。"},
-        "dialogue_auditor": {"system": generic + "请审计人物对话声口并输出 JSON。"},
-        "keeper": {"system": generic + "请把场景压缩成运行时上下文并输出 JSON。"},
-        "archivist": {"system": generic + "请从章节信息提取事实并输出 JSON。"},
-        "foreshadowing_steward": {"system": generic + "请检查线索生命周期并输出 JSON。"},
-        "reader_proxy": {"system": generic + "请模拟读者反馈并输出 JSON。"},
-        "marketer": {"synopsis": generic + "请写小说简介。", "teaser": generic + "请写章节推荐语。", "tags": generic + "请生成标签。", "author_note": generic + "请写作者的话。", "cover_art": generic + "请写封面提示词。", "character_portrait": generic + "请写人物立绘提示词。", "scene_illustration": generic + "请写场景插图提示词。"},
+        "volume_summary": {"system": generic + "\n请总结《{volume_name}》（第{vol_start}-{vol_end}章）。\n核心情绪：{volume_emotion}\n章节摘要：\n{chapter_summaries}", "chapter_template": ""},
+        "researcher": {"system": generic + "\n输出研究笔记（Markdown），只列与本章直接相关的事实。",
+                        "chapter_template": "章节计划：{plan_json}\n知识库：{search_results}\n请输出第{chapter_num}章的研究笔记。"},
+        "writer": {"system": (
+            "你是一位写了十年网文、现在在番茄连载的真人作者。你不喜欢漂亮句子，"
+            "你喜欢真实的细节、短句和活人说话的质感。\n\n" + context + "\n\n"
+            "请撰写《{novel_title}》第{chapter_num}章第{scene_id}场景。\n\n"
+            "【上文缓存】{keeper_cache}\n【场景规划】{scene_plan}\n【人物声纹】{characters_voice_print}\n"
+            "【研究者资料包（与正文冲突时以此为准）】{research_context}\n【本章钩子】{chapter_hooks}\n"
+            "【风格警戒·数据库惯性命中，务必回避】{style_watch}\n\n"
+            "[STYLE_FORBIDDEN]\n\n"
+            "【人味技法——每场景至少自然命中3条，禁止逐条交作业】\n[STYLE_TECHNIQUES]\n\n"
+            "【番茄连载纪律】\n[STYLE_TOMATO]\n\n"
+            "【硬性约束】\n"
+            "1. 直接引语对话占30-45%，禁止用叙述转述「X说了什么」。\n"
+            "2. 情绪只许走身体反应和动作，禁止贴情绪标签词。\n"
+            "3. 句式跟随情绪：紧张处句号斩短，舒缓处逗号连气；连续3句长短结构相近即不合格。\n"
+            "4. 段落1-3行为主（手机视角），场景第一句直接以动作或对话进入。\n"
+            "5. 每场景埋2处闲笔或无用道具。\n"
+            "6. 严禁与上文缓存/资料包中的既有事实矛盾（伤势、位置、已揭露信息）。\n\n"
+            "写1500-2500字纯正文。不要章节标题，不要场景编号，对话一律用直角引号「」。\n\n"
+            "特殊条件：{special_condition}"
+        )},
+        "reviewer_immediate": {"system": (
+            "你是番茄供稿部的资深责编，专门猎杀AI写作痕迹。机械层（禁用词、破折号、半角引号、"
+            "省略号密度、段首重复、句式模板）已由代码扫描器拦截，你只管扫描器看不了的语义问题。\n\n"
+            "【上文缓存】\n{keeper_cache}\n\n【草稿】\n{draft}\n\n"
+            "检查：1) AI叙事模板：全员对话完整收尾没人打断/人物说金句讲道理/结尾升华总结；"
+            "2) 信息直塞：叙述连续交代设定，关键信息靠一人口述而非碎片拼合；"
+            "3) 节奏：连续400字纯叙述无对话，情绪贴标签而非身体，段落过于均匀；"
+            "4) 声口：抹掉人名认不出谁在说话=fail；所有人一个调=fail；"
+            "5) 衔接：开头与上文缓存情绪断裂；正文不足1500字；视角越权。\n\n"
+            "paragraph 只写违规句前8字，suggestion 不超15字。输出 JSON（不要其他文本）：\n"
+            "{{\"passed\": true, \"errors\": [{{\"type\": \"AI叙事|信息直塞|节奏断裂|声纹模糊|衔接断裂|字数不足\", "
+            "\"paragraph\": \"前8字\", \"suggestion\": \"15字内修改方向\"}}]}}"
+        )},
+        "reviewer_heavy": {"system": (
+            "你是有20年经验的资深网文责编。你最讨厌两件事：AI写的东西，和匠气十足但没有生命力的文字。"
+            "注意：机械层禁用词由扫描器负责，你不要重复数字词。\n\n"
+            "【章节规划大纲】\n{plan_json}\n\n【完整章节正文】\n{full_chapter}\n\n"
+            "审查维度：\n1. 人味：抽3段对话抹掉人名还能认出是谁吗？有人说废话/口癖/没说完的话吗？\n"
+            "2. 细节可感度：抽象形容词代替感官？环境描写只调用视觉？\n"
+            "3. 节奏：连续超过500字纯叙述？高冲突场景是否短句？结尾是否收得太圆？\n"
+            "4. 结构：伏笔操作是否生硬？章末钩子是否够硬？\n\n"
+            "patch_instructions 必须具体到第X段第X句，不要给重写文本。输出 JSON：\n"
+            "{{\"score\": 8.5, \"human_feel_issues\": \"...\", \"detail_issues\": \"...\", "
+            "\"rhythm_issues\": \"...\", \"hook_issues\": \"...\", "
+            "\"patch_instructions\": [\"第2段第3句改为具体动作\", \"第5段对话删掉最后一句让它说一半\"]}}"
+        )},
+        "dialogue_auditor": {"system": (
+            "你是对话声纹审计师，同时也是AI对话味道的专项猎手。\n\n"
+            "【人物声纹档案】\n{voice_print}\n\n【当前场景正文】\n{draft}\n\n"
+            "审计规则：\n"
+            "1. 声纹匹配：句式长度、用词习惯是否与档案一致？\n"
+            "2. AI对话特征（任一命中即违规）：每句完整有逻辑有句号；对话像陈述解释而非争论/求助/威胁/回避；"
+            "从不改口犹豫说错话；每句都直接回答问题（真人常答非所问）；对话携带过多设定信息。\n"
+            "3. 区分度：抹掉所有引号前人名，能认出谁在说话吗？不能=违规。\n"
+            "4. 对话占比：是否在30-45%之间？\n"
+            "5. 格式：对话必须是中文直角引号「」，半角引号或叙述式转述即违规；全部完整句号收尾=违规。\n\n"
+            "输出 JSON（不要其他文本）：\n"
+            "{{\"passed\": true, \"violations\": [{{\"character\": \"人物名或整体\", "
+            "\"issue\": \"声纹违规|AI对话|无法区分|占比异常\", \"location\": \"第几段或关键词前8字\", "
+            "\"fix\": \"15字内修改方向\"}}]}}"
+        )},
+        "keeper": {"system": (
+            "你是一个精准的记忆压缩器。请将场景正文(第{scene_id}号场景)压缩为不超过300字的运行时上下文。"
+            "输出三个模块的 JSON（不要其他文本）：\n"
+            "{{\"plot_progress\": \"客观事件链：谁在哪里做了什么拿到什么，谁受伤/死亡/发现什么；禁心理活动；不超过100字\", "
+            "\"emotion_state\": \"主要人物当前情绪的身体反应和可观察行为；不超过80字\", "
+            "\"env_and_clue\": \"时间/地点/天气可延续细节+新埋设伏笔+伏笔状态变化；不超过120字\"}}\n\n"
+            "【场景正文】\n{scene_draft}"
+        )},
+        "archivist": {"system": (
+            "你是小说档案员。输入为本章结构化大纲与逐场景快照摘要（plot_progress/emotion_state/env_and_clue）。"
+            "只提取输入中明确出现的信息，禁止脑补推断。输出 JSON，不要其他文字，结构：\n"
+            "{\n"
+            "  \"character_updates\": {\"人物名\": {\"status_change\": \"一句话\", \"location\": \"所在地(未知则省略)\", \"injury_ability_item\": \"新伤/新能力/新物品(无则省略)\"}},\n"
+            "  \"clue_updates\": {\"C001\": {\"current_state\": \"...\", \"new_development\": \"...\", \"resolved\": false}},\n"
+            "  \"facts\": [{\"kind\": \"plot|object|location|injury|info|relationship\", \"subject\": \"人物或物品名\", \"content\": \"一句话原子事实25字内\", \"scene_id\": 1}],\n"
+            "  \"chapter_summary\": \"两句话不超过80字\"\n"
+            "}\nfacts 是跨章一致性的长期记忆：谁拿到了什么/谁看见了什么/谁去了哪/什么东西被破坏/谁对谁说了什么关键信息。排除情绪描写，5-12条。"
+        )},
+        "foreshadowing_steward": {"system": (
+            "你是伏笔管家，负责让伏笔在章节间有序运行。\n\n"
+            "【当前所有伏笔】{all_foreshadowing}\n\n"
+            "【本章大纲的伏笔操作】{clue_operations}\n\n"
+            "【大纲】{plan_json}\n\n【近期章节摘要】{recent_summaries}\n\n"
+            "检查本章大纲（第{chapter_num}章）：\n"
+            "1. 回收类操作指向的伏笔是否真实存在？\n"
+            "2. 是否重复埋设已存在伏笔？\n"
+            "3. 有哪些pending伏笔长期未触碰（暗章数>30）需要提醒？\n"
+            "4. 计划在本章回收但与当前章节差距过大的伏笔是否遗漏？\n"
+            "输出JSON：{{\"operation_warnings\": [\"...\"], \"overdue\": [\"Fxxx\"], \"stale\": [\"Fxxx\"], \"duplicates\": [\"...\"]}}"
+        )},
+        "reader_proxy": {"system": (
+            "你是个28岁的上班族，晚上八点挤地铁回家，拇指刷着番茄APP看这本书。你追到了前几章，"
+            "没读过任何设定文档——正文里没讲的，你就是不知道。请逐段报告真实阅读感受。\n\n"
+            "【章节正文】\n{full_chapter}\n\n"
+            "规则：1) 每500字左右标记理解度/兴趣度(0-10)；2) 想发段评的记高光，想划走的记疲劳点，"
+            "新名词没讲明白的记困惑点；3) 重点评估结尾：你会不会点开下一章？给面子没用，实话实说；"
+            "4) 哪句像AI写的（工整像范文/排比/升华/背台词）记进 ai_suspect_points。\n\n"
+            "输出 JSON（不要其他文本）：\n"
+            "{{\"engagement_curve\": [{{\"position\": \"0-500字\", \"understanding\": 8, \"interest\": 6}}], "
+            "\"confusion_points\": [\"...\"], \"fatigue_points\": [\"...\"], \"ai_suspect_points\": [\"...\"], "
+            "\"best_moment\": \"...\", \"worst_moment\": \"...\", \"would_continue\": true, \"overall_score\": 7.5}}"
+        )},
+        "marketer": {
+            "synopsis": "你是小说平台签约编辑。根据以下信息写一篇抓人的小说简介（200字以内，适合平台展示）。\n书名：{novel_title}\n核心设定：{world_setting}",
+            "teaser": "为本书第{chapter_num}章「{chapter_title}」写一句50字以内的推荐语。\n本章内容：{chapter_summary}",
+            "tags": "为本书起8-12个标签，帮助平台推荐。\n书名：{novel_title}\n世界观：{world_setting}",
+            "author_note": "为作者写一段200字以内的「作者的话」，发布在章节旁边。亲切、不油腻。\n书名：{novel_title}\n创作理念：{inspiration}\n进度：{progress}",
+            "cover_art": "为{novel_title}设计3套封面图AI绘画提示词（各100字内、中文画面描述）。\n世界观：{world_setting}",
+            "character_portrait": "根据人物档案生成AI绘画立绘提示词（风格统一，200字内）。\n{character_profile}",
+            "scene_illustration": "根据场景描述生成插图视觉提示词（150字内）。\n{scene_description}",
+        },
     }
 
 
-def create_novel(id, title, chapter_count, words_per_chapter, genre, description):
-    """Create a novel directory atomically and return its final path."""
+def _resolve_model_env(model: dict | None) -> dict:
+    """把新建小说传入的模型配置解析成 {ENV_KEY: value}，校验后返回。
+
+    支持两种写法：
+      1. quick = {chat_model, reasoner_model, api_key?, base_url?}  → 一键覆盖全部角色
+      2. models = {env或attr名: 值}                                    → 精确改个别角色
+    两者可混用，models 优先级高于 quick。
+    """
+    if not model:
+        return {}
+    if not isinstance(model, dict):
+        raise NovelCreationError("model 配置必须是对象")
+    out = {}
+    out.update(model_config.expand_quick(model.get("quick")))
+    if model.get("models"):
+        sanitized = model_config.sanitize_input(model["models"])
+        out.update(sanitized)
+    return out
+
+
+def create_novel(id, title, chapter_count, words_per_chapter, genre, description,
+                 model_env=None):
+    """Create a novel directory atomically and return its final path.
+
+    model_env：可选 {ENV_KEY: value}，创建时写入 novels/<id>/.env（密钥只存本书 .env）。
+    """
     novel_id = validate_slug(id)
     title = _validate_text(title, "title", required=True)
     genre = _validate_text(genre, "genre")
@@ -196,6 +351,8 @@ def create_novel(id, title, chapter_count, words_per_chapter, genre, description
         (temp_dir / "cache").mkdir()
         (temp_dir / "config.py").write_text(_config_py(title, chapter_count, words_per_chapter, volumes), encoding="utf-8")
         (temp_dir / ".env.example").write_text(_env_example(), encoding="utf-8")
+        if model_env:
+            model_config.update_env_file(temp_dir / ".env", model_env)
         (temp_dir / "novel_prompts.json").write_text(json.dumps(_prompts(title, genre, description), ensure_ascii=False, indent=2), encoding="utf-8")
         (temp_dir / "bible" / "master_bible.md").write_text(f"# {title}\n\n## 类型\n{genre}\n\n## 简介\n{description}\n", encoding="utf-8")
         (temp_dir / "bible" / "characters.json").write_text(json.dumps({"characters": {}}, ensure_ascii=False, indent=2), encoding="utf-8")
