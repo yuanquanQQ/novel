@@ -32,7 +32,7 @@ start "Novel Frontend" /D "%ROOT%web" cmd /k "npm run dev"
 
 echo.
 echo 后端：http://127.0.0.1:8300
-echo 前端：http://localhost:5173
+echo 前端：http://localhost:114514
 echo 关闭两个新窗口即可停止服务。
 timeout /t 3 >nul
 endlocal

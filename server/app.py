@@ -20,7 +20,7 @@ from server import tasks as T  # noqa: E402
 app = FastAPI(title="Novel Console API")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origins=["http://localhost:114514", "http://127.0.0.1:114514"],
     allow_methods=["*"], allow_headers=["*"])
 
 

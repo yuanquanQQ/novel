@@ -32,7 +32,7 @@ python novel.py --novel mirror-city generate 1
 
 # 8. Web 控制台（推荐：看板/章节编辑/一键生成+实时日志/知识库浏览）
 pip install fastapi uvicorn
-scripts\dev.cmd     # 后端 http://127.0.0.1:8300 · 前端 http://localhost:5173
+scripts\dev.cmd     # 后端 http://127.0.0.1:8300 · 前端 http://localhost:114514
 ```
 
 ---
