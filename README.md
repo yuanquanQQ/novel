@@ -18,6 +18,8 @@ cd ..
 $env:DEEPSEEK_API_KEY = "sk-your-key"
 ```
 
+AI 主题构思优先读取 `API_KEY`，未设置时读取 `DEEPSEEK_API_KEY`；接口地址优先读取 `API_BASE_URL`，其次为 `DEEPSEEK_BASE_URL`，默认 `https://api.deepseek.com/v1`。可通过 `THEME_MODEL` 单独指定构思模型，默认 `deepseek-chat`。
+
 ## 快速开始
 
 项目不附带示例小说。请先通过 Web 或 CLI 新建独立工作区。
@@ -28,7 +30,7 @@ $env:DEEPSEEK_API_KEY = "sk-your-key"
 scripts\dev.cmd
 ```
 
-打开前端 `http://localhost:11451`，点击“新建小说”，填写小说 ID、书名、章节数等信息。后端 API 位于 `http://127.0.0.1:11452`，Vite 开发服务器会将 `/api` 请求代理到后端。
+打开前端 `http://localhost:11451`，点击“新建小说”，填写小说 ID、书名、章节数等信息。也可以在弹窗顶部输入可选灵感和题材偏好，点击“生成方案”获取 3 个 AI 主题构思；选择卡片只会把建议填入创建表单，不会立即创建小说，确认和修改后仍需点击“创建并进入”。后端 API 位于 `http://127.0.0.1:11452`，Vite 开发服务器会将 `/api` 请求代理到后端。
 
 ### 方式二：CLI
 

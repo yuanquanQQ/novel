@@ -14,6 +14,11 @@ sys.path.insert(0, str(ROOT))
 
 from engine.settings import NOVELS_DIR, load_config  # noqa: E402
 from engine.novel_creator import NovelCreationError, create_novel  # noqa: E402
+from engine.theme_generator import (  # noqa: E402
+    ThemeConfigurationError,
+    ThemeGenerationError,
+    generate_themes,
+)
 from engine.db import NovelDB  # noqa: E402
 from engine.style_kit import scanner  # noqa: E402
 from server import tasks as T  # noqa: E402
@@ -66,6 +71,22 @@ def api_novels():
         out.append({"id": d.name, "title": title, "chapters_written": len(gen),
                     "chapter_count": chapter_count, "words": words})
     return out
+
+
+class ThemeGenerationBody(BaseModel):
+    inspiration: str = Field(default="", max_length=1000)
+    genre: str = Field(default="", max_length=100)
+
+
+@app.post("/api/novel-themes/generate")
+def api_generate_novel_themes(body: ThemeGenerationBody):
+    try:
+        options = generate_themes(body.inspiration, body.genre)
+    except ThemeConfigurationError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except ThemeGenerationError as exc:
+        raise HTTPException(502, str(exc)) from exc
+    return {"options": options}
 
 
 class CreateNovelBody(BaseModel):

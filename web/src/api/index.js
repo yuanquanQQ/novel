@@ -4,6 +4,7 @@ const http = axios.create({ baseURL: '/api', timeout: 30000 })
 
 export const api = {
   novels: () => http.get('/novels').then(r => r.data),
+  generateNovelThemes: (data) => http.post('/novel-themes/generate', data, { timeout: 90000 }).then(r => r.data),
   createNovel: (data) => http.post('/novels', data).then(r => r.data),
   status: (n) => http.get(`/novels/${n}/status`).then(r => r.data),
 
