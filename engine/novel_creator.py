@@ -54,6 +54,33 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 
+
+def _load_local_env() -> dict[str, str]:
+    values = {{}}
+    env_file = PROJECT_ROOT / ".env"
+    if not env_file.is_file():
+        return values
+    for raw_line in env_file.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\\\"'":
+            value = value[1:-1]
+        if key:
+            values[key] = value
+    return values
+
+
+_LOCAL_ENV = _load_local_env()
+
+
+def _env(name: str, default: str) -> str:
+    return _LOCAL_ENV.get(name) or os.getenv(name) or default
+
+
 @dataclass
 class ModelConfig:
     provider: str = "deepseek"
@@ -66,15 +93,18 @@ class ModelConfig:
 
 @dataclass
 class Config:
-    api_key: str = field(default_factory=lambda: os.getenv("API_KEY", os.getenv("DEEPSEEK_API_KEY", "your-api-key-here")))
-    base_url: str = field(default_factory=lambda: os.getenv("API_BASE_URL", "https://api.deepseek.com/v1"))
-    planner_model: ModelConfig = field(default_factory=lambda: ModelConfig(model_name="deepseek-reasoner", temperature=0.6))
-    researcher_model: ModelConfig = field(default_factory=lambda: ModelConfig(model_name="deepseek-reasoner", temperature=0.15))
-    writer_model: ModelConfig = field(default_factory=lambda: ModelConfig(model_name="deepseek-chat", temperature=0.9, max_tokens=8192))
-    immediate_reviewer_model: ModelConfig = field(default_factory=lambda: ModelConfig(model_name="deepseek-chat", temperature=0.15))
-    heavy_reviewer_model: ModelConfig = field(default_factory=lambda: ModelConfig(model_name="deepseek-reasoner", temperature=0.6))
-    keeper_model: ModelConfig = field(default_factory=lambda: ModelConfig(model_name="deepseek-chat", temperature=0.15))
-    archivist_model: ModelConfig = field(default_factory=lambda: ModelConfig(model_name="deepseek-chat", temperature=0.15))
+    api_key: str = field(default_factory=lambda: _env("API_KEY", _env("DEEPSEEK_API_KEY", "your-api-key-here")))
+    base_url: str = field(default_factory=lambda: _env("API_BASE_URL", _env("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1")))
+    planner_model: ModelConfig = field(default_factory=lambda: ModelConfig(model_name=_env("PLANNER_MODEL", "deepseek-reasoner"), temperature=0.6))
+    researcher_model: ModelConfig = field(default_factory=lambda: ModelConfig(model_name=_env("RESEARCHER_MODEL", "deepseek-reasoner"), temperature=0.15))
+    writer_model: ModelConfig = field(default_factory=lambda: ModelConfig(model_name=_env("WRITER_MODEL", "deepseek-chat"), temperature=0.9, max_tokens=8192))
+    immediate_reviewer_model: ModelConfig = field(default_factory=lambda: ModelConfig(model_name=_env("IMMEDIATE_REVIEWER_MODEL", "deepseek-chat"), temperature=0.15))
+    heavy_reviewer_model: ModelConfig = field(default_factory=lambda: ModelConfig(model_name=_env("HEAVY_REVIEWER_MODEL", "deepseek-reasoner"), temperature=0.6))
+    keeper_model: ModelConfig = field(default_factory=lambda: ModelConfig(model_name=_env("KEEPER_MODEL", "deepseek-chat"), temperature=0.15))
+    archivist_model: ModelConfig = field(default_factory=lambda: ModelConfig(model_name=_env("ARCHIVIST_MODEL", "deepseek-chat"), temperature=0.15))
+    foreshadowing_steward_model: ModelConfig = field(default_factory=lambda: ModelConfig(model_name=_env("FORESHADOWING_STEWARD_MODEL", "deepseek-reasoner"), temperature=0.6))
+    reader_proxy_model: ModelConfig = field(default_factory=lambda: ModelConfig(model_name=_env("READER_PROXY_MODEL", "deepseek-chat"), temperature=0.15))
+    marketer_model: ModelConfig = field(default_factory=lambda: ModelConfig(model_name=_env("MARKETER_MODEL", "deepseek-chat"), temperature=0.9, max_tokens=8192))
     story_title: str = {title!r}
     chapter_count: int = {chapter_count}
     words_per_chapter: int = {words_per_chapter}
@@ -89,6 +119,34 @@ class Config:
     retry_delay: float = 2.0
 
 config = Config()
+'''
+
+
+def _env_example() -> str:
+    return '''# 复制为同目录的 .env，再填写本书使用的 API 配置和模型名称。
+# .env 仅供本机使用，不要提交到 git。
+
+# API_KEY 优先于 DEEPSEEK_API_KEY；二者任选其一。
+API_KEY=your-api-key-here
+DEEPSEEK_API_KEY=your-api-key-here
+# API_BASE_URL 优先于 DEEPSEEK_BASE_URL。
+API_BASE_URL=https://api.deepseek.com/v1
+DEEPSEEK_BASE_URL=https://api.deepseek.com/v1
+
+# 主题构思（新建小说前的全局主题生成使用；默认 deepseek-chat）
+THEME_MODEL=deepseek-chat
+
+# 各 Agent 使用的模型（可按本书单独调整）
+PLANNER_MODEL=deepseek-reasoner
+RESEARCHER_MODEL=deepseek-reasoner
+WRITER_MODEL=deepseek-chat
+IMMEDIATE_REVIEWER_MODEL=deepseek-chat
+HEAVY_REVIEWER_MODEL=deepseek-reasoner
+KEEPER_MODEL=deepseek-chat
+ARCHIVIST_MODEL=deepseek-chat
+FORESHADOWING_STEWARD_MODEL=deepseek-reasoner
+READER_PROXY_MODEL=deepseek-chat
+MARKETER_MODEL=deepseek-chat
 '''
 
 
@@ -137,6 +195,7 @@ def create_novel(id, title, chapter_count, words_per_chapter, genre, description
         (temp_dir / "generated").mkdir()
         (temp_dir / "cache").mkdir()
         (temp_dir / "config.py").write_text(_config_py(title, chapter_count, words_per_chapter, volumes), encoding="utf-8")
+        (temp_dir / ".env.example").write_text(_env_example(), encoding="utf-8")
         (temp_dir / "novel_prompts.json").write_text(json.dumps(_prompts(title, genre, description), ensure_ascii=False, indent=2), encoding="utf-8")
         (temp_dir / "bible" / "master_bible.md").write_text(f"# {title}\n\n## 类型\n{genre}\n\n## 简介\n{description}\n", encoding="utf-8")
         (temp_dir / "bible" / "characters.json").write_text(json.dumps({"characters": {}}, ensure_ascii=False, indent=2), encoding="utf-8")

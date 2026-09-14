@@ -10,7 +10,7 @@ log = logging.getLogger("steward")
 class ForeshadowingSteward:
 
     def __init__(self):
-        self.model_config = config.planner_model
+        self.model_config = config.foreshadowing_steward_model
 
     def audit(self, plan_json: dict, chapter_num: int,
               bible: dict) -> dict:

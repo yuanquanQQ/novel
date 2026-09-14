@@ -10,7 +10,7 @@ log = logging.getLogger("reader")
 class ReaderProxy:
 
     def __init__(self):
-        self.model_config = config.immediate_reviewer_model
+        self.model_config = config.reader_proxy_model
 
     def read(self, full_chapter: str) -> dict:
         prompt = self._build_prompt(full_chapter)

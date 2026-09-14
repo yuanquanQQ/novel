@@ -1,11 +1,14 @@
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
 import engine.novel_creator as novel_creator
+import engine.settings as settings
 import server.app as server_app
 
 
@@ -16,13 +19,16 @@ class TestNovelCreationAPI(unittest.TestCase):
         self.novels_dir.mkdir()
         self._creator_dir = novel_creator.NOVELS_DIR
         self._server_dir = server_app.NOVELS_DIR
+        self._settings_dir = settings.NOVELS_DIR
         novel_creator.NOVELS_DIR = self.novels_dir
         server_app.NOVELS_DIR = self.novels_dir
+        settings.NOVELS_DIR = self.novels_dir
         self.client = TestClient(server_app.app)
 
     def tearDown(self):
         novel_creator.NOVELS_DIR = self._creator_dir
         server_app.NOVELS_DIR = self._server_dir
+        settings.NOVELS_DIR = self._settings_dir
         self._tmp.cleanup()
 
     def test_create_initializes_complete_workspace(self):
@@ -37,6 +43,8 @@ class TestNovelCreationAPI(unittest.TestCase):
         self.assertEqual(response.status_code, 201, response.text)
 
         novel_dir = self.novels_dir / "small-book"
+        self.assertTrue((novel_dir / ".env.example").is_file())
+        self.assertFalse((novel_dir / ".env").exists())
         prompts = json.loads((novel_dir / "novel_prompts.json").read_text(encoding="utf-8"))
         for name in ("title_generator", "volume_summary", "planner", "writer"):
             self.assertIn(name, prompts)
@@ -47,6 +55,25 @@ class TestNovelCreationAPI(unittest.TestCase):
             list(self.client.get("/api/novels/small-book/bible").json()),
             server_app.BIBLE_FILES,
         )
+
+    def test_config_reads_local_env_without_global_pollution(self):
+        novel_creator.create_novel("configured-book", "配置测试", 1, 1000, "", "")
+        novel_dir = self.novels_dir / "configured-book"
+        (novel_dir / ".env").write_text(
+            "API_KEY=local-key\nAPI_BASE_URL=https://local.example/v1\n"
+            "PLANNER_MODEL=local-planner\nWRITER_MODEL=local-writer\n",
+            encoding="utf-8",
+        )
+        with patch.dict(os.environ, {
+            "API_KEY": "external-key", "API_BASE_URL": "https://external.example/v1",
+            "PLANNER_MODEL": "external-planner",
+        }, clear=False):
+            config = settings.load_config("configured-book")
+            self.assertEqual(os.environ["PLANNER_MODEL"], "external-planner")
+        self.assertEqual(config.api_key, "local-key")
+        self.assertEqual(config.base_url, "https://local.example/v1")
+        self.assertEqual(config.planner_model.model_name, "local-planner")
+        self.assertEqual(config.writer_model.model_name, "local-writer")
 
     def test_knowledge_base_fields_round_trip(self):
         created = self.client.post("/api/novels", json={

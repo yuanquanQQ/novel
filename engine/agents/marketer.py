@@ -10,7 +10,7 @@ log = logging.getLogger("marketer")
 class MarketerAgent:
 
     def __init__(self):
-        self.model_config = config.writer_model
+        self.model_config = config.marketer_model
 
     def synopsis(self, bible: dict, chapter_summaries: str) -> str:
         from engine.prompts_loader import get_prompt

@@ -14,11 +14,15 @@ cd web
 npm install
 cd ..
 
-# 当前 PowerShell 会话；也可写入系统环境变量
-$env:DEEPSEEK_API_KEY = "sk-your-key"
 ```
 
-AI 主题构思优先读取 `API_KEY`，未设置时读取 `DEEPSEEK_API_KEY`；接口地址优先读取 `API_BASE_URL`，其次为 `DEEPSEEK_BASE_URL`，默认 `https://api.deepseek.com/v1`。可通过 `THEME_MODEL` 单独指定构思模型，默认 `deepseek-chat`。
+新建小说后，复制该小说目录中的 `.env.example` 为 `.env`，再填写本书的 API 配置和模型安排：
+
+```powershell
+Copy-Item novels\my-story\.env.example novels\my-story\.env
+```
+
+每部小说的 `.env` 只在加载该小说的 `config.py` 时读取，不会污染其他小说。文件中的值优先于同名系统环境变量；未配置时使用模板中的默认模型。`API_KEY` 优先于 `DEEPSEEK_API_KEY`，接口地址 `API_BASE_URL` 优先于 `DEEPSEEK_BASE_URL`，默认地址为 `https://api.deepseek.com/v1`。`THEME_MODEL` 控制主题构思模型，默认 `deepseek-chat`；其余 `*_MODEL` 变量分别控制各 Agent。`.env` 含密钥，已被 git 忽略，不要提交。
 
 ## 快速开始
 
@@ -134,7 +138,9 @@ engine/                 共享创作引擎、Agent、SQLite 与风格扫描器
 server/                 FastAPI REST/SSE 后端
 web/                    Vue 3 + Vite 控制台
 novels/<id>/
-  config.py             本书配置
+  config.py             本书配置（从同目录 .env 读取）
+  .env.example          API 与 Agent 模型配置示例
+  .env                  本机配置，不提交
   novel_prompts.json    本书提示词
   bible/                世界观、人物、线索、大纲、章名等种子文件
   db/novel.db           本书运行时知识库
