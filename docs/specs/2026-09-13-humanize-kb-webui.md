@@ -52,7 +52,7 @@
 pip install fastapi uvicorn                          # 新增依赖
 python novel.py --novel mirror-city db init          # 从 bible 导入生成 db/novel.db
 python novel.py --novel mirror-city generate 5       # 行为不变，内部走 style_kit + DB
-uvicorn server.app:app --port 114524 --reload          # 启动控制台后端
+uvicorn server.app:app --port 11452 --reload          # 启动控制台后端
 cd web && npm install && npm run dev                 # 前端 http://localhost:114514
 cd web && npm run build                              # 产物可被 FastAPI 静态托管
 python -m engine.style_kit.scanner 某草稿.txt         # 独立跑确定性扫描（调试用）
