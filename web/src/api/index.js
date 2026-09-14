@@ -4,6 +4,7 @@ const http = axios.create({ baseURL: '/api', timeout: 30000 })
 
 export const api = {
   novels: () => http.get('/novels').then(r => r.data),
+  createNovel: (data) => http.post('/novels', data).then(r => r.data),
   status: (n) => http.get(`/novels/${n}/status`).then(r => r.data),
 
   outline: (n) => http.get(`/novels/${n}/outline`).then(r => r.data),
@@ -20,8 +21,14 @@ export const api = {
   bibleList: (n) => http.get(`/novels/${n}/bible`).then(r => r.data),
   bibleFile: (n, fn) => http.get(`/novels/${n}/bible/${fn}`, { responseType: 'text', transformResponse: [d => d] }).then(r => r.data),
   saveBibleFile: (n, fn, content) => http.put(`/novels/${n}/bible/${fn}`, { content }).then(r => r.data),
+  knowledgeSync: (n) => http.post(`/novels/${n}/knowledge-base/sync`).then(r => r.data),
 
   dbCharacters: (n) => http.get(`/novels/${n}/db/characters`).then(r => r.data),
+  saveCharacter: (n, id, data) => http.put(`/novels/${n}/db/characters/${encodeURIComponent(id)}`, data).then(r => r.data),
+  dbClues: (n) => http.get(`/novels/${n}/db/clues`).then(r => r.data),
+  saveClue: (n, id, data) => http.put(`/novels/${n}/db/clues/${encodeURIComponent(id)}`, data).then(r => r.data),
+  dbMotifs: (n) => http.get(`/novels/${n}/db/motifs`).then(r => r.data),
+  dbForeshadowUpdate: (n, id, data) => http.put(`/novels/${n}/db/foreshadowing/${encodeURIComponent(id)}`, data).then(r => r.data),
   dbForeshadow: (n, current) => http.get(`/novels/${n}/db/foreshadowing`, { params: { current } }).then(r => r.data),
   dbFacts: (n, params) => http.get(`/novels/${n}/db/facts`, { params }).then(r => r.data),
   dbStyleHits: (n) => http.get(`/novels/${n}/db/style-hits`).then(r => r.data),

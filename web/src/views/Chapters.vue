@@ -1,7 +1,9 @@
 <template>
   <div class="page">
-    <h2>章节 · {{ novelName }}</h2>
-    <el-row :gutter="14">
+    <header class="page-header"><div><div class="eyebrow">MANUSCRIPT</div><h1>章节</h1><p>{{ store.novel?.title || novelName }} 的正文编辑与风格复检</p></div><el-button :loading="loading" :disabled="!novelName" @click="loadNovel"><el-icon><Refresh /></el-icon>刷新</el-button></header>
+    <el-alert v-if="error" type="error" :title="error" show-icon :closable="false" class="section-gap" />
+    <div v-if="!novelName" class="empty-panel"><el-empty description="请先选择小说" /></div>
+    <el-row v-else :gutter="14" v-loading="loading" class="chapter-layout">
       <el-col :span="6">
         <div class="card list-card">
           <div v-for="c in chapters" :key="c.num" class="ch-item" :class="{ active: current === c.num }" @click="open(c.num)">
@@ -62,8 +64,10 @@ import { api } from '../api'
 
 const store = useNovelStore()
 const route = useRoute()
-const novelName = computed(() => route.params.name || store.current)
+const novelName = computed(() => route.params.name || store.current || '')
 const chapters = ref([])
+const loading = ref(false)
+const error = ref('')
 const current = ref(null)
 const content = ref('')
 const scanData = ref({ passed: true, metrics: {}, violations: [], warnings: [] })
@@ -75,32 +79,42 @@ let requestSeq = 0
 
 async function open(n) {
   const name = novelName.value
+  if (!name || !n) return
   const seq = ++requestSeq
   current.value = n
-  const [c, s] = await Promise.all([api.chapter(name, n), api.scanChapter(name, n)])
-  if (seq !== requestSeq || name !== novelName.value) return
-  content.value = c.content
-  scanData.value = s
-  editing.value = false
+  try {
+    const [c, s] = await Promise.all([api.chapter(name, n), api.scanChapter(name, n)])
+    if (seq !== requestSeq || name !== novelName.value) return
+    content.value = c.content
+    scanData.value = s
+    editing.value = false
+  } catch (e) { if (seq === requestSeq) error.value = e.response?.data?.detail || '章节加载失败' }
 }
 
-async function loadChapters(name = novelName.value) { chapters.value = await api.chapters(name) }
+async function loadChapters(name = novelName.value) { if (name) chapters.value = await api.chapters(name) }
 
 async function loadNovel() {
   const name = novelName.value
   const seq = ++requestSeq
   current.value = null
+  chapters.value = []
   content.value = ''
+  error.value = ''
   scanData.value = { passed: true, metrics: {}, violations: [], warnings: [] }
   editing.value = false
   scanFilter.value = 'all'
-  await store.load()
-  const loadedChapters = await api.chapters(name)
-  if (seq !== requestSeq || name !== novelName.value) return
-  chapters.value = loadedChapters
-  if (chapters.value.length) open(chapters.value[chapters.value.length - 1].num)
+  if (!name) return
+  loading.value = true
+  try {
+    const loadedChapters = await api.chapters(name)
+    if (seq !== requestSeq || name !== novelName.value) return
+    chapters.value = loadedChapters
+    if (chapters.value.length) await open(chapters.value[chapters.value.length - 1].num)
+  } catch (e) { if (seq === requestSeq) error.value = e.response?.data?.detail || '章节列表加载失败' }
+  finally { if (name === novelName.value) loading.value = false }
 }
 async function saveContent() {
+  if (!novelName.value || !current.value) return
   saving.value = true
   try {
     const res = await api.saveChapter(novelName.value, current.value, content.value)
@@ -115,20 +129,24 @@ async function saveContent() {
 }
 async function doScan() {
   const name = novelName.value
+  if (!name || !current.value) return
   const seq = ++requestSeq
-  const result = await api.scanChapter(name, current.value)
-  if (seq === requestSeq && name === novelName.value) scanData.value = result
+  try {
+    const result = await api.scanChapter(name, current.value)
+    if (seq === requestSeq && name === novelName.value) scanData.value = result
+  } catch (e) { error.value = e.response?.data?.detail || '扫描失败' }
 }
 function toggleEdit() { editing.value = !editing.value }
 
-watch(() => route.params.name, loadNovel, { immediate: true })
+watch(novelName, loadNovel, { immediate: true })
 </script>
 
 <style scoped>
-.list-card { max-height: 84vh; overflow-y: auto; padding: 6px }
-.ch-item { padding: 10px 12px; cursor: pointer; border-radius: 8px; margin: 2px 0 }
-.ch-item:hover { background: #f2f5fa }
-.ch-item.active { background: #eaf3ff; color: #409eff }
-.ch-title { font-weight: 500; font-size: 14px; margin-bottom: 2px }
-.ch-words { font-size: 12px; color: #909399 }
+.list-card { max-height: 76vh; overflow-y: auto; padding: 7px }
+.ch-item { padding: 11px 12px; cursor: pointer; border: 1px solid transparent; border-radius: 8px; margin: 2px 0 }
+.ch-item:hover { background: var(--surface-soft) }
+.ch-item.active { color: var(--primary); background: var(--primary-soft); border-color: #dbe8e5 }
+.ch-title { font-weight: 500; font-size: 14px; margin-bottom: 3px }
+.ch-words { font-size: 12px; color: var(--muted) }
+@media (max-width: 900px) { .chapter-layout :deep(.el-col-6), .chapter-layout :deep(.el-col-18) { max-width: 100%; flex: 0 0 100%; } .list-card { max-height: 240px; margin-bottom: 14px; } }
 </style>

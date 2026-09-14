@@ -7,12 +7,13 @@ from pathlib import Path
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse, StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from engine.settings import NOVELS_DIR, load_config  # noqa: E402
+from engine.novel_creator import NovelCreationError, create_novel  # noqa: E402
 from engine.db import NovelDB  # noqa: E402
 from engine.style_kit import scanner  # noqa: E402
 from server import tasks as T  # noqa: E402
@@ -67,6 +68,27 @@ def api_novels():
     return out
 
 
+class CreateNovelBody(BaseModel):
+    id: str
+    title: str
+    chapter_count: int = 200
+    words_per_chapter: int = 3000
+    genre: str = ""
+    description: str = ""
+
+
+@app.post("/api/novels", status_code=201)
+def api_create_novel(body: CreateNovelBody):
+    try:
+        path = create_novel(body.id, body.title, body.chapter_count,
+                            body.words_per_chapter, body.genre, body.description)
+    except FileExistsError as exc:
+        raise HTTPException(409, str(exc))
+    except (NovelCreationError, ValueError) as exc:
+        raise HTTPException(400, str(exc))
+    return {"id": body.id, "title": body.title, "path": str(path)}
+
+
 @app.get("/api/novels/{name}/status")
 def api_status(name: str):
     d = novel_dir(name)
@@ -85,10 +107,12 @@ def api_status(name: str):
         vols.append({"key": vk, "name": v["name"], "lo": lo, "hi": hi,
                      "done": len(done)})
     db = NovelDB(d)
-    st = db.stats()
-    log_rows = [dict(r) for r in db.conn.execute(
-        "SELECT * FROM chapter_log ORDER BY chapter").fetchall()]
-    db.close()
+    try:
+        st = db.stats()
+        log_rows = [dict(r) for r in db.conn.execute(
+            "SELECT * FROM chapter_log ORDER BY chapter").fetchall()]
+    finally:
+        db.close()
     return {"title": cfg.story_title, "chapter_count": cfg.chapter_count,
             "written": len(gen), "volumes": vols, "db": st,
             "chapter_log": log_rows}
@@ -177,13 +201,15 @@ async def api_chapter_save(name: str, num: int, body: dict):
     fp.write_text(content, encoding="utf-8")
     r = scanner.scan(content)
     db = NovelDB(novel_dir(name))
-    rows = r.to_rows(num)
-    db.delete_style_hits(num)
-    db.add_style_hits(rows)
-    db.log_chapter(num, words=len(content),
-                   violations=sum(x[3] for x in rows
-                                  if x[1] in ("禁用词", "句式", "排版")))
-    db.close()
+    try:
+        rows = r.to_rows(num)
+        db.delete_style_hits(num)
+        db.add_style_hits(rows)
+        db.log_chapter(num, words=len(content),
+                       violations=sum(x[3] for x in rows
+                                      if x[1] in ("禁用词", "句式", "排版")))
+    finally:
+        db.close()
     return {"ok": True, "words": len(content),
             "scan": {"passed": r.passed,
                      "violations": r.violations, "warnings": r.warnings}}
@@ -208,7 +234,7 @@ async def api_scan_preview(body: dict):
 
 # --------------------------------------------------------------------- bible
 BIBLE_FILES = ["characters.json", "clues.json", "motif_bank.json",
-               "master_bible.md", "lessons_learned.jsonl"]
+               "master_bible.md", "lessons_learned.jsonl", "chapter_titles.json"]
 
 
 @app.get("/api/novels/{name}/bible")
@@ -223,7 +249,7 @@ def api_bible(name: str):
 
 @app.get("/api/novels/{name}/bible/{fn}")
 def api_bible_file(name: str, fn: str):
-    if fn not in BIBLE_FILES + ["outline.md", "chapter_titles.json"]:
+    if fn not in BIBLE_FILES + ["outline.md"]:
         raise HTTPException(400, "不允许的文件")
     fp = novel_dir(name) / "bible" / fn
     if not fp.exists():
@@ -233,74 +259,235 @@ def api_bible_file(name: str, fn: str):
 
 @app.put("/api/novels/{name}/bible/{fn}")
 async def api_bible_save(name: str, fn: str, body: dict):
-    if fn not in BIBLE_FILES + ["chapter_titles.json"]:
+    if fn not in BIBLE_FILES:
         raise HTTPException(400, "不允许的文件")
-    content = body.get("content", "")
-    if fn.endswith(".json") or fn.endswith(".jsonl"):
+    content = body.get("content")
+    if not isinstance(content, str):
+        raise HTTPException(422, "content 必须是字符串")
+    try:
         if fn.endswith(".json"):
-            json.loads(content)  # 校验
-    fp = novel_dir(name) / "bible" / fn
+            json.loads(content)
+        elif fn.endswith(".jsonl"):
+            for line_no, line in enumerate(content.splitlines(), 1):
+                if line.strip():
+                    json.loads(line)
+    except json.JSONDecodeError as exc:
+        detail = f"JSON 格式错误: {exc.msg}（第 {exc.lineno} 行，第 {exc.colno} 列）"
+        if fn.endswith(".jsonl"):
+            detail = f"JSONL 第 {line_no} 行格式错误: {exc.msg}"
+        raise HTTPException(422, detail) from exc
+    d = novel_dir(name)
+    fp = d / "bible" / fn
     fp.write_text(content, encoding="utf-8")
-    return {"ok": True}
+    db = NovelDB(d, auto_import=False)
+    try:
+        synced = db.ensure_imported(force=True)
+    finally:
+        db.close()
+    return {"ok": True, "synced": synced}
+
+
+class CharacterBody(BaseModel):
+    profile: dict = Field(default_factory=dict)
+    chapter: int | None = Field(default=None, ge=1)
+
+
+class ClueBody(BaseModel):
+    name: str = ""
+    type: str = ""
+    description: str = ""
+    introduced_chapter: int | None = Field(default=None, ge=1)
+    intended_reveal_chapter: int | None = Field(default=None, ge=1)
+    intended_resolution_chapter: int | None = Field(default=None, ge=1)
+    resolved: bool = False
+    state: dict = Field(default_factory=dict)
+    chapter: int | None = Field(default=None, ge=1)
+
+
+class ForeshadowBody(BaseModel):
+    name: str = ""
+    status: str = Field(default="pending", pattern="^(pending|active|resolved)$")
+    introduced_chapter: int | None = Field(default=None, ge=1)
+    intended_payoff_chapter: int | None = Field(default=None, ge=1)
+    resolved_chapter: int | None = Field(default=None, ge=1)
+    description: str = ""
+    hinted_chapters: list[int] = Field(default_factory=list)
 
 
 # ------------------------------------------------------------------ db browse
+@app.post("/api/novels/{name}/knowledge-base/sync")
+def api_knowledge_base_sync(name: str):
+    db = NovelDB(novel_dir(name), auto_import=False)
+    try:
+        counts = db.ensure_imported(force=True)
+        stats = db.stats()
+    finally:
+        db.close()
+    return {"ok": True, "counts": counts, "stats": stats}
+
+
+def _foreshadow_response(row) -> dict:
+    value = dict(row)
+    return {
+        "id": value["id"],
+        "name": value["name"],
+        "status": value["status"],
+        "introduced_chapter": value["planted_ch"],
+        "intended_payoff_chapter": value["payoff_ch"],
+        "resolved_chapter": value["resolved_ch"],
+        "description": value["description"],
+        "hinted_chapters": json.loads(value["hinted_chs"] or "[]"),
+        **({"days_dark": value["days_dark"]} if "days_dark" in value else {}),
+    }
+
+
 @app.get("/api/novels/{name}/db/foreshadowing")
 def api_db_foreshadow(name: str, current: int = 1):
     db = NovelDB(novel_dir(name))
-    buckets = db.open_foreshadowing(current)
-    rows = [dict(r) for r in db.conn.execute("SELECT * FROM foreshadowing").fetchall()]
-    db.close()
-    for r in rows:
-        r["hinted_chs"] = json.loads(r["hinted_chs"] or "[]")
-    return {"rows": rows, "buckets": {k: [dict(x) for x in v] for k, v in buckets.items()}}
+    try:
+        buckets = db.open_foreshadowing(current)
+        rows = db.conn.execute("SELECT * FROM foreshadowing").fetchall()
+    finally:
+        db.close()
+    return {
+        "rows": [_foreshadow_response(row) for row in rows],
+        "buckets": {
+            key: [_foreshadow_response(item) for item in bucket]
+            for key, bucket in buckets.items()
+        },
+    }
+
+
+@app.put("/api/novels/{name}/db/foreshadowing/{fid}")
+def api_db_foreshadow_update(name: str, fid: str, body: ForeshadowBody):
+    db = NovelDB(novel_dir(name))
+    try:
+        db.upsert_foreshadow(fid, body.model_dump())
+    finally:
+        db.close()
+    return {"ok": True, "id": fid}
 
 
 @app.get("/api/novels/{name}/db/facts")
 def api_db_facts(name: str, q: str = "", chapter: int = 0, limit: int = 30):
     db = NovelDB(novel_dir(name))
-    if q:
-        rows = db.search_facts(q.split(), before_ch=chapter or 10 ** 9, limit=limit)
-    else:
-        rows = db.conn.execute(
-            "SELECT * FROM chapter_facts WHERE chapter<? ORDER BY id DESC LIMIT ?",
-            (chapter or 10 ** 9, limit)).fetchall()
-    db.close()
-    return [dict(r) for r in rows]
+    try:
+        if q:
+            rows = db.search_facts(q.split(), before_ch=chapter or 10 ** 9, limit=limit)
+        else:
+            rows = db.conn.execute(
+                "SELECT * FROM chapter_facts WHERE chapter<? ORDER BY id DESC LIMIT ?",
+                (chapter or 10 ** 9, limit)).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        db.close()
 
 
 @app.get("/api/novels/{name}/db/characters")
 def api_db_characters(name: str):
     db = NovelDB(novel_dir(name))
-    chars = [dict(r) for r in db.conn.execute(
-        "SELECT name, role, voice_print, first_chapter, updated_chapter FROM characters").fetchall()]
-    for c in chars:
-        states = db.conn.execute(
-            "SELECT chapter, state_json FROM character_states WHERE character=? "
-            "ORDER BY chapter DESC LIMIT 3", (c["name"],)).fetchall()
-        c["recent_states"] = [dict(s) for s in states]
-    db.close()
-    return chars
+    try:
+        rows = db.conn.execute("SELECT * FROM characters").fetchall()
+        chars = []
+        for row in rows:
+            char = dict(row)
+            states = db.conn.execute(
+                "SELECT chapter, state_json FROM character_states WHERE character=? "
+                "ORDER BY chapter DESC LIMIT 3", (char["name"],)).fetchall()
+            chars.append({
+                "name": char["name"],
+                "role": char["role"],
+                "voice_print": char["voice_print"],
+                "first_appearance_chapter": char["first_chapter"],
+                "updated_chapter": char["updated_chapter"],
+                "profile": json.loads(char["profile_json"] or "{}"),
+                "recent_states": [
+                    {"chapter": state["chapter"],
+                     "state": json.loads(state["state_json"] or "{}")}
+                    for state in states
+                ],
+            })
+        return chars
+    finally:
+        db.close()
+
+
+@app.put("/api/novels/{name}/db/characters/{character}")
+def api_db_character_update(name: str, character: str, body: CharacterBody):
+    db = NovelDB(novel_dir(name))
+    try:
+        db.upsert_character(character, body.profile, body.chapter)
+    finally:
+        db.close()
+    return {"ok": True, "name": character}
+
+
+@app.get("/api/novels/{name}/db/clues")
+def api_db_clues(name: str):
+    db = NovelDB(novel_dir(name))
+    try:
+        rows = db.conn.execute("SELECT * FROM clues ORDER BY id").fetchall()
+    finally:
+        db.close()
+    return [{
+        "id": row["id"],
+        "name": row["name"],
+        "type": row["type"],
+        "description": row["description"],
+        "introduced_chapter": row["introduced_ch"],
+        "intended_reveal_chapter": row["intended_reveal_ch"],
+        "resolved": bool(row["resolved"]),
+        "state": json.loads(row["state_json"] or "{}"),
+        "updated_chapter": row["updated_ch"],
+    } for row in rows]
+
+
+@app.put("/api/novels/{name}/db/clues/{cid}")
+def api_db_clue_update(name: str, cid: str, body: ClueBody):
+    db = NovelDB(novel_dir(name))
+    try:
+        db.upsert_clue(cid, body.model_dump(), body.chapter)
+    finally:
+        db.close()
+    return {"ok": True, "id": cid}
+
+
+@app.get("/api/novels/{name}/db/motifs")
+def api_db_motifs(name: str):
+    db = NovelDB(novel_dir(name))
+    try:
+        rows = [dict(r) for r in db.conn.execute("SELECT * FROM motifs ORDER BY id").fetchall()]
+    finally:
+        db.close()
+    return [{
+        "id": row["id"],
+        "name": row["name"],
+        "description": row["description"],
+        "used_in_chapters": json.loads(row["used_chs"] or "[]"),
+    } for row in rows]
 
 
 @app.get("/api/novels/{name}/db/style-hits")
 def api_db_style_hits(name: str):
     db = NovelDB(novel_dir(name))
-    rows = db.conn.execute(
-        "SELECT category, pattern, SUM(count) total, COUNT(*) chapters FROM style_hits "
-        "GROUP BY category, pattern ORDER BY total DESC LIMIT 50").fetchall()
-    by_ch = db.conn.execute(
-        "SELECT chapter, COUNT(*) hits FROM style_hits GROUP BY chapter ORDER BY chapter").fetchall()
-    db.close()
-    return {"patterns": [dict(r) for r in rows], "by_chapter": [dict(r) for r in by_ch]}
+    try:
+        rows = db.conn.execute(
+            "SELECT category, pattern, SUM(count) total, COUNT(*) chapters FROM style_hits "
+            "GROUP BY category, pattern ORDER BY total DESC LIMIT 50").fetchall()
+        by_ch = db.conn.execute(
+            "SELECT chapter, COUNT(*) hits FROM style_hits GROUP BY chapter ORDER BY chapter").fetchall()
+        return {"patterns": [dict(r) for r in rows], "by_chapter": [dict(r) for r in by_ch]}
+    finally:
+        db.close()
 
 
 @app.get("/api/novels/{name}/db/lessons")
 def api_db_lessons(name: str):
     db = NovelDB(novel_dir(name))
-    rows = db.lessons_recent(50)
-    db.close()
-    return [dict(r) for r in rows]
+    try:
+        return [dict(r) for r in db.lessons_recent(50)]
+    finally:
+        db.close()
 
 
 # ---------------------------------------------------------------- style kit

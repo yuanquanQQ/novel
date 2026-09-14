@@ -85,12 +85,23 @@ class MarketerAgent:
         from engine.llm_client import chat
         return chat(self.model_config, user_prompt=prompt)
 
+    def _world_setting(self) -> str:
+        configured = getattr(config, "world_setting", None)
+        if configured:
+            if isinstance(configured, str):
+                return configured
+            return json.dumps(configured, ensure_ascii=False, indent=2)
+        bible_file = config.bible_dir / "master_bible.md"
+        if bible_file.exists():
+            return bible_file.read_text(encoding="utf-8")[:1500]
+        return f"《{config.story_title}》的世界观设定"
+
     def character_portrait(self, name: str, profile: dict) -> str:
         from engine.prompts_loader import get_prompt
         prompts, _ = get_prompt("marketer")
         prompt = prompts["character_portrait"].format(
             character_profile=json.dumps(profile, ensure_ascii=False, indent=2),
-            world_setting="镜影迷城：现代都市与镜像平行世界交织",
+            world_setting=self._world_setting(),
         )
         from engine.llm_client import chat
         return chat(self.model_config, user_prompt=prompt)
@@ -101,7 +112,7 @@ class MarketerAgent:
         cf = config.generated_dir / f"chapter_{chapter_num:02d}.md"
         scene = cf.read_text(encoding="utf-8")[:800] if cf.exists() else "未生成"
         prompt = prompts["scene_illustration"].format(
-            world_setting="镜影迷城：现代都市与镜像平行世界",
+            world_setting=self._world_setting(),
             scene_description=scene,
         )
         from engine.llm_client import chat

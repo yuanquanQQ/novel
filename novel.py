@@ -32,17 +32,37 @@ log = logging.getLogger("novel")
 def _parse_args():
     args = sys.argv[1:]
     parsed = {
-        "novel": "mirror-city",
+        "novel": "",
         "command": "",
         "chapter": None,
         "volume": None,
         "prompt": "",
         "content": "",
+        "id": "",
+        "title": "",
+        "chapter_count": 200,
+        "words_per_chapter": 3000,
+        "genre": "",
+        "description": "",
     }
     i = 0
     while i < len(args):
         a = args[i]
-        if a == "--novel" and i + 1 < len(args):
+        if a == "create":
+            parsed["command"] = "create"
+        elif a == "--id" and i + 1 < len(args):
+            i += 1; parsed["id"] = args[i]
+        elif a == "--title" and i + 1 < len(args):
+            i += 1; parsed["title"] = args[i]
+        elif a in ("--chapters", "--chapter-count") and i + 1 < len(args):
+            i += 1; parsed["chapter_count"] = int(args[i])
+        elif a in ("--words", "--words-per-chapter") and i + 1 < len(args):
+            i += 1; parsed["words_per_chapter"] = int(args[i])
+        elif a == "--genre" and i + 1 < len(args):
+            i += 1; parsed["genre"] = args[i]
+        elif a == "--description" and i + 1 < len(args):
+            i += 1; parsed["description"] = args[i]
+        elif a == "--novel" and i + 1 < len(args):
             i += 1; parsed["novel"] = args[i]
         elif a == "--list":
             parsed["command"] = "list"
@@ -103,6 +123,15 @@ def _parse_args():
 # 命令实现
 # ============================================================
 
+def cmd_create(args):
+    """创建独立的新小说工作区。"""
+    from engine.novel_creator import create_novel
+    path = create_novel(
+        args["id"], args["title"], args["chapter_count"],
+        args["words_per_chapter"], args["genre"], args["description"])
+    print(f"小说已创建: {path}")
+
+
 def cmd_list():
     """列出所有可用小说"""
     print("可用小说:")
@@ -124,18 +153,20 @@ def cmd_db(sub: str):
     from engine.db import NovelDB
     novel_dir = get_novel_dir()
     db = NovelDB(novel_dir)
-    if sub == "init":
-        counts = db.import_bible()
-        parts = ", ".join(f"{k}={v}" for k, v in counts.items())
-        print(f"知识库已导入: {db.path}")
-        print(f"  {parts}")
-    else:
-        s = db.stats()
-        print(f"  {get_novel()}: {db.path.name} ({s['db_bytes']:,} 字节)")
-        for k in ("characters", "facts", "clues", "foreshadow_total",
-                  "foreshadow_resolved", "lessons", "chapters_logged", "style_hits"):
-            print(f"  {k:<20} {s[k]}")
-    db.close()
+    try:
+        if sub == "init":
+            counts = db.ensure_imported(force=True)
+            parts = ", ".join(f"{k}={v}" for k, v in counts.items())
+            print(f"知识库已导入: {db.path}")
+            print(f"  {parts}")
+        else:
+            s = db.stats()
+            print(f"  {get_novel()}: {db.path.name} ({s['db_bytes']:,} 字节)")
+            for k in ("characters", "facts", "clues", "foreshadow_total",
+                      "foreshadow_resolved", "lessons", "chapters_logged", "style_hits"):
+                print(f"  {k:<20} {s[k]}")
+    finally:
+        db.close()
 
 
 def cmd_scan(chapter_num: int):
@@ -791,6 +822,13 @@ def main():
     if cmd == "list":
         return cmd_list()
 
+    if cmd == "create":
+        return cmd_create(args)
+
+    if not novel:
+        print("请先创建小说，或使用 --novel <id> 指定小说")
+        return
+
     # 需要设置小说的命令
     set_novel(novel)
 
@@ -830,6 +868,8 @@ def main():
 
     # 没有命令时显示帮助
     print("小说创作引擎 — 命令列表\n")
+    print("  python novel.py create --id <slug> --title <书名> [--chapters N] [--words N] [--genre 类型] [--description 简介]")
+    print()
     print("  配置与规划:")
     print("    python novel.py --novel <名> outline         生成全书大纲 → bible/outline.md")
     print("    python novel.py --novel <名> titles          根据大纲生成章名 → bible/chapter_titles.json")

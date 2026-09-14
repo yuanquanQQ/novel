@@ -1,0 +1,121 @@
+import json
+import tempfile
+import unittest
+from pathlib import Path
+
+from fastapi.testclient import TestClient
+
+import engine.novel_creator as novel_creator
+import server.app as server_app
+
+
+class TestNovelCreationAPI(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.novels_dir = Path(self._tmp.name) / "novels"
+        self.novels_dir.mkdir()
+        self._creator_dir = novel_creator.NOVELS_DIR
+        self._server_dir = server_app.NOVELS_DIR
+        novel_creator.NOVELS_DIR = self.novels_dir
+        server_app.NOVELS_DIR = self.novels_dir
+        self.client = TestClient(server_app.app)
+
+    def tearDown(self):
+        novel_creator.NOVELS_DIR = self._creator_dir
+        server_app.NOVELS_DIR = self._server_dir
+        self._tmp.cleanup()
+
+    def test_create_initializes_complete_workspace(self):
+        response = self.client.post("/api/novels", json={
+            "id": "small-book",
+            "title": "小书",
+            "chapter_count": 3,
+            "words_per_chapter": 1200,
+            "genre": "悬疑",
+            "description": "测试简介",
+        })
+        self.assertEqual(response.status_code, 201, response.text)
+
+        novel_dir = self.novels_dir / "small-book"
+        prompts = json.loads((novel_dir / "novel_prompts.json").read_text(encoding="utf-8"))
+        for name in ("title_generator", "volume_summary", "planner", "writer"):
+            self.assertIn(name, prompts)
+
+        titles = self.client.get("/api/novels/small-book/titles").json()
+        self.assertEqual(list(titles["volumes"]), ["volume_1", "volume_2", "volume_3"])
+        self.assertEqual(
+            list(self.client.get("/api/novels/small-book/bible").json()),
+            server_app.BIBLE_FILES,
+        )
+
+    def test_knowledge_base_fields_round_trip(self):
+        created = self.client.post("/api/novels", json={
+            "id": "crud-book", "title": "契约测试", "chapter_count": 8,
+            "words_per_chapter": 1500,
+        })
+        self.assertEqual(created.status_code, 201, created.text)
+
+        response = self.client.put(
+            "/api/novels/crud-book/db/characters/林一",
+            json={
+                "profile": {
+                    "role": "主角", "voice_print": "短句",
+                    "first_appearance_chapter": 2,
+                },
+                "chapter": 3,
+            },
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        character = self.client.get("/api/novels/crud-book/db/characters").json()[0]
+        self.assertEqual(character["first_appearance_chapter"], 2)
+        self.assertEqual(character["updated_chapter"], 3)
+        self.assertNotIn("profile_json", character)
+
+        response = self.client.put(
+            "/api/novels/crud-book/db/clues/C001",
+            json={
+                "name": "钥匙", "type": "物件", "description": "铜钥匙",
+                "introduced_chapter": 2, "intended_reveal_chapter": 7,
+                "resolved": False, "state": {"holder": "林一"}, "chapter": 3,
+            },
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        clue = self.client.get("/api/novels/crud-book/db/clues").json()[0]
+        self.assertEqual(clue["introduced_chapter"], 2)
+        self.assertEqual(clue["intended_reveal_chapter"], 7)
+        self.assertEqual(clue["updated_chapter"], 3)
+        self.assertEqual(clue["state"], {"holder": "林一"})
+
+        response = self.client.put(
+            "/api/novels/crud-book/db/foreshadowing/F001",
+            json={
+                "name": "钟声", "status": "active", "introduced_chapter": 1,
+                "intended_payoff_chapter": 6, "description": "午夜钟声",
+                "hinted_chapters": [1, 4],
+            },
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        foreshadow = self.client.get(
+            "/api/novels/crud-book/db/foreshadowing?current=5"
+        ).json()
+        self.assertEqual(foreshadow["rows"][0]["introduced_chapter"], 1)
+        self.assertEqual(foreshadow["rows"][0]["hinted_chapters"], [1, 4])
+        self.assertEqual(foreshadow["buckets"]["normal"][0]["hinted_chapters"], [1, 4])
+
+        motif_content = json.dumps({
+            "motifs": [{
+                "id": "M001", "name": "雨", "description": "转折",
+                "used_in_chapters": [2, 5],
+            }]
+        }, ensure_ascii=False)
+        response = self.client.put(
+            "/api/novels/crud-book/bible/motif_bank.json",
+            json={"content": motif_content},
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        motif = self.client.get("/api/novels/crud-book/db/motifs").json()[0]
+        self.assertEqual(motif["used_in_chapters"], [2, 5])
+
+
+if __name__ == "__main__":
+    unittest.main()

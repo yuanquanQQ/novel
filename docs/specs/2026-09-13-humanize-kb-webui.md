@@ -14,7 +14,7 @@
    - `banned_words.json` — 结构化词表（词汇类 / 句式类 / 模板道具类 / AI情绪万能句），源自 novel-live-writing `references/banned-words.md`，含替换方向，前端可编辑
    - `techniques.md` — 正向技法注入（源自 techniques.md 30 招中的核心 15 招：情绪体感化、私人细节、句式情绪同步、干扰项注入、主角犯错、感官偏见、白描比喻克制、标点语流、对话碎化、长短错落、一句成段、数字体感化、无用道具、减空洞加颗粒、电影桥段化）
    - `tomato_rules.md` — 番茄平台规则：单章 1800-2500 字、每 800 字一个小爽点/转折、章末硬钩子、开篇 3 秒进入冲突、对话「」直角引号、破折号清零
-2. 重写两本小说 `novel_prompts.json` 的 writer / reviewer_immediate / reviewer_heavy / dialogue_auditor / reader_proxy / planner prompt：注入"导"的部分（正向技法+番茄规则），由 `prompts_loader` 在运行时把 style_kit 内容拼入，禁改剧本类约束保留
+2. 更新小说 `novel_prompts.json` 的 writer / reviewer_immediate / reviewer_heavy / dialogue_auditor / reader_proxy / planner prompt：注入"导"的部分（正向技法+番茄规则），由 `prompts_loader` 在运行时把 style_kit 内容拼入，禁改剧本类约束保留
 3. **确定性预检**：`engine/style_kit/scanner.py`（纯代码，非 LLM）对草稿做禁用词/句式 regex 扫描 + 句长分布、对话占比、连续同构句统计 → 违规先由代码打回（零成本、必命中），LLM Reviewer 只审语义层（声纹、衔接、人味整体感）；扫描结果写入数据库
 
 **B. 每小说 SQLite 知识库（记录型数据库）**
@@ -50,11 +50,12 @@
 
 ```bash
 pip install fastapi uvicorn                          # 新增依赖
-python novel.py --novel mirror-city db init          # 从 bible 导入生成 db/novel.db
-python novel.py --novel mirror-city generate 5       # 行为不变，内部走 style_kit + DB
+python novel.py create --id my-story --title "我的小说"
+python novel.py --novel my-story db init             # 从 bible 导入生成 db/novel.db
+python novel.py --novel my-story generate 5          # 内部走 style_kit + DB
 uvicorn server.app:app --port 11452 --reload          # 启动控制台后端
 cd web && npm install && npm run dev                 # 前端 http://localhost:11451
-cd web && npm run build                              # 产物可被 FastAPI 静态托管
+cd web && npm run build                              # 产物在 web/dist
 python -m engine.style_kit.scanner 某草稿.txt         # 独立跑确定性扫描（调试用）
 ```
 
@@ -90,7 +91,8 @@ ScanResult(violations=[{"category": "词", "pattern": "然而", "count": 3, "loc
 
 - `tests/test_scanner.py`：禁用词命中/句长统计/对话占比的单元断言（pytest, stdlib 可跑）
 - `tests/test_db.py`：init 幂等、伏笔状态流转、facts 检索
-- 手工验收：用 mirror-city 跑 `generate 5`，对比 chapter_04 检查人味与钩子；前端走完"看板→生成→看日志→编辑章节"闭环
+- 自动验收：通过 `novel_creator` 在临时 `NOVELS_DIR` 创建 `my-story`，运行完整 server API 测试，不读取或修改真实 `novels/`
+- 手工验收：创建临时小说 `my-story`，前端走完“新建→看板→生成→看日志→编辑章节”闭环；验收后删除该临时目录
 
 ## 7. Boundaries
 
@@ -100,14 +102,14 @@ ScanResult(violations=[{"category": "词", "pattern": "然而", "count": 3, "loc
 
 ## 8. Success Criteria
 
-1. 确定性 scanner 对旧章 chapter_03 扫描能复现 ≥ 已知违规（"然而/仿佛"类），新章节首稿扫描通过率高且人审盲测"像人"
+1. 确定性 scanner 能在临时小说的违规草稿中稳定识别禁用词、句式与排版问题，新章节首稿扫描通过率高且人审盲测“像人”
 2. `generate N` 后 `db/novel.db` 中该章 chapter_facts ≥ 5 条、伏笔 hinted_chs 更新、style_hits 有记录
 3. Researcher 资料包不再整库塞 JSON：单章 prompt 体积下降 ≥30% 且事实一致性抽查通过
-4. 前端 6 大页面可用，生成任务日志实时流式显示，章节编辑保存生效
-5. 全部旧 CLI 命令行为不回退
+4. 前端主要页面可用，支持新建小说、生成任务实时日志和章节编辑保存
+5. CLI 新建、规划、写作、查看与知识库命令行为不回退
 
 ## 9. Resolved Decisions (2026-09-13 用户确认)
 
 - 单章字数**维持现状**（各场景 1500-2500，整章 2500-3500+），tomato_rules.md 不改数值长度指令，只管节奏与钩子
-- style_kit 为引擎级共享，两本小说 prompts 同步升级
+- style_kit 为引擎级共享，新建小说通过 prompts 注入机制使用共享规则
 - Spec 已确认，按 A→B→C→D 4 阶段 11 任务实施

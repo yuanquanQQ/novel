@@ -1,6 +1,7 @@
 # 每小说 SQLite 运行时知识库
 # Bible JSON = 出厂设定种子；本库 = 随章节生长、可查询的"运行记忆"
 
+import hashlib
 import json
 import sqlite3
 from pathlib import Path
@@ -45,7 +46,7 @@ CREATE TABLE IF NOT EXISTS chapter_log(
 
 
 class NovelDB:
-    def __init__(self, novel_dir: Path):
+    def __init__(self, novel_dir: Path, auto_import: bool = True):
         self.novel_dir = Path(novel_dir)
         db_dir = self.novel_dir / "db"
         db_dir.mkdir(exist_ok=True)
@@ -57,9 +58,34 @@ class NovelDB:
         self.conn.execute(
             "INSERT OR REPLACE INTO meta(key,value) VALUES('created_from_bible','v1')")
         self.conn.commit()
+        if auto_import:
+            self.ensure_imported()
 
     def close(self):
         self.conn.close()
+
+    def _bible_signature(self) -> str:
+        files = ("characters.json", "clues.json", "motif_bank.json",
+                 "lessons_learned.jsonl", "chapter_titles.json")
+        digest = hashlib.sha256()
+        for name in files:
+            fp = self.novel_dir / "bible" / name
+            digest.update(name.encode())
+            if fp.exists():
+                digest.update(fp.read_bytes())
+        return digest.hexdigest()
+
+    def ensure_imported(self, force: bool = False) -> dict:
+        """导入 Bible 种子；仅在首次或文件内容变化时同步，保留运行态字段。"""
+        signature = self._bible_signature()
+        row = self.conn.execute("SELECT value FROM meta WHERE key='bible_signature'").fetchone()
+        if not force and row and row[0] == signature:
+            return {"skipped": True}
+        counts = self.import_bible()
+        self.conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('bible_signature',?)",
+                          (signature,))
+        self.conn.commit()
+        return counts
 
     # ------------------------------------------------------------------ init
     def import_bible(self, force: bool = False) -> dict:
@@ -76,7 +102,9 @@ class NovelDB:
                        VALUES(?,?,?,?,?,0)
                        ON CONFLICT(name) DO UPDATE SET
                          role=excluded.role, voice_print=excluded.voice_print,
-                         profile_json=excluded.profile_json""",
+                         profile_json=CASE
+                           WHEN COALESCE(characters.updated_chapter, 0) > 0
+                           THEN characters.profile_json ELSE excluded.profile_json END""",
                     (name, prof.get("role", ""), prof.get("voice_print", ""),
                      prof.get("first_appearance_chapter"),
                      json.dumps(prof, ensure_ascii=False)))
@@ -95,7 +123,10 @@ class NovelDB:
                          description=excluded.description,
                          introduced_ch=excluded.introduced_ch,
                          intended_reveal_ch=excluded.intended_reveal_ch,
-                         state_json=excluded.state_json""",
+                         state_json=CASE WHEN COALESCE(clues.updated_ch, 0) > 0
+                           THEN clues.state_json ELSE excluded.state_json END,
+                         resolved=CASE WHEN COALESCE(clues.updated_ch, 0) > 0
+                           THEN clues.resolved ELSE excluded.resolved END""",
                     (cid, c.get("name", ""), c.get("type", ""),
                      c.get("description", ""), c.get("introduced_chapter"),
                      c.get("intended_reveal_chapter") or c.get("intended_resolution_chapter"),
@@ -171,6 +202,8 @@ class NovelDB:
                 (ch, titles.get(ch, ""), len(text)))
             n += 1
         counts["chapter_log"] = n
+        self.conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('bible_signature',?)",
+                          (self._bible_signature(),))
         self.conn.commit()
         return counts
 
@@ -257,11 +290,52 @@ class NovelDB:
             (chapter, fid))
         self.conn.commit()
 
-    def update_clue(self, cid, state: dict, chapter):
+    def upsert_clue(self, cid, data: dict, chapter=None):
+        state = data.get("state", data)
         self.conn.execute(
+            """INSERT INTO clues(id,name,type,description,introduced_ch,
+                   intended_reveal_ch,resolved,state_json,updated_ch)
+               VALUES(?,?,?,?,?,?,?,?,?)
+               ON CONFLICT(id) DO UPDATE SET
+                 name=excluded.name, type=excluded.type,
+                 description=excluded.description,
+                 introduced_ch=excluded.introduced_ch,
+                 intended_reveal_ch=excluded.intended_reveal_ch,
+                 resolved=excluded.resolved, state_json=excluded.state_json,
+                 updated_ch=excluded.updated_ch""",
+            (cid, data.get("name", ""), data.get("type", ""),
+             data.get("description", ""), data.get("introduced_chapter"),
+             data.get("intended_reveal_chapter") or data.get("intended_resolution_chapter"),
+             1 if data.get("resolved") else 0,
+             json.dumps(state, ensure_ascii=False), chapter))
+        self.conn.commit()
+
+    def update_clue(self, cid, state: dict, chapter):
+        cursor = self.conn.execute(
             """UPDATE clues SET state_json=?, resolved=?, updated_ch=? WHERE id=?""",
             (json.dumps(state, ensure_ascii=False), 1 if state.get("resolved") else 0,
              chapter, cid))
+        self.conn.commit()
+        return cursor.rowcount
+
+    def upsert_foreshadow(self, fid, data: dict):
+        hinted = data.get("hinted_chapters")
+        if hinted is None:
+            introduced = data.get("introduced_chapter")
+            hinted = [introduced] if introduced else []
+        self.conn.execute(
+            """INSERT INTO foreshadowing(id,name,status,planted_ch,payoff_ch,
+                   resolved_ch,description,hinted_chs)
+               VALUES(?,?,?,?,?,?,?,?)
+               ON CONFLICT(id) DO UPDATE SET
+                 name=excluded.name, status=excluded.status,
+                 planted_ch=excluded.planted_ch, payoff_ch=excluded.payoff_ch,
+                 resolved_ch=excluded.resolved_ch, description=excluded.description,
+                 hinted_chs=excluded.hinted_chs""",
+            (fid, data.get("name", ""), data.get("status", "pending"),
+             data.get("introduced_chapter"), data.get("intended_payoff_chapter"),
+             data.get("resolved_chapter"), data.get("description", ""),
+             json.dumps(hinted)))
         self.conn.commit()
 
     def add_lesson(self, chapter, issue, fix, source="user"):

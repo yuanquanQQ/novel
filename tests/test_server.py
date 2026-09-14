@@ -1,102 +1,183 @@
-# 后端 API 冒烟测试: python -m unittest tests.test_server -v
+# 后端 API 测试: python -m unittest tests.test_server -v
 import json
+import shutil
 import sys
-import time
+import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from fastapi.testclient import TestClient
-from server.app import app
+
+import engine.novel_creator as novel_creator
+import engine.settings as settings
+from engine.db import NovelDB
+from engine.style_kit import scanner
+import server.app as server_app
 
 
 class TestServerAPI(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.c = TestClient(app)
+        cls._tmp = tempfile.TemporaryDirectory()
+        cls.temp_root = Path(cls._tmp.name)
+        cls.novels_dir = cls.temp_root / "novels"
+        cls.novels_dir.mkdir()
+        cls.style_dir = cls.temp_root / "style_kit"
+        cls.style_dir.mkdir()
+        shutil.copy(
+            ROOT / "engine" / "style_kit" / "banned_words.json",
+            cls.style_dir / "banned_words.json",
+        )
+
+        cls._original_rules_file = scanner.RULES_FILE
+        cls._patches = [
+            patch.object(settings, "NOVELS_DIR", cls.novels_dir),
+            patch.object(novel_creator, "NOVELS_DIR", cls.novels_dir),
+            patch.object(server_app, "NOVELS_DIR", cls.novels_dir),
+            patch.object(server_app, "SK", cls.style_dir),
+        ]
+        for item in cls._patches:
+            item.start()
+        scanner.RULES_FILE = cls.style_dir / "banned_words.json"
+
+        novel_creator.create_novel(
+            "my-story", "我的小说", 8, 1500, "悬疑", "临时服务端测试小说"
+        )
+        novel_dir = cls.novels_dir / "my-story"
+        (novel_dir / "generated" / "chapter_01.md").write_text(
+            "「门外是谁？」\n林一握紧钥匙，没敢开门。", encoding="utf-8"
+        )
+        (novel_dir / "generated" / "chapter_02.md").write_text(
+            '然而门开了。\n他说："别动。"', encoding="utf-8"
+        )
+        db = NovelDB(novel_dir)
+        try:
+            db.upsert_character(
+                "林一",
+                {
+                    "role": "主角",
+                    "voice_print": "短句",
+                    "first_appearance_chapter": 1,
+                },
+                1,
+            )
+            db.upsert_foreshadow(
+                "F001",
+                {
+                    "name": "旧钥匙",
+                    "status": "active",
+                    "introduced_chapter": 1,
+                    "intended_payoff_chapter": 6,
+                    "description": "钥匙来源不明",
+                    "hinted_chapters": [1],
+                },
+            )
+        finally:
+            db.close()
+
+        cls.c = TestClient(server_app.app)
+
+    @classmethod
+    def tearDownClass(cls):
+        server_app.T._TASKS.clear()
+        server_app.T._LOCKS.clear()
+        scanner.RULES_FILE = cls._original_rules_file
+        for item in reversed(cls._patches):
+            item.stop()
+        cls._tmp.cleanup()
 
     def test_01_novels_list(self):
-        r = self.c.get("/api/novels")
-        self.assertEqual(r.status_code, 200)
-        ids = [n["id"] for n in r.json()]
-        self.assertIn("mirror-city", ids)
+        response = self.c.get("/api/novels")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual([novel["id"] for novel in response.json()], ["my-story"])
 
     def test_02_status(self):
-        r = self.c.get("/api/novels/mirror-city/status")
-        d = r.json()
-        self.assertEqual(d["title"], "镜影迷城")
-        self.assertIn("volumes", d)
-        self.assertIn("db", d)
+        response = self.c.get("/api/novels/my-story/status")
+        self.assertEqual(response.status_code, 200, response.text)
+        data = response.json()
+        self.assertEqual(data["title"], "我的小说")
+        self.assertEqual(data["written"], 2)
+        self.assertIn("volumes", data)
+        self.assertIn("db", data)
 
     def test_03_chapters(self):
-        r = self.c.get("/api/novels/mirror-city/chapters")
-        rows = r.json()
-        self.assertTrue(rows)
-        n = rows[0]["num"]
-        r2 = self.c.get(f"/api/novels/mirror-city/chapters/{n}")
-        self.assertIn("content", r2.json())
+        rows = self.c.get("/api/novels/my-story/chapters").json()
+        self.assertEqual([row["num"] for row in rows], [1, 2])
+        response = self.c.get("/api/novels/my-story/chapters/1")
+        self.assertIn("握紧钥匙", response.json()["content"])
 
     def test_04_scan(self):
-        r = self.c.get("/api/novels/mirror-city/scan/2")
-        d = r.json()
-        self.assertIn("metrics", d)
-        self.assertFalse(d["passed"])   # 旧章节应有违规（回归基线）
+        response = self.c.get("/api/novels/my-story/scan/2")
+        self.assertEqual(response.status_code, 200, response.text)
+        data = response.json()
+        self.assertIn("metrics", data)
+        self.assertFalse(data["passed"])
+        self.assertTrue(data["metrics"]["has_halfwidth_quote"])
 
     def test_05_db_browse(self):
-        r = self.c.get("/api/novels/mirror-city/db/characters")
-        self.assertTrue(r.json())
-        r = self.c.get("/api/novels/mirror-city/db/foreshadowing?current=50")
-        self.assertIn("buckets", r.json())
-        r = self.c.get("/api/novels/mirror-city/db/style-hits")
-        self.assertIn("patterns", r.json())
+        characters = self.c.get("/api/novels/my-story/db/characters").json()
+        self.assertEqual(characters[0]["name"], "林一")
+        foreshadow = self.c.get(
+            "/api/novels/my-story/db/foreshadowing?current=5"
+        ).json()
+        self.assertEqual(foreshadow["rows"][0]["id"], "F001")
+        style_hits = self.c.get("/api/novels/my-story/db/style-hits").json()
+        self.assertIn("patterns", style_hits)
 
-    def test_06_style_kit_roundtrip(self):
-        r = self.c.get("/api/style-kit")
-        data = r.json()
+    def test_06_style_kit_roundtrip_uses_temporary_copy(self):
+        response = self.c.get("/api/style-kit")
+        data = response.json()
         self.assertIn("hard_words", data)
-        r2 = self.c.put("/api/style-kit", json=data)   # 原样保存
-        self.assertTrue(r2.json()["ok"])
+        saved = self.c.put("/api/style-kit", json=data)
+        self.assertEqual(saved.status_code, 200, saved.text)
+        self.assertTrue(saved.json()["ok"])
+        self.assertEqual(scanner.RULES_FILE.parent, self.style_dir)
 
     def test_07_chapter_save_revalidates(self):
-        text = (self.c.get("/api/novels/mirror-city/chapters/1")
-                .json()["content"])
-        r = self.c.put("/api/novels/mirror-city/chapters/1",
-                       json={"content": text})          # 原样回存
-        self.assertEqual(r.status_code, 200)
-        self.assertIn("scan", r.json())
+        content = self.c.get("/api/novels/my-story/chapters/1").json()["content"]
+        response = self.c.put(
+            "/api/novels/my-story/chapters/1", json={"content": content}
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertIn("scan", response.json())
 
-    def test_08_task_db_init_streams(self):
-        r = self.c.post("/api/novels/mirror-city/tasks/db", json={})
-        self.assertEqual(r.status_code, 200, r.text)
-        tid = r.json()["task_id"]
+    def test_08_task_submission_and_event_stream(self):
+        with patch.object(server_app.T, "running_task", return_value=None), patch.object(
+            server_app.T, "submit", return_value="temporary-task"
+        ) as submit:
+            response = self.c.post("/api/novels/my-story/tasks/db", json={})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["task_id"], "temporary-task")
+        submit.assert_called_once_with("my-story", "db", ["init"])
+
+        server_app.T._TASKS["temporary-task"] = {
+            "id": "temporary-task",
+            "novel": "my-story",
+            "action": "db",
+            "args": ["init"],
+            "status": "done",
+            "lines": ["知识库已导入\n"],
+            "started": 0,
+        }
         got = []
-        with self.c.stream("GET", f"/api/tasks/{tid}/events") as s:
-            for line in s.iter_lines():
+        with self.c.stream("GET", "/api/tasks/temporary-task/events") as stream:
+            for line in stream.iter_lines():
                 if line.startswith("data:"):
-                    payload = json.loads(line[5:].strip())
-                    got.append(payload)
-                    if "__TASK_END__" in payload:
-                        break
-                if len(got) > 50:
-                    break
-        self.assertTrue(any("知识库" in g or "characters=" in g for g in got))
-        self.assertTrue(got[-1].startswith("__TASK_END__ done"), got[-1])
+                    got.append(json.loads(line[5:].strip()))
+        self.assertEqual(got, ["知识库已导入\n", "__TASK_END__ done"])
 
     def test_09_task_lock(self):
-        r1 = self.c.post("/api/novels/wangu-changqing/tasks/db", json={})
-        self.assertEqual(r1.status_code, 200)
-        r2 = self.c.post("/api/novels/wangu-changqing/tasks/db", json={})
-        # 可能 409（还在跑）或 200（已完成）——不该 500
-        self.assertIn(r2.status_code, (200, 409))
-        if r2.status_code == 200:
-            tid = r2.json()["task_id"]
-            with self.c.stream("GET", f"/api/tasks/{tid}/events") as s:
-                for line in s.iter_lines():
-                    if "__TASK_END__" in line:
-                        break
+        with patch.object(server_app.T, "running_task", return_value="busy-task"), patch.object(
+            server_app.T, "submit"
+        ) as submit:
+            response = self.c.post("/api/novels/my-story/tasks/db", json={})
+        self.assertEqual(response.status_code, 409)
+        submit.assert_not_called()
 
 
 if __name__ == "__main__":
