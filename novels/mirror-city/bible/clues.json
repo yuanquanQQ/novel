@@ -1,0 +1,182 @@
+{
+  "_schema": "1.0",
+  "_description": "线索追踪库，由 Archivist + Keeper Agent 自动维护",
+  "clues": {
+    "C001": {
+      "name": "车祸真相",
+      "type": "主线",
+      "description": "第1章林泽与叶清遭遇的车祸究竟是意外还是人为安排",
+      "introduced_chapter": 1,
+      "intended_reveal_chapter": 46,
+      "current_state": "未展开",
+      "related_characters": [
+        "林泽",
+        "叶清"
+      ],
+      "related_foreshadowing": [
+        "F001"
+      ],
+      "new_development": "镜子异常频繁出现，倒影独立行动，镜中世界存在",
+      "resolved": false
+    },
+    "C002": {
+      "name": "叶清下落",
+      "type": "主线",
+      "description": "叶清在车祸后是否真的死亡？为何在镜影层能看到她的影像",
+      "introduced_chapter": 1,
+      "intended_reveal_chapter": 46,
+      "current_state": "未展开",
+      "related_characters": [
+        "叶清",
+        "林泽"
+      ],
+      "related_foreshadowing": [
+        "F002"
+      ],
+      "new_development": "虎口伤口渗出银色液体，液体形成纹路，与符号相关",
+      "resolved": false
+    },
+    "C003": {
+      "name": "镜中连环失踪案",
+      "type": "案件线",
+      "description": "城中多人失踪，最后被目击时均在注视镜子。卷一首个大型案件。",
+      "introduced_chapter": 21,
+      "intended_resolution_chapter": 45,
+      "current_state": "未展开",
+      "related_characters": [
+        "林泽",
+        "苏晚"
+      ],
+      "related_foreshadowing": []
+    },
+    "C004": {
+      "name": "镜守会的秘密",
+      "type": "世界观",
+      "description": "镜守会的真实目的、组织架构、以及为何监视林泽",
+      "introduced_chapter": 36,
+      "intended_reveal_chapter": 110,
+      "current_state": "未展开",
+      "related_characters": [
+        "苏晚"
+      ],
+      "related_foreshadowing": [
+        "F004"
+      ]
+    },
+    "C005": {
+      "name": "林泽身世之谜",
+      "type": "主线",
+      "description": "林泽被抹去的童年记忆是什么？父母在当年的实验中的角色？",
+      "introduced_chapter": 1,
+      "intended_reveal_chapter": 126,
+      "current_state": "未展开",
+      "related_characters": [
+        "林泽"
+      ],
+      "related_foreshadowing": [
+        "F003",
+        "F005"
+      ],
+      "new_development": "黑猫颈圈符号与林泽眉疤相同，出现在银色液体纹路中",
+      "resolved": false
+    },
+    "C006": {
+      "name": "镜影容器计划",
+      "type": "主线",
+      "description": "人为制造连接点的实验项目，林泽与叶清均为受害者",
+      "introduced_chapter": 46,
+      "intended_reveal_chapter": 181,
+      "current_state": "未展开",
+      "related_characters": [
+        "林泽",
+        "叶清"
+      ],
+      "related_foreshadowing": [
+        "F005",
+        "F006"
+      ]
+    },
+    "C007": {
+      "name": "三大势力博弈",
+      "type": "世界观",
+      "description": "镜守会、融界派、猎影者的三角博弈。各自的真正目标是？",
+      "introduced_chapter": 66,
+      "intended_reveal_chapter": 171,
+      "current_state": "未展开",
+      "related_characters": [
+        "苏晚"
+      ],
+      "related_foreshadowing": []
+    },
+    "C008": {
+      "name": "镜塔的终极功能",
+      "type": "世界观",
+      "description": "城市中心全玻璃大厦镜塔的真正用途——可能是人为建造的镜影层入口",
+      "introduced_chapter": 1,
+      "intended_reveal_chapter": 171,
+      "current_state": "未展开",
+      "related_characters": [],
+      "related_foreshadowing": [
+        "F008"
+      ]
+    }
+  },
+  "active_foreshadowing": {
+    "F001": {
+      "name": "古董永不反射镜",
+      "introduced_chapter": 1,
+      "status": "pending",
+      "intended_payoff_chapter": 126,
+      "description": "一面不反光的古董镜子，在林泽家中出现，实为父母实验的遗留物"
+    },
+    "F002": {
+      "name": "镜中叶清",
+      "introduced_chapter": 1,
+      "status": "pending",
+      "intended_payoff_chapter": 46,
+      "description": "林泽在车祸后看到镜中叶清的身影——她是镜影容器的首批受害者"
+    },
+    "F003": {
+      "name": "林泽童年记忆缺口",
+      "introduced_chapter": 1,
+      "status": "pending",
+      "intended_payoff_chapter": 126,
+      "description": "林泽无法回忆起7-12岁期间的童年经历，此为人为记忆抹除"
+    },
+    "F004": {
+      "name": "苏晚的秘密纹身",
+      "introduced_chapter": 21,
+      "status": "pending",
+      "intended_payoff_chapter": 110,
+      "description": "苏晚右腕内侧有一处被遮盖的纹身——镜守会核心成员标记"
+    },
+    "F005": {
+      "name": "林泽父母实验记录",
+      "introduced_chapter": 51,
+      "status": "pending",
+      "intended_payoff_chapter": 126,
+      "description": "林泽父母（或养父母）当年参与镜影容器计划的实验记录"
+    },
+    "F006": {
+      "name": "镜像共生体绑定",
+      "introduced_chapter": 1,
+      "status": "pending",
+      "intended_payoff_chapter": 151,
+      "description": "林泽与叶清是罕见的镜像共生体，一人死则另一人也崩溃"
+    },
+    "F007": {
+      "name": "黑猫真实身份",
+      "introduced_chapter": 1,
+      "status": "pending",
+      "intended_payoff_chapter": 126,
+      "description": "能在现实与镜影层自由穿梭的黑猫，真实身份在卷三揭示"
+    },
+    "F008": {
+      "name": "镜塔建造目的",
+      "introduced_chapter": 1,
+      "status": "pending",
+      "intended_payoff_chapter": 171,
+      "description": "城市中心全玻璃大厦镜塔，实为人为建造的镜影层大型入口"
+    }
+  }
+}

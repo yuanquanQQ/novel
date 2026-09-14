@@ -1,0 +1,18 @@
+:root {
+  --bg: #f5f6f8;
+}
+html, body, #app { height: 100%; margin: 0; }
+body { font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; background: var(--bg); }
+.page { padding: 18px 22px; }
+.page h2 { margin: 0 0 16px; font-size: 20px; }
+.muted { color: #909399; font-size: 13px; }
+.mono { font-family: "Cascadia Code", Consolas, "Courier New", monospace; }
+.prose { white-space: pre-wrap; line-height: 1.9; font-size: 16px; }
+.grow { flex: 1; }
+.row { display: flex; gap: 12px; align-items: center; }
+.wrap { flex-wrap: wrap; }
+.card { background: #fff; border-radius: 10px; padding: 16px; box-shadow: 0 1px 4px rgba(0,0,0,.06); }
+.stat-num { font-size: 26px; font-weight: 700; color: #303133; }
+.log { background: #1e1e1e; color: #d4d4d4; border-radius: 8px; padding: 14px; height: 420px; overflow-y: auto; font-family: Consolas, monospace; font-size: 13px; white-space: pre-wrap; word-break: break-all; }
+.log .done { color: #4ec9b0; }
+.log .warn { color: #dcdcaa; }
