@@ -27,12 +27,19 @@ if not exist "%ROOT%web\node_modules" (
 )
 
 echo 正在启动小说创作控制台...
-start "Novel Backend" /D "%ROOT%" cmd /k ""%PYTHON%" -X utf8 -m uvicorn server.app:app --host 127.0.0.1 --port 11452 --reload"
-start "Novel Frontend" /D "%ROOT%web" cmd /k "npm run dev"
-
 echo.
-echo 后端：http://127.0.0.1:11452
-echo 前端：http://localhost:11451
-echo 关闭两个新窗口即可停止服务。
-timeout /t 3 >nul
-endlocal
+echo [后端] http://127.0.0.1:11452
+echo [前端] http://localhost:11451
+echo.
+echo 正在同一终端启动后端和前端，按 Ctrl+C 可停止服务。
+echo.
+
+cd /d "%ROOT%"
+start "" /b "%PYTHON%" -X utf8 -m uvicorn server.app:app --host 127.0.0.1 --port 11452 --reload
+cd /d "%ROOT%web"
+start "" /b cmd /c "npm run dev"
+cd /d "%ROOT%"
+
+:wait
+ timeout /t 3600 >nul
+ goto wait
