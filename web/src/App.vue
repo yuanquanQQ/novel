@@ -63,11 +63,23 @@
         <el-input v-model="themeRequest.inspiration" maxlength="1000" show-word-limit placeholder="可选：一句灵感、人物或场景" />
         <el-input v-model="themeRequest.genre" maxlength="100" placeholder="可选：题材偏好" />
       </div>
+      <div class="theme-inputs theme-selects">
+        <el-select v-model="themeRequest.channel" placeholder="频道">
+          <el-option v-for="channel in CHANNELS" :key="channel" :label="channel" :value="channel" />
+        </el-select>
+        <el-select v-model="themeRequest.protagonist_gender" placeholder="主角类型">
+          <el-option v-for="gender in PROTAGONIST_GENDERS" :key="gender" :label="gender" :value="gender" />
+        </el-select>
+        <el-select v-model="themeRequest.length" placeholder="篇幅">
+          <el-option v-for="preset in LENGTH_PRESETS" :key="preset" :label="preset" :value="preset" />
+        </el-select>
+      </div>
       <el-alert v-if="themeError" class="theme-error" type="error" :title="themeError" :closable="false" show-icon />
       <div v-if="themeOptions.length" class="theme-cards">
         <button v-for="option in themeOptions" :key="option.id" type="button" class="theme-card" @click="applyTheme(option)">
           <span class="theme-card-title">{{ option.title }}</span>
           <span class="theme-card-meta">{{ option.genre }} · {{ option.chapter_count }} 章 · 每章 {{ option.words_per_chapter }} 字</span>
+          <span class="theme-card-line"><b>主角</b>{{ option.protagonist_name }}（{{ option.protagonist_gender }}）</span>
           <span class="theme-card-copy">{{ option.description }}</span>
           <span class="theme-card-line"><b>主题</b>{{ option.theme }}</span>
           <span class="theme-card-line"><b>冲突</b>{{ option.conflict }}</span>
@@ -131,7 +143,14 @@ const themeLoading = ref(false)
 const themeError = ref('')
 const themeOptions = ref([])
 const THEME_DIRECTIONS = ['悬疑推理', '都市情感', '科幻未来', '奇幻冒险', '历史权谋', '成长热血', '惊悚生存', '自由创作']
-const themeRequest = reactive({ inspiration: '', genre: '', direction: '' })
+const CHANNELS = ['男频', '女频', '不限']
+const PROTAGONIST_GENDERS = ['男主角', '女主角', '双主角', '不限']
+const LENGTH_PRESETS = ['长篇200-400章', '超长篇500-800章', '巨长篇1000-1500章']
+const defaultThemeRequest = () => ({
+  inspiration: '', genre: '', direction: '', channel: '男频',
+  protagonist_gender: '男主角', length: '长篇200-400章',
+})
+const themeRequest = reactive(defaultThemeRequest())
 const createFormRef = ref(null)
 const form = reactive({ id: '', title: '', chapter_count: 200, words_per_chapter: 3000, genre: '', description: '' })
 const createPanels = ref([])
@@ -178,7 +197,7 @@ function openCreate() {
   Object.assign(form, { id: '', title: '', chapter_count: 200, words_per_chapter: 3000, genre: '', description: '' })
   Object.assign(modelForm, emptyModelForm())
   createPanels.value = []
-  Object.assign(themeRequest, { inspiration: '', genre: '', direction: '' })
+  Object.assign(themeRequest, defaultThemeRequest())
   themeOptions.value = []
   themeError.value = ''
   createVisible.value = true
@@ -209,7 +228,7 @@ function applyTheme(option) {
     chapter_count: option.chapter_count,
     words_per_chapter: option.words_per_chapter,
     genre: option.genre,
-    description: `${option.description}\n\n主题：${option.theme}\n核心冲突：${option.conflict}`,
+    description: `${option.description}\n\n主角：${option.protagonist_name}（${option.protagonist_gender}）\n主题：${option.theme}\n核心冲突：${option.conflict}`,
   })
   createFormRef.value?.clearValidate()
 }
@@ -328,6 +347,7 @@ async function submitCreate() {
 .direction-card { padding: 7px 12px; color: #52606d; background: #fff; border: 1px solid var(--border); border-radius: 8px; cursor: pointer; }
 .direction-card:hover, .direction-card.selected { color: var(--primary); border-color: var(--primary); background: var(--primary-soft); }
 .theme-inputs { display: grid; grid-template-columns: 2fr 1fr; gap: 10px; margin-top: 14px; }
+.theme-selects { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 .theme-error { margin-top: 12px; }
 .theme-cards { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; margin-top: 14px; }
 .theme-card { display: flex; flex-direction: column; gap: 7px; min-width: 0; padding: 14px; color: var(--text); text-align: left; background: #fff; border: 1px solid var(--border); border-radius: 10px; cursor: pointer; transition: border-color .2s, box-shadow .2s; }

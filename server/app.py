@@ -23,6 +23,9 @@ from engine.novel_creator import (  # noqa: E402
     validate_slug,
 )
 from engine.theme_generator import (  # noqa: E402
+    CHANNELS,
+    LENGTH_PRESETS,
+    PROTAGONIST_GENDERS,
     THEME_DIRECTIONS,
     ThemeConfigurationError,
     ThemeGenerationError,
@@ -130,6 +133,9 @@ class ThemeGenerationBody(BaseModel):
     inspiration: str = Field(default="", max_length=1000)
     genre: str = Field(default="", max_length=100)
     direction: str = Field(..., max_length=20)
+    channel: str = "男频"
+    protagonist_gender: str = "男主角"
+    length: str = "长篇200-400章"
 
     @field_validator("direction")
     @classmethod
@@ -139,11 +145,34 @@ class ThemeGenerationBody(BaseModel):
             raise ValueError("请选择有效的主题方向")
         return value
 
+    @field_validator("channel")
+    @classmethod
+    def validate_channel(cls, value: str) -> str:
+        if value not in CHANNELS:
+            raise ValueError("请选择有效的频道")
+        return value
+
+    @field_validator("protagonist_gender")
+    @classmethod
+    def validate_protagonist_gender(cls, value: str) -> str:
+        if value not in PROTAGONIST_GENDERS:
+            raise ValueError("请选择有效的主角类型")
+        return value
+
+    @field_validator("length")
+    @classmethod
+    def validate_length(cls, value: str) -> str:
+        if value not in LENGTH_PRESETS:
+            raise ValueError("请选择有效的篇幅")
+        return value
+
 
 @app.post("/api/novel-themes/generate")
 def api_generate_novel_themes(body: ThemeGenerationBody):
     try:
-        options = generate_themes(body.inspiration, body.genre, body.direction)
+        options = generate_themes(
+            body.inspiration, body.genre, body.direction, body.channel,
+            body.protagonist_gender, body.length)
     except ThemeConfigurationError as exc:
         raise HTTPException(400, str(exc)) from exc
     except ThemeGenerationError as exc:

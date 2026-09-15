@@ -21,10 +21,12 @@ def _options():
             "id": f"test-story-{i}",
             "genre": "悬疑",
             "description": f"第{i}个故事简介",
-            "chapter_count": 80 + i,
+            "chapter_count": 200 + i,
             "words_per_chapter": 3000,
             "theme": "信任与选择",
             "conflict": f"主角必须解决第{i}个困局",
+            "protagonist_name": f"周寻{i}",
+            "protagonist_gender": "男主角",
         }
         for i in range(1, 4)
     ]
@@ -58,8 +60,12 @@ class ThemeGeneratorTests(unittest.TestCase):
         request = create.call_args.kwargs
         self.assertEqual(request["model"], "theme-model")
         self.assertEqual(request["response_format"], {"type": "json_object"})
-        self.assertIn("雨夜里的旧车站", request["messages"][1]["content"])
-        self.assertIn("创作方向：悬疑推理", request["messages"][1]["content"])
+        prompt = request["messages"][1]["content"]
+        self.assertIn("雨夜里的旧车站", prompt)
+        self.assertIn("创作方向：悬疑推理", prompt)
+        self.assertIn("频道：男频；目标主角类型：男主角", prompt)
+        self.assertIn("200 到 400 章", prompt)
+        self.assertIn("升级、明确爽点、势力成长与多卷结构", prompt)
 
     def test_generate_uses_root_env_when_environ_is_omitted(self):
         content = json.dumps({"options": _options()}, ensure_ascii=False)
@@ -84,6 +90,42 @@ class ThemeGeneratorTests(unittest.TestCase):
                     ThemeConfigurationError, "API_KEY 或 DEEPSEEK_API_KEY"
                 ):
                     generate_themes(direction="自由创作", environ=environ)
+
+    def test_generate_supports_female_channel_and_protagonist(self):
+        options = _options()
+        for option in options:
+            option["protagonist_gender"] = "女主角"
+            option["chapter_count"] = 500
+        content = json.dumps({"options": options}, ensure_ascii=False)
+        create = Mock(return_value=SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=content))]
+        ))
+        client = SimpleNamespace(chat=SimpleNamespace(
+            completions=SimpleNamespace(create=create)
+        ))
+
+        result = generate_themes(
+            direction="都市情感", channel="女频", protagonist_gender="女主角",
+            length="超长篇500-800章", client=client,
+            environ={"API_KEY": "secret"},
+        )
+
+        self.assertTrue(all(item["protagonist_gender"] == "女主角" for item in result))
+        prompt = create.call_args.kwargs["messages"][1]["content"]
+        self.assertIn("频道：女频；目标主角类型：女主角", prompt)
+        self.assertIn("500 到 800 章", prompt)
+
+    def test_parser_rejects_chapter_count_outside_expected_range(self):
+        options = _options()
+        options[0]["chapter_count"] = 199
+        with self.assertRaisesRegex(ThemeGenerationError, "200 到 400"):
+            parse_theme_response(json.dumps({"options": options}, ensure_ascii=False))
+
+    def test_parser_rejects_mismatched_protagonist_gender(self):
+        options = _options()
+        options[0]["protagonist_gender"] = "女主角"
+        with self.assertRaisesRegex(ThemeGenerationError, "主角类型与期望不符"):
+            parse_theme_response(json.dumps({"options": options}, ensure_ascii=False), "男主角", (200, 400))
 
     def test_invalid_and_duplicate_ids_receive_unique_safe_fallbacks(self):
         options = _options()
@@ -120,7 +162,19 @@ class ThemeGeneratorAPITests(unittest.TestCase):
             )
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(response.json(), {"options": options})
-        generate.assert_called_once_with("逆行列车", "科幻", "科幻未来")
+        generate.assert_called_once_with(
+            "逆行列车", "科幻", "科幻未来", "男频", "男主角", "长篇200-400章")
+
+    def test_api_passes_channel_gender_and_length(self):
+        with patch.object(server_app, "generate_themes", return_value=[]) as generate:
+            response = self.client.post(
+                "/api/novel-themes/generate",
+                json={"direction": "都市情感", "channel": "女频",
+                      "protagonist_gender": "女主角", "length": "超长篇500-800章"},
+            )
+        self.assertEqual(response.status_code, 200, response.text)
+        generate.assert_called_once_with(
+            "", "", "都市情感", "女频", "女主角", "超长篇500-800章")
 
     def test_api_maps_configuration_and_generation_errors(self):
         cases = [
