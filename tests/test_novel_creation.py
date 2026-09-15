@@ -60,7 +60,7 @@ class TestNovelCreationAPI(unittest.TestCase):
             self.assertIn(name, prompts)
 
         titles = self.client.get("/api/novels/small-book/titles").json()
-        self.assertEqual(list(titles["volumes"]), ["volume_1", "volume_2", "volume_3"])
+        self.assertEqual(list(titles["volumes"]), ["volume_1"])
         self.assertEqual(
             list(self.client.get("/api/novels/small-book/bible").json()),
             server_app.BIBLE_FILES,
@@ -207,6 +207,19 @@ class TestNovelCreationAPI(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         motif = self.client.get("/api/novels/crud-book/db/motifs").json()[0]
         self.assertEqual(motif["used_in_chapters"], [2, 5])
+
+    def test_dynamic_volumes_are_balanced_and_continuous(self):
+        for chapters in (200, 500, 1000, 1500):
+            volumes = novel_creator._volume_config(chapters)
+            ranges = [value["chapters"] for value in volumes.values()]
+            self.assertEqual(ranges[0][0], 1)
+            self.assertEqual(ranges[-1][1], chapters)
+            self.assertTrue(all(left[1] + 1 == right[0]
+                                for left, right in zip(ranges, ranges[1:])))
+            sizes = [hi - lo + 1 for lo, hi in ranges]
+            self.assertTrue(all(40 <= size <= 80 for size in sizes))
+            self.assertLessEqual(max(sizes) - min(sizes), 1)
+        self.assertEqual(novel_creator._volume_config(3)["volume_1"]["chapters"], (1, 3))
 
 
 if __name__ == "__main__":

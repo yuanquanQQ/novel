@@ -7,6 +7,7 @@ export const api = {
   generateNovelThemes: (data) => http.post('/novel-themes/generate', data, { timeout: 90000 }).then(r => r.data),
   createNovel: (data) => http.post('/novels', data).then(r => r.data),
   exportNovel: (n) => http.get(`/novels/${n}/export`, { responseType: 'blob' }).then(r => r.data),
+  backupNovel: (n) => http.get(`/novels/${n}/backup`, { responseType: 'blob' }).then(r => r.data),
   deleteNovel: (n) => http.delete(`/novels/${n}`).then(r => r.data),
   status: (n) => http.get(`/novels/${n}/status`).then(r => r.data),
 
@@ -16,6 +17,7 @@ export const api = {
   saveTitle: (n, chapter, title) => http.put(`/novels/${n}/titles`, { chapter, title }).then(r => r.data),
 
   chapters: (n) => http.get(`/novels/${n}/chapters`).then(r => r.data),
+  chaptersPage: (n, params) => http.get(`/novels/${n}/chapters-page`, { params }).then(r => r.data),
   chapter: (n, num) => http.get(`/novels/${n}/chapters/${num}`).then(r => r.data),
   saveChapter: (n, num, content) => http.put(`/novels/${n}/chapters/${num}`, { content }).then(r => r.data),
   scanChapter: (n, num) => http.get(`/novels/${n}/scan/${num}`).then(r => r.data),
@@ -43,6 +45,7 @@ export const api = {
 
   tasks: (n) => http.get(`/novels/${n}/tasks`).then(r => r.data),
   runTask: (n, action, body) => http.post(`/novels/${n}/tasks/${action}`, body).then(r => r.data),
+  cancelTask: (tid) => http.post(`/tasks/${tid}/cancel`).then(r => r.data),
 
   pipeline: (n) => http.get(`/novels/${n}/pipeline`).then(r => r.data),
   modelConfig: (n) => http.get(`/novels/${n}/model-config`).then(r => r.data),

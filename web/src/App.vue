@@ -12,10 +12,13 @@
           <el-option v-for="n in novelStore.novels" :key="n.id" :label="`${n.title} · ${n.chapters_written}/${n.chapter_count || '?'}`" :value="n.id" />
         </el-select>
         <div v-if="novelStore.current" class="novel-actions">
-          <el-button plain :loading="exporting" :disabled="deleting" @click="exportCurrentNovel">
-            <el-icon v-if="!exporting"><Download /></el-icon>导出整本
+          <el-button plain :loading="exporting" :disabled="deleting || backingUp" @click="exportCurrentNovel">
+            <el-icon v-if="!exporting"><Download /></el-icon>导出稿件
           </el-button>
-          <el-button plain type="danger" :loading="deleting" :disabled="exporting" @click="deleteCurrentNovel">
+          <el-button plain :loading="backingUp" :disabled="deleting || exporting" @click="backupCurrentNovel">
+            <el-icon v-if="!backingUp"><Download /></el-icon>备份工作区
+          </el-button>
+          <el-button plain type="danger" :loading="deleting" :disabled="exporting || backingUp" @click="deleteCurrentNovel">
             <el-icon v-if="!deleting"><Delete /></el-icon>删除小说
           </el-button>
         </div>
@@ -120,6 +123,7 @@
       </el-collapse>
     </el-form>
     <template #footer>
+      <el-button type="danger" plain @click="clearCreateDraft">清空草稿</el-button>
       <el-button @click="createVisible = false">取消</el-button>
       <el-button type="primary" :loading="creating" @click="submitCreate">创建并进入</el-button>
     </template>
@@ -127,7 +131,7 @@
 </template>
 
 <script setup>
-import { computed, onMounted, reactive, ref } from 'vue'
+import { computed, nextTick, onMounted, reactive, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { useNovelStore } from './stores/novel'
@@ -138,6 +142,7 @@ const router = useRouter()
 const createVisible = ref(false)
 const creating = ref(false)
 const exporting = ref(false)
+const backingUp = ref(false)
 const deleting = ref(false)
 const themeLoading = ref(false)
 const themeError = ref('')
@@ -152,8 +157,13 @@ const defaultThemeRequest = () => ({
 })
 const themeRequest = reactive(defaultThemeRequest())
 const createFormRef = ref(null)
-const form = reactive({ id: '', title: '', chapter_count: 200, words_per_chapter: 3000, genre: '', description: '' })
+const defaultForm = () => ({ id: '', title: '', chapter_count: 200, words_per_chapter: 3000, genre: '', description: '' })
+const form = reactive(defaultForm())
 const createPanels = ref([])
+const CREATE_DRAFT_KEY = 'novel:create-draft'
+const FORM_FIELDS = ['id', 'title', 'chapter_count', 'words_per_chapter', 'genre', 'description']
+const THEME_REQUEST_FIELDS = ['inspiration', 'genre', 'direction', 'channel', 'protagonist_gender', 'length']
+let draftPaused = false
 const AGENT_ROLES = [
   { env: 'PLANNER_MODEL', label: '规划', default: 'deepseek-reasoner' },
   { env: 'RESEARCHER_MODEL', label: '检索', default: 'deepseek-reasoner' },
@@ -168,6 +178,84 @@ const AGENT_ROLES = [
 ]
 const emptyModelForm = () => ({ api_key: '', base_url: '', chat_model: '', reasoner_model: '', models: {} })
 const modelForm = reactive(emptyModelForm())
+
+function copyDraftFields(target, source, fields) {
+  if (!source || typeof source !== 'object' || Array.isArray(source)) return
+  for (const field of fields) {
+    if (Object.prototype.hasOwnProperty.call(source, field)) target[field] = source[field]
+  }
+}
+
+function resetCreateDraftFields() {
+  Object.assign(form, defaultForm())
+  Object.assign(themeRequest, defaultThemeRequest())
+  Object.assign(modelForm, emptyModelForm())
+  themeOptions.value = []
+  themeError.value = ''
+  createPanels.value = []
+}
+
+function loadCreateDraft() {
+  try {
+    const draft = JSON.parse(localStorage.getItem(CREATE_DRAFT_KEY))
+    if (!draft || typeof draft !== 'object' || Array.isArray(draft)) return null
+    if (draft.modelForm && typeof draft.modelForm === 'object' && 'api_key' in draft.modelForm) {
+      delete draft.modelForm.api_key
+      localStorage.setItem(CREATE_DRAFT_KEY, JSON.stringify(draft))
+    }
+    return draft
+  } catch {
+    return null
+  }
+}
+
+function restoreCreateDraft(draft) {
+  if (!draft) return
+  copyDraftFields(form, draft.form, FORM_FIELDS)
+  copyDraftFields(themeRequest, draft.themeRequest, THEME_REQUEST_FIELDS)
+  if (Array.isArray(draft.themeOptions)) themeOptions.value = draft.themeOptions
+  copyDraftFields(modelForm, draft.modelForm, ['base_url', 'chat_model', 'reasoner_model'])
+  if (draft.modelForm?.models && typeof draft.modelForm.models === 'object' && !Array.isArray(draft.modelForm.models)) {
+    modelForm.models = Object.fromEntries(
+      AGENT_ROLES
+        .filter(role => typeof draft.modelForm.models[role.env] === 'string')
+        .map(role => [role.env, draft.modelForm.models[role.env]]),
+    )
+  }
+  modelForm.api_key = ''
+}
+
+function removeCreateDraft() {
+  try {
+    localStorage.removeItem(CREATE_DRAFT_KEY)
+  } catch {
+    return
+  }
+}
+
+watch(
+  () => ({
+    form: { ...form },
+    themeRequest: { ...themeRequest },
+    themeOptions: themeOptions.value,
+    modelForm: {
+      base_url: modelForm.base_url,
+      chat_model: modelForm.chat_model,
+      reasoner_model: modelForm.reasoner_model,
+      models: { ...modelForm.models },
+    },
+  }),
+  draft => {
+    if (draftPaused) return
+    try {
+      localStorage.setItem(CREATE_DRAFT_KEY, JSON.stringify(draft))
+    } catch {
+      return
+    }
+  },
+  { deep: true },
+)
+
 const rules = {
   id: [
     { required: true, message: '请输入小说 ID', trigger: 'blur' },
@@ -194,13 +282,19 @@ onMounted(async () => {
 })
 
 function openCreate() {
-  Object.assign(form, { id: '', title: '', chapter_count: 200, words_per_chapter: 3000, genre: '', description: '' })
-  Object.assign(modelForm, emptyModelForm())
-  createPanels.value = []
-  Object.assign(themeRequest, defaultThemeRequest())
-  themeOptions.value = []
-  themeError.value = ''
+  resetCreateDraftFields()
+  restoreCreateDraft(loadCreateDraft())
   createVisible.value = true
+}
+
+async function clearCreateDraft() {
+  draftPaused = true
+  resetCreateDraftFields()
+  await nextTick()
+  draftPaused = false
+  removeCreateDraft()
+  createFormRef.value?.clearValidate()
+  ElMessage.success('新建小说草稿已清空')
 }
 
 async function generateThemes() {
@@ -262,9 +356,31 @@ async function exportCurrentNovel() {
   }
 }
 
+async function backupCurrentNovel() {
+  const id = novelStore.current
+  if (!id || backingUp.value || deleting.value || exporting.value) return
+  backingUp.value = true
+  try {
+    const blob = await api.backupNovel(id)
+    const url = URL.createObjectURL(blob)
+    const link = document.createElement('a')
+    link.href = url
+    link.download = `${id}-workspace.zip`
+    document.body.appendChild(link)
+    link.click()
+    link.remove()
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000)
+    ElMessage.success('工作区备份已下载（不含 .env）')
+  } catch (error) {
+    ElMessage.error(error.response?.data?.detail || '工作区备份失败，请稍后重试')
+  } finally {
+    backingUp.value = false
+  }
+}
+
 async function deleteCurrentNovel() {
   const id = novelStore.current
-  if (!id || deleting.value || exporting.value) return
+  if (!id || deleting.value || exporting.value || backingUp.value) return
   try {
     await ElMessageBox.confirm(
       `删除后将无法恢复，确定删除小说“${id}”吗？`,
@@ -306,6 +422,8 @@ async function submitCreate() {
       : undefined
     const created = await api.createNovel({ ...form, model })
     await novelStore.reload(created.id)
+    removeCreateDraft()
+    modelForm.api_key = ''
     createVisible.value = false
     await router.push({ name: 'dashboard' })
     ElMessage.success(`《${created.title}》已创建`)

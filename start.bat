@@ -12,19 +12,19 @@ if not exist "%PYTHON%" (
     exit /b 1
 )
 
-where npm >nul 2>nul
+where node.exe >nul 2>nul
 if errorlevel 1 (
-    echo [错误] 未找到 npm，请先安装 Node.js 并将 npm 加入 PATH。
+    echo [错误] 未找到 node.exe，请先安装 Node.js 并将 Node.js 加入 PATH。
     pause
     exit /b 1
 )
 
-if not exist "%ROOT%web\node_modules" (
+if not exist "%ROOT%web\node_modules\vite\bin\vite.js" (
     echo [错误] 前端依赖尚未安装。
     echo 请先运行：cd web ^&^& npm install
     pause
     exit /b 1
 )
 
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%ROOT%scripts\start.ps1"
-exit /b %errorlevel%
+start "" /b powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%ROOT%scripts\start.ps1"
+exit /b 0

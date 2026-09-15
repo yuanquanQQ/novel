@@ -34,7 +34,12 @@ def _validate_text(value: str, field: str, required: bool = False) -> str:
 
 def _volume_config(chapter_count: int) -> dict:
     volumes = {}
-    volume_count = min(4, chapter_count)
+    if chapter_count < 40:
+        volume_count = 1
+    else:
+        minimum = (chapter_count + 79) // 80
+        maximum = chapter_count // 40
+        volume_count = min(maximum, max(minimum, round(chapter_count / 60)))
     for index in range(volume_count):
         start = index * chapter_count // volume_count + 1
         end = (index + 1) * chapter_count // volume_count
@@ -157,7 +162,9 @@ def _prompts(title: str, genre: str, description: str) -> dict:
             "{{\"chapter_title\": \"...\", \"emotional_arc\": [0.7, 0.9], "
             "\"scene_outline\": [{{\"scene_id\": 1, \"type\": \"high_conflict|breathable\", "
             "\"target_emotion\": 0.9, \"description\": \"...\"}}], "
-            "\"clue_operations\": [{{\"clue_id\": \"F001\", \"action\": \"hint|reveal\", \"method\": \"...\"}}], "
+            "\"clue_operations\": [{{\"clue_id\": \"F001\", \"action\": \"plant|hint|escalate|reveal|reschedule|retire\", \"method\": \"...\"}}], "
+            "\"entities\": {{\"characters\": [], \"locations\": [], \"objects\": [], "
+            "\"factions\": [], \"abilities\": [], \"clue_ids\": []}}, "
             "\"chapter_hooks\": {{\"light_hook\": \"...\", \"dark_hook\": \"...\"}}}}"
         ), "chapter_template": (
             "## 创作指令\n{instruction}\n\n"
@@ -202,7 +209,7 @@ def _prompts(title: str, genre: str, description: str) -> dict:
             "【人味技法——每场景至少自然命中3条，禁止逐条交作业】\n[STYLE_TECHNIQUES]\n\n"
             "【番茄连载纪律】\n[STYLE_TOMATO]\n\n"
             "【硬性约束】\n"
-            "1. 直接引语对话占30-45%，禁止用叙述转述「X说了什么」。\n"
+            "1. 普通场景直接引语对话占30-45%；breathable场景允许无对话或低对话。禁止用叙述转述「X说了什么」。\n"
             "2. 情绪只许走身体反应和动作，禁止贴情绪标签词。\n"
             "3. 句式跟随情绪：紧张处句号斩短，舒缓处逗号连气；连续3句长短结构相近即不合格。\n"
             "4. 段落1-3行为主（手机视角），场景第一句直接以动作或对话进入。\n"
@@ -217,7 +224,7 @@ def _prompts(title: str, genre: str, description: str) -> dict:
             "【上文缓存】\n{keeper_cache}\n\n【草稿】\n{draft}\n\n"
             "检查：1) AI叙事模板：全员对话完整收尾没人打断/人物说金句讲道理/结尾升华总结；"
             "2) 信息直塞：叙述连续交代设定，关键信息靠一人口述而非碎片拼合；"
-            "3) 节奏：连续400字纯叙述无对话，情绪贴标签而非身体，段落过于均匀；"
+            "3) 节奏：普通场景连续400字纯叙述无对话，情绪贴标签而非身体，段落过于均匀；breathable场景允许低对话；"
             "4) 声口：抹掉人名认不出谁在说话=fail；所有人一个调=fail；"
             "5) 衔接：开头与上文缓存情绪断裂；正文不足1500字；视角越权。\n\n"
             "paragraph 只写违规句前8字，suggestion 不超15字。输出 JSON（不要其他文本）：\n"
@@ -261,7 +268,7 @@ def _prompts(title: str, genre: str, description: str) -> dict:
             "【场景正文】\n{scene_draft}"
         )},
         "archivist": {"system": (
-            "你是小说档案员。输入为本章结构化大纲与逐场景快照摘要（plot_progress/emotion_state/env_and_clue）。"
+            "你是小说档案员。输入为最终章节正文、本章结构化大纲与仅属于本章的逐场景快照摘要。"
             "只提取输入中明确出现的信息，禁止脑补推断。输出 JSON，不要其他文字，结构：\n"
             "{\n"
             "  \"character_updates\": {\"人物名\": {\"status_change\": \"一句话\", \"location\": \"所在地(未知则省略)\", \"injury_ability_item\": \"新伤/新能力/新物品(无则省略)\"}},\n"
@@ -275,9 +282,9 @@ def _prompts(title: str, genre: str, description: str) -> dict:
             "【当前所有伏笔】{all_foreshadowing}\n\n"
             "【本章大纲的伏笔操作】{clue_operations}\n\n"
             "【大纲】{plan_json}\n\n【近期章节摘要】{recent_summaries}\n\n"
-            "检查本章大纲（第{chapter_num}章）：\n"
-            "1. 回收类操作指向的伏笔是否真实存在？\n"
-            "2. 是否重复埋设已存在伏笔？\n"
+            "检查本章大纲（第{chapter_num}章），操作协议为 plant/hint/escalate/reveal/reschedule/retire：\n"
+            "1. 除plant外的操作指向的伏笔是否真实存在？\n"
+            "2. plant是否重复埋设已存在伏笔？\n"
             "3. 有哪些pending伏笔长期未触碰（暗章数>30）需要提醒？\n"
             "4. 计划在本章回收但与当前章节差距过大的伏笔是否遗漏？\n"
             "输出JSON：{{\"operation_warnings\": [\"...\"], \"overdue\": [\"Fxxx\"], \"stale\": [\"Fxxx\"], \"duplicates\": [\"...\"]}}"

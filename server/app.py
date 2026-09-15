@@ -1,13 +1,17 @@
 """小说创作引擎 — Web 控制台后端 (FastAPI)"""
 import io
 import json
+import os
 import re
 import shutil
+import sqlite3
+import stat
 import sys
+import tempfile
 import zipfile
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse, StreamingResponse
 from pydantic import BaseModel, Field, field_validator
@@ -15,6 +19,7 @@ from pydantic import BaseModel, Field, field_validator
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
+from engine.chapter_files import chapter_files, parse_chapter_number  # noqa: E402
 from engine.settings import NOVELS_DIR, load_config  # noqa: E402
 from engine.novel_creator import (  # noqa: E402
     NovelCreationError,
@@ -83,6 +88,171 @@ def api_export_novel(name: str):
         headers={"Content-Disposition": f'attachment; filename="{name}.zip"'})
 
 
+MAX_BACKUP_UPLOAD_BYTES = 100 * 1024 * 1024
+MAX_BACKUP_FILES = 5000
+MAX_BACKUP_FILE_BYTES = 100 * 1024 * 1024
+MAX_BACKUP_TOTAL_BYTES = 2 * 1024 * 1024 * 1024
+_BACKUP_TOP_FILES = {"config.py", "novel_prompts.json", ".env.example"}
+_BACKUP_DIRS = {"bible", "generated", "cache"}
+
+
+def _backup_file_allowed(relative: Path) -> bool:
+    parts = relative.parts
+    if not parts or any(part == ".env" for part in parts):
+        return False
+    if len(parts) == 1:
+        return parts[0] in _BACKUP_TOP_FILES
+    if parts[0] not in _BACKUP_DIRS:
+        return False
+    return not (parts[0] == "cache" and len(parts) > 1 and parts[1] == "failed_drafts")
+
+
+@app.get("/api/novels/{name}/backup")
+def api_backup_novel(name: str):
+    try:
+        validate_slug(name)
+    except NovelCreationError as exc:
+        raise HTTPException(404, f"小说不存在: {name}") from exc
+    d = novel_dir(name)
+    archive = io.BytesIO()
+    try:
+        with tempfile.TemporaryDirectory() as temp_name:
+            snapshot = Path(temp_name) / "novel.db"
+            db_path = d / "db" / "novel.db"
+            if db_path.is_file() and not db_path.is_symlink():
+                source = sqlite3.connect(str(db_path))
+                target = sqlite3.connect(str(snapshot))
+                try:
+                    source.backup(target)
+                finally:
+                    target.close()
+                    source.close()
+            with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as zf:
+                for path in d.rglob("*"):
+                    if path.is_symlink() or not path.is_file():
+                        continue
+                    relative = path.relative_to(d)
+                    if _backup_file_allowed(relative):
+                        zf.write(path, relative.as_posix())
+                if snapshot.exists():
+                    zf.write(snapshot, "db/novel.db")
+    except (OSError, sqlite3.Error, zipfile.BadZipFile) as exc:
+        raise HTTPException(500, f"工作区备份失败: {exc}") from exc
+    archive.seek(0)
+    return StreamingResponse(
+        archive, media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{name}-workspace.zip"'})
+
+
+def _validated_backup_members(zf: zipfile.ZipFile) -> list[tuple[zipfile.ZipInfo, PurePosixPath]]:
+    infos = zf.infolist()
+    if len(infos) > MAX_BACKUP_FILES:
+        raise HTTPException(413, f"备份文件数量超过限制（{MAX_BACKUP_FILES}）")
+    members = []
+    seen = set()
+    total = 0
+    allowed_roots = _BACKUP_DIRS | {"db"}
+    for info in infos:
+        raw = info.filename
+        if not raw or "\\" in raw or raw.startswith("/"):
+            raise HTTPException(400, f"备份包含不安全路径: {raw}")
+        relative = PurePosixPath(raw.rstrip("/"))
+        if not relative.parts or any(part in ("", ".", "..") for part in relative.parts):
+            raise HTTPException(400, f"备份包含不安全路径: {raw}")
+        key = relative.as_posix().casefold()
+        if key in seen:
+            raise HTTPException(400, f"备份包含重复路径: {raw}")
+        seen.add(key)
+        if any(part == ".env" for part in relative.parts):
+            raise HTTPException(400, "备份不得包含 .env")
+        if info.flag_bits & 0x1:
+            raise HTTPException(400, f"不支持加密文件: {raw}")
+        mode = info.external_attr >> 16
+        if stat.S_ISLNK(mode):
+            raise HTTPException(400, f"备份不得包含符号链接: {raw}")
+        if len(relative.parts) == 1:
+            allowed = relative.name in _BACKUP_TOP_FILES
+        else:
+            allowed = relative.parts[0] in allowed_roots
+            if relative.parts[0] == "db":
+                allowed = relative.as_posix() == "db/novel.db"
+            elif relative.parts[0] == "cache" and len(relative.parts) > 1:
+                allowed = relative.parts[1] != "failed_drafts"
+        if not allowed:
+            raise HTTPException(400, f"备份包含不允许的文件: {raw}")
+        if info.is_dir():
+            continue
+        if info.file_size > MAX_BACKUP_FILE_BYTES:
+            raise HTTPException(413, f"单个文件超过限制: {raw}")
+        total += info.file_size
+        if total > MAX_BACKUP_TOTAL_BYTES:
+            raise HTTPException(413, "备份解压后总大小超过限制")
+        members.append((info, relative))
+    required = {"config.py", "novel_prompts.json", "bible/master_bible.md"}
+    missing = required - seen
+    if missing:
+        raise HTTPException(400, f"备份缺少必要文件: {', '.join(sorted(missing))}")
+    return members
+
+
+@app.post("/api/novels/import-backup", status_code=201)
+async def api_import_backup(request: Request, id: str = Query(..., min_length=1, max_length=64)):
+    try:
+        novel_id = validate_slug(id)
+    except NovelCreationError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    root = NOVELS_DIR.resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    target = root / novel_id
+    if target.exists():
+        raise HTTPException(409, f"小说 id 已存在: {novel_id}")
+    content_length = request.headers.get("content-length")
+    if content_length:
+        try:
+            if int(content_length) > MAX_BACKUP_UPLOAD_BYTES:
+                raise HTTPException(413, "备份压缩包超过上传限制")
+        except ValueError as exc:
+            raise HTTPException(400, "Content-Length 无效") from exc
+    payload = bytearray()
+    async for chunk in request.stream():
+        payload.extend(chunk)
+        if len(payload) > MAX_BACKUP_UPLOAD_BYTES:
+            raise HTTPException(413, "备份压缩包超过上传限制")
+    temp_dir = Path(tempfile.mkdtemp(prefix=f".{novel_id}-restore-", dir=str(root)))
+    try:
+        with zipfile.ZipFile(io.BytesIO(payload)) as zf:
+            members = _validated_backup_members(zf)
+            for info, relative in members:
+                destination = temp_dir.joinpath(*relative.parts)
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                written = 0
+                with zf.open(info) as source, destination.open("wb") as output:
+                    while chunk := source.read(1024 * 1024):
+                        written += len(chunk)
+                        if written > MAX_BACKUP_FILE_BYTES or written > info.file_size:
+                            raise HTTPException(413, f"文件解压大小异常: {info.filename}")
+                        output.write(chunk)
+        restored_db = temp_dir / "db" / "novel.db"
+        if restored_db.exists():
+            conn = sqlite3.connect(str(restored_db))
+            try:
+                result = conn.execute("PRAGMA integrity_check").fetchone()
+                if not result or result[0] != "ok":
+                    raise HTTPException(400, "备份数据库完整性检查失败")
+            except sqlite3.DatabaseError as exc:
+                raise HTTPException(400, "备份数据库无法打开") from exc
+            finally:
+                conn.close()
+        os.replace(str(temp_dir), str(target))
+    except HTTPException:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        raise
+    except (OSError, zipfile.BadZipFile, zipfile.LargeZipFile) as exc:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        raise HTTPException(400, f"无效的工作区备份: {exc}") from exc
+    return {"ok": True, "id": novel_id}
+
+
 @app.delete("/api/novels/{name}")
 def api_delete_novel(name: str):
     try:
@@ -111,19 +281,35 @@ def api_novels():
                 title = json.loads(pf.read_text(encoding="utf-8")).get("_meta", {}).get("novel", d.name)
             except Exception:
                 pass
-        cf = d / "config.py"
         try:
             cfg = load_config(d.name)
             chapter_count = cfg.chapter_count
         except Exception:
             pass
-        gen = list((d / "generated").glob("chapter_*.md")) if (d / "generated").exists() else []
-        words = 0
-        try:
-            for f in gen:
-                words += len(f.read_text(encoding="utf-8"))
-        except Exception:
-            pass
+        gen = chapter_files(d / "generated")
+        words = None
+        db_path = d / "db" / "novel.db"
+        if db_path.is_file():
+            try:
+                conn = sqlite3.connect(str(db_path))
+                row = conn.execute(
+                    "SELECT COUNT(*), COUNT(words), COALESCE(SUM(words), 0) FROM chapter_log"
+                ).fetchone()
+                if row[0] == len(gen) and row[1] == row[0]:
+                    words = row[2]
+            except sqlite3.Error:
+                pass
+            finally:
+                if "conn" in locals():
+                    conn.close()
+                    del conn
+        if words is None:
+            words = 0
+            for fp in gen:
+                try:
+                    words += len(fp.read_text(encoding="utf-8"))
+                except (OSError, UnicodeError):
+                    continue
         out.append({"id": d.name, "title": title, "chapters_written": len(gen),
                     "chapter_count": chapter_count, "words": words})
     return out
@@ -261,14 +447,9 @@ def api_model_config_test(name: str, body: dict):
 def api_status(name: str):
     d = novel_dir(name)
     cfg = load_config(name)
-    gen = sorted((d / "generated").glob("chapter_*.md"))
+    gen = chapter_files(d / "generated")
     vols = []
-    done_chs = []
-    for f in gen:
-        try:
-            done_chs.append(int(f.stem.split("_")[1]))
-        except (IndexError, ValueError):
-            pass
+    done_chs = [parse_chapter_number(f) for f in gen]
     for vk, v in cfg.volume_config.items():
         lo, hi = v["chapters"]
         done = [c for c in done_chs if lo <= c <= hi]
@@ -328,26 +509,78 @@ def api_title_update(name: str, body: TitleBody):
 
 
 # ------------------------------------------------------------------- chapters
+def _chapter_metadata(d: Path):
+    titles = {}
+    volumes = {}
+    tf = d / "bible" / "chapter_titles.json"
+    if tf.exists():
+        data = json.loads(tf.read_text(encoding="utf-8"))
+        for key, volume in data.get("volumes", {}).items():
+            for raw, title in volume.get("chapters", {}).items():
+                number = int(raw)
+                titles[number] = title
+                volumes[number] = {"key": key, "name": volume.get("name", key)}
+    db = NovelDB(d)
+    try:
+        logs = {row["chapter"]: dict(row) for row in db.conn.execute(
+            "SELECT chapter,status,words FROM chapter_log"
+        ).fetchall()}
+    finally:
+        db.close()
+    return titles, volumes, logs
+
+
+def _chapter_item(number, fp, titles, volumes, logs):
+    log = logs.get(number, {})
+    words = log.get("words")
+    if words is None:
+        words = len(fp.read_text(encoding="utf-8"))
+    status = log.get("status") or "generated"
+    return {"num": number, "title": titles.get(number, ""), "words": words,
+            "updated": fp.stat().st_mtime, "status": status,
+            "volume": volumes.get(number),
+            "knowledge_stale": status == "knowledge_stale"}
+
+
 @app.get("/api/novels/{name}/chapters")
 def api_chapters(name: str):
     d = novel_dir(name)
-    tf = d / "bible" / "chapter_titles.json"
-    titles = {}
-    if tf.exists():
-        data = json.loads(tf.read_text(encoding="utf-8"))
-        for v in data.get("volumes", {}).values():
-            titles.update({int(k): t for k, t in v.get("chapters", {}).items()})
-    out = []
-    chapters = []
-    for fp in (d / "generated").glob("chapter_*.md"):
-        match = re.fullmatch(r"chapter_(\d+)\.md", fp.name)
-        if match:
-            chapters.append((int(match.group(1)), fp))
-    for n, fp in sorted(chapters):
-        text = fp.read_text(encoding="utf-8")
-        out.append({"num": n, "title": titles.get(n, ""), "words": len(text),
-                    "updated": fp.stat().st_mtime})
-    return out
+    titles, volumes, logs = _chapter_metadata(d)
+    return [_chapter_item(parse_chapter_number(fp), fp, titles, volumes, logs)
+            for fp in chapter_files(d / "generated")]
+
+
+@app.get("/api/novels/{name}/chapters-page")
+def api_chapters_page(
+    name: str,
+    offset: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=200),
+    q: str = Query("", max_length=100),
+    status: str = Query("", max_length=40),
+    chapter_from: int | None = Query(None, ge=1),
+    chapter_to: int | None = Query(None, ge=1),
+):
+    if chapter_from is not None and chapter_to is not None and chapter_from > chapter_to:
+        raise HTTPException(422, "chapter_from 不能大于 chapter_to")
+    d = novel_dir(name)
+    titles, volumes, logs = _chapter_metadata(d)
+    needle = q.strip().casefold()
+    matched = []
+    for fp in chapter_files(d / "generated"):
+        number = parse_chapter_number(fp)
+        chapter_status = logs.get(number, {}).get("status") or "generated"
+        if chapter_from is not None and number < chapter_from:
+            continue
+        if chapter_to is not None and number > chapter_to:
+            continue
+        if status and chapter_status != status:
+            continue
+        if needle and needle not in str(number) and needle not in titles.get(number, "").casefold():
+            continue
+        matched.append((number, fp))
+    page = matched[offset:offset + limit]
+    return {"items": [_chapter_item(number, fp, titles, volumes, logs)
+                      for number, fp in page], "total": len(matched)}
 
 
 @app.get("/api/novels/{name}/chapters/{num}")
@@ -368,17 +601,26 @@ async def api_chapter_save(name: str, num: int, body: dict):
     content = body.get("content", "")
     fp.write_text(content, encoding="utf-8")
     r = scanner.scan(content)
-    db = NovelDB(novel_dir(name))
+    d = novel_dir(name)
+    db = NovelDB(d)
     try:
         rows = r.to_rows(num)
         db.delete_style_hits(num)
         db.add_style_hits(rows)
-        db.log_chapter(num, words=len(content),
+        db.clear_chapter_derivatives(num)
+        db.log_chapter(num, words=len(content), status="knowledge_stale",
                        violations=sum(x[3] for x in rows
                                       if x[1] in ("禁用词", "句式", "排版")))
     finally:
         db.close()
-    return {"ok": True, "words": len(content),
+    for cache_file in (d / "cache").glob("keeper_cache_*.json"):
+        try:
+            cached_chapter = int(cache_file.stem.rsplit("_", 1)[-1])
+        except ValueError:
+            continue
+        if cached_chapter >= num:
+            cache_file.unlink()
+    return {"ok": True, "words": len(content), "knowledge_stale": True,
             "scan": {"passed": r.passed,
                      "violations": r.violations, "warnings": r.warnings}}
 
@@ -474,12 +716,19 @@ class ClueBody(BaseModel):
 
 class ForeshadowBody(BaseModel):
     name: str = ""
-    status: str = Field(default="pending", pattern="^(pending|active|resolved)$")
+    status: str = Field(
+        default="pending", pattern="^(pending|active|escalated|resolved|retired)$"
+    )
     introduced_chapter: int | None = Field(default=None, ge=1)
     intended_payoff_chapter: int | None = Field(default=None, ge=1)
+    payoff_start_chapter: int | None = Field(default=None, ge=1)
+    payoff_end_chapter: int | None = Field(default=None, ge=1)
     resolved_chapter: int | None = Field(default=None, ge=1)
     description: str = ""
     hinted_chapters: list[int] = Field(default_factory=list)
+    scope: str | None = None
+    importance: str | None = None
+    touch_interval: int | None = Field(default=None, ge=1)
 
 
 # ------------------------------------------------------------------ db browse
@@ -502,8 +751,13 @@ def _foreshadow_response(row) -> dict:
         "status": value["status"],
         "introduced_chapter": value["planted_ch"],
         "intended_payoff_chapter": value["payoff_ch"],
+        "payoff_start_chapter": value.get("payoff_start_ch"),
+        "payoff_end_chapter": value.get("payoff_end_ch"),
         "resolved_chapter": value["resolved_ch"],
         "description": value["description"],
+        "scope": value.get("scope"),
+        "importance": value.get("importance"),
+        "touch_interval": value.get("touch_interval"),
         "hinted_chapters": json.loads(value["hinted_chs"] or "[]"),
         **({"days_dark": value["days_dark"]} if "days_dark" in value else {}),
     }
@@ -703,12 +957,7 @@ def api_pipeline(name: str):
     b = d / "bible"
     gen = d / "generated"
 
-    written = []
-    for fp in (gen.glob("chapter_*.md")):
-        m = re.fullmatch(r"chapter_(\d+)\.md", fp.name)
-        if m:
-            written.append(int(m.group(1)))
-    written = sorted(set(written))
+    written = [parse_chapter_number(fp) for fp in chapter_files(gen)]
     missing = [c for c in range(1, (written[-1] + 1) if written else 1) if c not in written]
 
     outline_fp = b / "outline.md"
@@ -855,6 +1104,14 @@ async def api_task(name: str, action: str, body: TaskBody):
     except T.BusyError as e:
         raise HTTPException(409, str(e))
     return {"task_id": tid, "steps": len(steps or [1])}
+
+
+@app.post("/api/tasks/{tid}/cancel")
+def api_task_cancel(tid: str):
+    result = T.cancel(tid)
+    if result is None:
+        raise HTTPException(404, "任务不存在")
+    return result
 
 
 @app.get("/api/tasks/{tid}/events")

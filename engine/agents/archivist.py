@@ -1,5 +1,6 @@
 # Archivist Agent — 归档与知识库更新
 
+import hashlib
 import json
 import logging
 from engine.proxy import config
@@ -28,65 +29,77 @@ class ArchivistAgent:
         log.info(f"章节保存: {out_file}")
 
     def update_bible(self, chapter_num: int, plan_json: dict,
-                     keeper_cache: dict):
+                     keeper_cache: dict, full_chapter: str) -> bool:
         from engine.llm_client import chat_json
         from engine.prompts_loader import get_prompt
         system, _ = get_prompt("archivist")
-
+        snapshots = keeper_cache.get("current_chapter_snapshots", [])
+        if any(s.get("chapter_num") != chapter_num for s in snapshots):
+            raise ValueError("Archivist 收到非当前章快照")
         prompt = json.dumps({
             "chapter_num": chapter_num,
             "plan_title": plan_json.get("chapter_title", ""),
             "clue_operations": plan_json.get("clue_operations", []),
-            "snapshots": keeper_cache.get("snapshots", []),
+            "current_chapter_snapshots": snapshots,
+            "full_chapter": full_chapter,
         }, ensure_ascii=False, indent=2)
-
-        extracted = {}
         try:
-            extracted = chat_json(self.model_config,
-                                  system_prompt=system,
+            extracted = chat_json(self.model_config, system_prompt=system,
                                   user_prompt=prompt)
-            keeper_cache["character_delta"] = extracted.get(
-                "character_updates", {})
+            if not isinstance(extracted, dict) or not extracted.get("chapter_summary"):
+                raise ValueError("Archivist 返回缺少 chapter_summary")
+            keeper_cache["character_delta"] = extracted.get("character_updates", {})
             keeper_cache["clue_delta"] = extracted.get("clue_updates", {})
+            self._sync_db(chapter_num, keeper_cache, extracted,
+                          plan_json.get("clue_operations", []), full_chapter)
         except Exception as e:
-            log.warning(f"Archivist LLM 提取失败: {e}")
-            keeper_cache["character_delta"] = {}
-            keeper_cache["clue_delta"] = {}
-
+            log.error(f"Archivist 归档失败: {e}")
+            return False
         self._update_characters(chapter_num, keeper_cache)
         self._update_clues(chapter_num, keeper_cache)
         self._update_master_bible(chapter_num, plan_json)
         self._update_foreshadowing(chapter_num, plan_json)
-        self._sync_db(chapter_num, keeper_cache, extracted,
-                      plan_json.get("clue_operations", []))
+        return True
 
     def _sync_db(self, chapter_num: int, keeper_cache: dict, extracted: dict,
-                 plan_ops: list):
-        """SQLite 双写：人物状态时间线 + 原子事实 + 伏笔操作 + 风格命中 + 章节日志。"""
+                 plan_ops: list, full_chapter: str):
         db = self._db()
         if not db:
-            return
+            raise RuntimeError("知识库不可用")
         try:
-            for name, state in (keeper_cache.get("character_delta") or {}).items():
-                db.add_character_state(chapter_num, name, state)
-            facts = extracted.get("facts", []) if isinstance(extracted, dict) else []
-            if facts:
-                db.add_facts(chapter_num, facts)
+            db.replace_chapter_derivatives(
+                chapter_num, extracted.get("facts", []),
+                keeper_cache.get("character_delta") or {},
+                extracted["chapter_summary"],
+                hashlib.sha256(full_chapter.encode("utf-8")).hexdigest(),
+            )
             for op in plan_ops:
                 fid = (op or {}).get("clue_id")
+                action = (op or {}).get("action")
                 if not fid:
-                    continue
-                act = op.get("action", "")
-                if act == "hint":
-                    db.hint_foreshadow(fid, chapter_num)
-                elif act == "reveal":
-                    db.resolve_foreshadow(fid, chapter_num)
+                    raise ValueError("伏笔操作缺少 clue_id")
+                if action == "plant":
+                    data = dict(op)
+                    data.setdefault("introduced_chapter", chapter_num)
+                    changed = db.create_foreshadow(fid, data)
+                elif action == "hint":
+                    changed = db.hint_foreshadow(fid, chapter_num)
+                elif action == "escalate":
+                    changed = db.hint_foreshadow(fid, chapter_num, status="escalated")
+                elif action == "reveal":
+                    changed = db.resolve_foreshadow(fid, chapter_num)
+                elif action == "reschedule":
+                    changed = db.reschedule_foreshadow(fid, op)
+                elif action == "retire":
+                    changed = db.retire_foreshadow(fid, chapter_num)
+                else:
+                    raise ValueError(f"未知伏笔操作: {action}")
+                if changed != 1:
+                    raise ValueError(f"伏笔操作未命中唯一记录: {action} {fid}")
             hits = keeper_cache.get("_style_hits", [])
+            db.delete_style_hits(chapter_num)
             if hits:
                 db.add_style_hits(hits)
-            db.conn.commit()
-        except Exception as e:
-            log.warning(f"DB 双写异常: {e}")
         finally:
             db.close()
 
@@ -141,14 +154,49 @@ class ArchivistAgent:
         changed = False
         for op in ops:
             fid = op.get("clue_id", "")
-            if fid in foreshadowing:
-                action = op.get("action", "")
-                if action == "reveal":
-                    foreshadowing[fid]["status"] = "resolved"
-                    changed = True
-                elif action == "hint":
-                    foreshadowing[fid]["last_hinted_chapter"] = chapter_num
-                    changed = True
+            action = op.get("action", "")
+            if action == "plant":
+                if fid in foreshadowing:
+                    raise ValueError(f"重复 plant 已存在伏笔 {fid}")
+                foreshadowing[fid] = {
+                    "name": op.get("name", ""),
+                    "description": op.get("description", ""),
+                    "status": "pending",
+                    "introduced_chapter": op.get("introduced_chapter", chapter_num),
+                    "intended_payoff_chapter": op.get("intended_payoff_chapter"),
+                    "payoff_start_chapter": op.get("payoff_start_chapter"),
+                    "payoff_end_chapter": op.get("payoff_end_chapter"),
+                    "scope": op.get("scope"),
+                    "importance": op.get("importance"),
+                    "touch_interval": op.get("touch_interval"),
+                    "hinted_chapters": [chapter_num],
+                }
+                changed = True
+                continue
+            if fid not in foreshadowing:
+                raise ValueError(f"{action} 指向未知伏笔 {fid}")
+            item = foreshadowing[fid]
+            if action in ("hint", "escalate"):
+                timeline = item.setdefault("hinted_chapters", [])
+                if chapter_num not in timeline:
+                    timeline.append(chapter_num)
+                item["last_hinted_chapter"] = chapter_num
+                if action == "escalate":
+                    item["status"] = "escalated"
+            elif action == "reveal":
+                item["status"] = "resolved"
+                item["resolved_chapter"] = chapter_num
+            elif action == "retire":
+                item["status"] = "retired"
+                item["resolved_chapter"] = chapter_num
+            elif action == "reschedule":
+                for field in ("intended_payoff_chapter", "payoff_start_chapter",
+                              "payoff_end_chapter", "touch_interval"):
+                    if op.get(field) is not None:
+                        item[field] = op[field]
+            else:
+                raise ValueError(f"未知伏笔操作: {action}")
+            changed = True
         if changed:
             clues_file.write_text(
                 json.dumps(clues, ensure_ascii=False, indent=2),

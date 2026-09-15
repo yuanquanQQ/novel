@@ -1,9 +1,12 @@
 # 后端 API 测试: python -m unittest tests.test_server -v
+import io
 import json
 import shutil
+import sqlite3
 import sys
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 from unittest.mock import patch
 
@@ -138,13 +141,29 @@ class TestServerAPI(unittest.TestCase):
         self.assertTrue(saved.json()["ok"])
         self.assertEqual(scanner.RULES_FILE.parent, self.style_dir)
 
-    def test_07_chapter_save_revalidates(self):
+    def test_07_chapter_save_revalidates_and_marks_knowledge_stale(self):
+        book = self.novels_dir / "my-story"
+        db = NovelDB(book)
+        db.replace_chapter_derivatives(1, [{
+            "kind": "plot", "subject": "旧", "content": "旧事实"
+        }], {"林一": {"location": "门口"}}, "旧摘要", "old-hash")
+        db.close()
+        for chapter in (1, 2):
+            (book / "cache" / f"keeper_cache_{chapter:02d}.json").write_text("{}")
         content = self.c.get("/api/novels/my-story/chapters/1").json()["content"]
         response = self.c.put(
             "/api/novels/my-story/chapters/1", json={"content": content}
         )
         self.assertEqual(response.status_code, 200, response.text)
-        self.assertIn("scan", response.json())
+        self.assertTrue(response.json()["knowledge_stale"])
+        rows = self.c.get("/api/novels/my-story/chapters").json()
+        self.assertTrue(rows[0]["knowledge_stale"])
+        db = NovelDB(book)
+        self.assertEqual(db.conn.execute(
+            "SELECT COUNT(*) FROM chapter_summaries WHERE chapter=1").fetchone()[0], 0)
+        db.close()
+        self.assertFalse((book / "cache" / "keeper_cache_01.json").exists())
+        self.assertFalse((book / "cache" / "keeper_cache_02.json").exists())
 
     def test_08_task_submission_and_event_stream(self):
         with patch.object(server_app.T, "running_task", return_value=None), patch.object(
@@ -178,6 +197,124 @@ class TestServerAPI(unittest.TestCase):
             response = self.c.post("/api/novels/my-story/tasks/db", json={})
         self.assertEqual(response.status_code, 409)
         submit.assert_not_called()
+
+    def test_10_cancel_task_endpoint(self):
+        with patch.object(server_app.T, "cancel", return_value={
+                "id": "running-task", "status": "cancelled", "cancelled": True}):
+            response = self.c.post("/api/tasks/running-task/cancel")
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["status"], "cancelled")
+        with patch.object(server_app.T, "cancel", return_value=None):
+            response = self.c.post("/api/tasks/missing/cancel")
+        self.assertEqual(response.status_code, 404)
+
+    def test_11_workspace_backup_and_restore(self):
+        book = self.novels_dir / "my-story"
+        (book / ".env").write_text("API_KEY=secret", encoding="utf-8")
+        (book / "cache" / "keeper_cache_01.json").write_text("{}", encoding="utf-8")
+        (book / "cache" / "failed_drafts").mkdir(exist_ok=True)
+        (book / "cache" / "failed_drafts" / "bad.md").write_text("bad", encoding="utf-8")
+        (book / "bible" / "outline_manifest.json").write_text('{"parts": []}', encoding="utf-8")
+        (book / "bible" / "outline_parts" / "volume_1").mkdir(parents=True, exist_ok=True)
+        (book / "bible" / "outline_parts" / "volume_1" / "section_1_8.md").write_text("part", encoding="utf-8")
+        response = self.c.get("/api/novels/my-story/backup")
+        self.assertEqual(response.status_code, 200, response.text)
+        payload = response.content
+        with zipfile.ZipFile(io.BytesIO(payload)) as zf:
+            names = set(zf.namelist())
+            self.assertIn("config.py", names)
+            self.assertIn("novel_prompts.json", names)
+            self.assertIn("db/novel.db", names)
+            self.assertIn("cache/keeper_cache_01.json", names)
+            self.assertIn("bible/outline_manifest.json", names)
+            self.assertIn("bible/outline_parts/volume_1/section_1_8.md", names)
+            self.assertFalse(any(".env" in Path(name).parts for name in names))
+            self.assertFalse(any("failed_drafts" in name for name in names))
+            db_bytes = zf.read("db/novel.db")
+        snapshot = self.temp_root / "snapshot.db"
+        snapshot.write_bytes(db_bytes)
+        conn = sqlite3.connect(str(snapshot))
+        self.assertEqual(conn.execute("PRAGMA integrity_check").fetchone()[0], "ok")
+        conn.close()
+
+        restored = self.c.post(
+            "/api/novels/import-backup?id=restored-story",
+            content=payload, headers={"content-type": "application/zip"})
+        self.assertEqual(restored.status_code, 201, restored.text)
+        restored_dir = self.novels_dir / "restored-story"
+        self.assertTrue((restored_dir / "generated" / "chapter_01.md").exists())
+        self.assertTrue((restored_dir / "db" / "novel.db").exists())
+        self.assertFalse((restored_dir / ".env").exists())
+        duplicate = self.c.post("/api/novels/import-backup?id=restored-story", content=payload)
+        self.assertEqual(duplicate.status_code, 409)
+        shutil.rmtree(restored_dir)
+
+    def test_12_backup_import_rejects_zip_slip_and_limits(self):
+        required = {
+            "config.py": "config = None",
+            "novel_prompts.json": "{}",
+            "bible/master_bible.md": "# test",
+        }
+        archive = io.BytesIO()
+        with zipfile.ZipFile(archive, "w") as zf:
+            for name, content in required.items():
+                zf.writestr(name, content)
+            zf.writestr("../escape.txt", "bad")
+        response = self.c.post("/api/novels/import-backup?id=bad-slip", content=archive.getvalue())
+        self.assertEqual(response.status_code, 400)
+        self.assertFalse((self.novels_dir / "bad-slip").exists())
+
+        archive = io.BytesIO()
+        with zipfile.ZipFile(archive, "w") as zf:
+            for name, content in required.items():
+                zf.writestr(name, content)
+            zf.writestr(".env", "API_KEY=secret")
+        response = self.c.post("/api/novels/import-backup?id=bad-env", content=archive.getvalue())
+        self.assertEqual(response.status_code, 400)
+
+        archive = io.BytesIO()
+        with zipfile.ZipFile(archive, "w") as zf:
+            for name, content in required.items():
+                zf.writestr(name, content)
+            zf.writestr("cache/large.bin", "x" * 20)
+        with patch.object(server_app, "MAX_BACKUP_FILE_BYTES", 10):
+            response = self.c.post("/api/novels/import-backup?id=too-large", content=archive.getvalue())
+        self.assertEqual(response.status_code, 413)
+
+    def test_13_chapter_pagination_filters_and_boundaries(self):
+        response = self.c.get("/api/novels/my-story/chapters-page?offset=0&limit=1")
+        self.assertEqual(response.status_code, 200, response.text)
+        data = response.json()
+        self.assertEqual(data["total"], 2)
+        self.assertEqual([item["num"] for item in data["items"]], [1])
+        response = self.c.get("/api/novels/my-story/chapters-page?offset=1&limit=1&q=2")
+        self.assertEqual(response.json(), {"items": [], "total": 1})
+        response = self.c.get("/api/novels/my-story/chapters-page?status=knowledge_stale")
+        self.assertEqual([item["num"] for item in response.json()["items"]], [1])
+        response = self.c.get("/api/novels/my-story/chapters-page?chapter_from=2&chapter_to=2")
+        self.assertEqual([item["num"] for item in response.json()["items"]], [2])
+        self.assertEqual(self.c.get("/api/novels/my-story/chapters-page?limit=201").status_code, 422)
+        self.assertEqual(self.c.get("/api/novels/my-story/chapters-page?chapter_from=3&chapter_to=2").status_code, 422)
+
+    def test_14_novel_list_prefers_complete_db_word_totals(self):
+        book = self.novels_dir / "my-story"
+        db = NovelDB(book, auto_import=False)
+        db.conn.execute(
+            "INSERT OR REPLACE INTO chapter_log(chapter, words, status) VALUES(1, 123, 'generated')")
+        db.conn.execute(
+            "INSERT OR REPLACE INTO chapter_log(chapter, words, status) VALUES(2, 456, 'generated')")
+        db.conn.commit()
+        db.close()
+        original_read_text = Path.read_text
+        def guarded_read_text(path, *args, **kwargs):
+            if path.parent.name == "generated":
+                raise AssertionError("不应读取正文")
+            return original_read_text(path, *args, **kwargs)
+        with patch.object(Path, "read_text", guarded_read_text):
+            response = self.c.get("/api/novels")
+        self.assertEqual(response.status_code, 200, response.text)
+        row = next(item for item in response.json() if item["id"] == "my-story")
+        self.assertEqual(row["words"], 579)
 
 
 if __name__ == "__main__":

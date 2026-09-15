@@ -2,9 +2,38 @@
 
 import json
 import logging
+
+from engine.chapter_files import chapter_files
 from engine.proxy import config
 
 log = logging.getLogger("researcher")
+
+ENTITY_FIELDS = (
+    "characters", "locations", "objects", "factions", "abilities", "clue_ids"
+)
+
+
+def entity_search_terms(plan_json: dict, character_names: list[str]) -> tuple[list[str], list[str]]:
+    plan_text = json.dumps(plan_json, ensure_ascii=False)
+    mentioned_names = [name for name in character_names if name and name in plan_text]
+    entities = plan_json.get("entities")
+    if not isinstance(entities, dict):
+        return mentioned_names, mentioned_names or character_names[:5]
+
+    entity_values = []
+    for field in ENTITY_FIELDS:
+        values = entities.get(field, [])
+        if isinstance(values, list):
+            entity_values.extend(value for value in values if isinstance(value, str) and value)
+    entity_characters = entities.get("characters", [])
+    if not isinstance(entity_characters, list):
+        entity_characters = []
+    names = list(dict.fromkeys(
+        name for name in entity_characters + mentioned_names
+        if isinstance(name, str) and name
+    ))
+    terms = list(dict.fromkeys(entity_values + names))
+    return names, terms
 
 
 class ResearcherAgent:
@@ -17,12 +46,31 @@ class ResearcherAgent:
             bible: dict) -> dict:
         log.info(f"Researcher — 为第 {chapter_num} 章检索资料")
 
-        characters = bible.get("characters", {}).get("characters", {})
+        all_characters = bible.get("characters", {}).get("characters", {})
         clues_data = bible.get("clues", {})
-        clues = clues_data.get("clues", {})
-        foreshadowing = clues_data.get("active_foreshadowing", {})
+        all_clues = clues_data.get("clues", {})
+        all_foreshadowing = clues_data.get("active_foreshadowing", {})
         motifs_raw = bible.get("motif_bank", {}).get("motifs", [])
-        master_bible = bible.get("master_bible", "")
+        has_entities = isinstance(plan_json.get("entities"), dict)
+
+        character_names, _ = entity_search_terms(
+            plan_json, list(all_characters)
+        )
+        clue_ids = self._relevant_clue_ids(plan_json)
+        if has_entities:
+            characters = {
+                name: all_characters[name]
+                for name in character_names if name in all_characters
+            }
+            clues = {cid: all_clues[cid] for cid in clue_ids if cid in all_clues}
+            foreshadowing = {
+                cid: all_foreshadowing[cid]
+                for cid in clue_ids if cid in all_foreshadowing
+            }
+        else:
+            characters = all_characters
+            clues = all_clues
+            foreshadowing = all_foreshadowing
 
         available_motifs = self._filter_motifs(motifs_raw, chapter_num)
         relevant_foreshadowing = self._extract_pending_foreshadowing(
@@ -31,22 +79,36 @@ class ResearcherAgent:
         research_notes = self._build_research_notes(
             plan_json, clues, characters, chapter_num
         )
+        locations = self._extract_locations(characters)
+        if has_entities:
+            for location in plan_json["entities"].get("locations", []):
+                if isinstance(location, str):
+                    locations.setdefault(location, [])
 
         return {
             "chapter": chapter_num,
             "relevant_characters": characters,
             "relevant_clues": clues,
-            "relevant_locations": self._extract_locations(characters),
+            "relevant_locations": locations,
             "relevant_foreshadowing": relevant_foreshadowing,
             "suggested_motifs": available_motifs,
-            "recent_chapters_summary": self._read_recent_summaries(),
+            "recent_chapters_summary": self._read_recent_summaries(chapter_num),
             "research_notes": research_notes,
             **self._db_context(plan_json, chapter_num),
         }
 
+    def _relevant_clue_ids(self, plan_json: dict) -> list[str]:
+        ids = []
+        entities = plan_json.get("entities")
+        if isinstance(entities, dict) and isinstance(entities.get("clue_ids"), list):
+            ids.extend(entities["clue_ids"])
+        for operation in plan_json.get("clue_operations", []):
+            if isinstance(operation, dict):
+                ids.append(operation.get("clue_id"))
+        return list(dict.fromkeys(cid for cid in ids if isinstance(cid, str) and cid))
+
     def _db_context(self, plan_json: dict, chapter_num: int) -> dict:
         """从运行时知识库检索：跨章事实、人物状态时间线、伏笔健康度、风格惯性。"""
-        import json as _json
         from engine.db import NovelDB
         from engine.settings import get_novel_dir
         try:
@@ -56,12 +118,11 @@ class ResearcherAgent:
             return {}
         out = {}
         try:
-            plan_text = _json.dumps(plan_json, ensure_ascii=False)
             names = [r["name"] for r in
                      db.conn.execute("SELECT name FROM characters").fetchall()]
-            hit_names = [n for n in names if n and n in plan_text]
-            facts = db.search_facts(hit_names or names[:5], chapter_num, 20)
-            states = db.recent_states(hit_names[:6], chapter_num, 2)
+            relevant_names, search_terms = entity_search_terms(plan_json, names)
+            facts = db.search_facts(search_terms, chapter_num, 20)
+            states = db.recent_states(relevant_names[:6], chapter_num, 2)
             fore = db.open_foreshadowing(chapter_num)
             hits = db.top_style_hits(chapter_num, 5)
 
@@ -122,20 +183,28 @@ class ResearcherAgent:
                 locations.setdefault(loc, []).append(name)
         return locations
 
-    def _read_recent_summaries(self) -> str:
-        gen_dir = config.generated_dir
-        if not gen_dir.exists():
-            return "(无已写章节)"
-        chapters = sorted(gen_dir.glob("chapter_*.md"))
-        if not chapters:
-            return "(无已写章节)"
+    def _read_recent_summaries(self, chapter_num: int) -> str:
+        from engine.db import NovelDB
+        try:
+            db = NovelDB(config.bible_dir.parent)
+            try:
+                rows = db.recent_summaries(chapter_num, 3)
+            finally:
+                db.close()
+            if rows:
+                return "\n".join(
+                    f"第{row['chapter']}章: {row['summary']}" for row in rows
+                )
+        except Exception as e:
+            log.warning(f"章节摘要数据库读取失败，回退正文首行: {e}")
         lines = []
-        for fp in chapters[-3:]:
+        for fp in chapter_files(
+            config.generated_dir, before_chapter=chapter_num, limit=3
+        ):
             content = fp.read_text(encoding="utf-8")
-            first_line = (content.strip().split("\n")[0]
-                          if content else fp.stem)
+            first_line = content.strip().split("\n")[0] if content else fp.stem
             lines.append(first_line)
-        return "\n".join(lines)
+        return "\n".join(lines) if lines else "(无已写章节)"
 
     def _build_research_notes(self, plan_json: dict, clues: dict,
                               characters: dict, chapter_num: int) -> str:

@@ -92,8 +92,8 @@ class WriterAgent:
         parts = []
         if scene_type == "breathable":
             parts.append(
-                "本场景为 breathable（静默缓冲）：禁止任何对话。"
-                "只写环境、光影、微动作与内心流动。"
+                "本场景为 breathable（低对白缓冲）：允许完全无对话或仅有少量自然对话，"
+                "不要求达到普通场景30-45%的对话占比。重点写环境、光影、微动作与内心流动。"
             )
         sanity = scene.get("sanity_score", 0.8)
         if sanity < 0.6:

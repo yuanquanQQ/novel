@@ -113,6 +113,50 @@ class TestNovelDB(unittest.TestCase):
             "SELECT hinted_chs FROM foreshadowing WHERE id='F001'").fetchone()
         self.assertEqual(json.loads(row["hinted_chs"]), [1, 10, 23])
 
+    def test_replace_chapter_derivatives_removes_old_rows(self):
+        self.db.replace_chapter_derivatives(
+            2, [{"kind": "plot", "subject": "旧", "content": "旧事实"}],
+            {"林泽": {"location": "旧地"}}, "旧摘要", "hash-old")
+        self.db.replace_chapter_derivatives(
+            2, [{"kind": "plot", "subject": "新", "content": "新事实"}],
+            {"叶清": {"location": "新地"}}, "新摘要", "hash-new")
+        facts = self.db.conn.execute(
+            "SELECT subject FROM chapter_facts WHERE chapter=2").fetchall()
+        states = self.db.conn.execute(
+            "SELECT character FROM character_states WHERE chapter=2").fetchall()
+        summary = self.db.conn.execute(
+            "SELECT summary,content_hash FROM chapter_summaries WHERE chapter=2").fetchone()
+        self.assertEqual([row["subject"] for row in facts], ["新"])
+        self.assertEqual([row["character"] for row in states], ["叶清"])
+        self.assertEqual((summary["summary"], summary["content_hash"]),
+                         ("新摘要", "hash-new"))
+        self.assertEqual(self.db.conn.execute("PRAGMA user_version").fetchone()[0], 3)
+
+    def test_foreshadow_lifecycle_and_rowcounts(self):
+        self.assertEqual(self.db.create_foreshadow("F100", {
+            "name": "空盒", "description": "盒底有划痕",
+            "introduced_chapter": 3, "touch_interval": 4,
+            "payoff_start_chapter": 8, "payoff_end_chapter": 10,
+        }), 1)
+        self.assertEqual(self.db.create_foreshadow("F100", {}), 0)
+        self.assertEqual(self.db.hint_foreshadow("F100", 5), 1)
+        self.assertEqual(self.db.hint_foreshadow("UNKNOWN", 5), 0)
+        self.assertEqual(self.db.resolve_foreshadow("F100", 9), 1)
+        row = self.db.conn.execute(
+            "SELECT * FROM foreshadowing WHERE id='F100'"
+        ).fetchone()
+        self.assertEqual(row["status"], "resolved")
+        self.assertEqual(row["resolved_ch"], 9)
+        self.assertEqual(json.loads(row["hinted_chs"]), [3, 5])
+
+    def test_open_foreshadowing_uses_individual_touch_interval(self):
+        self.db.create_foreshadow("F100", {
+            "name": "短线", "description": "d", "introduced_chapter": 10,
+            "touch_interval": 2,
+        })
+        buckets = self.db.open_foreshadowing(current_ch=13, stale_after=30)
+        self.assertIn("F100", [item["id"] for item in buckets["stale"]])
+
 
 if __name__ == "__main__":
     unittest.main()

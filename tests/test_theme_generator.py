@@ -115,6 +115,78 @@ class ThemeGeneratorTests(unittest.TestCase):
         self.assertIn("频道：女频；目标主角类型：女主角", prompt)
         self.assertIn("500 到 800 章", prompt)
 
+    def test_generate_retries_gender_or_chapter_validation_error(self):
+        valid_content = json.dumps({"options": _options()}, ensure_ascii=False)
+        invalid_cases = []
+        wrong_gender = _options()
+        wrong_gender[0]["protagonist_gender"] = "女主角"
+        invalid_cases.append((wrong_gender, "第 1 个方案的主角类型与期望不符"))
+        wrong_chapters = _options()
+        wrong_chapters[0]["chapter_count"] = 199
+        invalid_cases.append((wrong_chapters, "第 1 个方案的 chapter_count 必须是 200 到 400"))
+
+        for invalid_options, expected_error in invalid_cases:
+            with self.subTest(expected_error=expected_error):
+                create = Mock(side_effect=[
+                    SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(
+                        content=json.dumps({"options": invalid_options}, ensure_ascii=False)
+                    ))]),
+                    SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(
+                        content=valid_content
+                    ))]),
+                ])
+                client = SimpleNamespace(chat=SimpleNamespace(
+                    completions=SimpleNamespace(create=create)
+                ))
+
+                result = generate_themes(
+                    direction="自由创作", client=client,
+                    environ={"API_KEY": "secret"},
+                )
+
+                self.assertEqual(len(result), 3)
+                self.assertEqual(create.call_count, 2)
+                retry_prompt = create.call_args_list[1].kwargs["messages"][1]["content"]
+                self.assertIn(f"具体错误：{expected_error}", retry_prompt)
+                self.assertIn("重新生成完整响应", retry_prompt)
+                self.assertIn("恰好 3 个全部合格", retry_prompt)
+
+    def test_generate_stops_after_three_invalid_responses(self):
+        options = _options()
+        options[0]["chapter_count"] = 199
+        content = json.dumps({"options": options}, ensure_ascii=False)
+        create = Mock(return_value=SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=content))]
+        ))
+        client = SimpleNamespace(chat=SimpleNamespace(
+            completions=SimpleNamespace(create=create)
+        ))
+
+        with self.assertRaisesRegex(
+            ThemeGenerationError,
+            "连续 3 轮返回无效方案.*chapter_count 必须是 200 到 400",
+        ):
+            generate_themes(
+                direction="自由创作", client=client,
+                environ={"API_KEY": "secret"},
+            )
+
+        self.assertEqual(create.call_count, 3)
+
+    def test_generate_does_not_retry_api_error(self):
+        create = Mock(side_effect=ConnectionError("连接中断"))
+        client = SimpleNamespace(chat=SimpleNamespace(
+            completions=SimpleNamespace(create=create)
+        ))
+
+        with self.assertRaisesRegex(ThemeGenerationError, "模型调用失败（第 1 轮）"):
+            generate_themes(
+                direction="自由创作", client=client,
+                environ={"API_KEY": "secret"},
+            )
+
+        create.assert_called_once()
+
     def test_parser_rejects_chapter_count_outside_expected_range(self):
         options = _options()
         options[0]["chapter_count"] = 199

@@ -181,17 +181,35 @@ def generate_themes(inspiration: str = "", genre: str = "", direction: str = "",
         f"\n题材偏好：{genre or '不限'}"
     )
     api_client = client or OpenAI(api_key=api_key, base_url=base_url)
-    try:
-        response = api_client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": "你是擅长长篇结构设计的中文小说策划编辑。只输出严格 JSON。"},
-                {"role": "user", "content": prompt},
-            ],
-            response_format={"type": "json_object"},
-            temperature=0.9,
-        )
-        content = response.choices[0].message.content
-    except Exception as exc:
-        raise ThemeGenerationError(f"主题构思模型调用失败: {exc}") from exc
-    return parse_theme_response(content, protagonist_gender, chapter_range)
+    validation_error = None
+    for attempt in range(1, 4):
+        retry_instruction = ""
+        if validation_error is not None:
+            retry_instruction = (
+                f"\n上一轮返回未通过校验，具体错误：{validation_error}"
+                "\n请重新生成完整响应，不要只修改单个方案；仍须返回恰好 3 个全部合格、"
+                "字段完整且互不雷同的方案。"
+            )
+        try:
+            response = api_client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": "你是擅长长篇结构设计的中文小说策划编辑。只输出严格 JSON。"},
+                    {"role": "user", "content": prompt + retry_instruction},
+                ],
+                response_format={"type": "json_object"},
+                temperature=0.9,
+            )
+            content = response.choices[0].message.content
+        except Exception as exc:
+            raise ThemeGenerationError(
+                f"主题构思模型调用失败（第 {attempt} 轮）: {exc}"
+            ) from exc
+        try:
+            return parse_theme_response(content, protagonist_gender, chapter_range)
+        except ThemeGenerationError as exc:
+            validation_error = exc
+
+    raise ThemeGenerationError(
+        f"主题构思模型连续 3 轮返回无效方案，最后错误：{validation_error}"
+    ) from validation_error

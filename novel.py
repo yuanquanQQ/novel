@@ -13,13 +13,18 @@
 
 import sys
 import json
+import hashlib
 import logging
+import os
 import re
+import tempfile
+import time
 from pathlib import Path
 
 ENGINE_ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ENGINE_ROOT))
 
+from engine.chapter_files import chapter_files, parse_chapter_number
 from engine.settings import set_novel, get_novel, get_novel_dir, get_config, NOVELS_DIR
 
 logging.basicConfig(
@@ -199,11 +204,11 @@ def cmd_status():
     print(f"总章节数: {config.chapter_count}")
     print(f"目录: {novel_dir}")
 
-    existing = sorted(gen_dir.glob("chapter_*.md")) if gen_dir.exists() else []
+    existing = chapter_files(gen_dir)
     total_words = sum(len(f.read_text(encoding="utf-8")) for f in existing)
     vols = {}
     for f in existing:
-        ch_num = int(f.stem.split("_")[1])
+        ch_num = parse_chapter_number(f)
         for vk, v in config.volume_config.items():
             lo, hi = v["chapters"]
             if lo <= ch_num <= hi:
@@ -294,10 +299,9 @@ def cmd_promo(args):
     # 收集已写章节摘要
     gen_dir = config.generated_dir
     summaries = []
-    for cf in sorted(gen_dir.glob("chapter_*.md"))[-10:]:
-        if cf.exists():
-            text = cf.read_text(encoding="utf-8")
-            summaries.append(f"{cf.stem}: {text[:150]}...")
+    for cf in chapter_files(gen_dir, limit=10):
+        text = cf.read_text(encoding="utf-8")
+        summaries.append(f"{cf.stem}: {text[:150]}...")
     summary_text = "\n".join(summaries) if summaries else "尚未生成章节"
 
     ptype = args.get("promo_type", "")
@@ -324,7 +328,7 @@ def cmd_promo(args):
         print(" ".join(f"#{t}" for t in tags))
 
     elif ptype == "author":
-        existing = list(gen_dir.glob("chapter_*.md"))
+        existing = chapter_files(gen_dir)
         progress = f"已更新 {len(existing)}/{config.chapter_count} 章，每天更新1-2章"
         print(mk.author_note(progress))
 
@@ -364,48 +368,82 @@ class OutlineValidationError(ValueError):
     """模型连续返回无法安全解析的分卷大纲。"""
 
 
-def build_outline_prompt(title: str, volume: dict, bible: dict, user_prompt: str = "") -> str:
-    """构建单卷大纲提示词，不依赖文件或模型调用。"""
-    lo, hi = volume["chapters"]
+def outline_section_ranges(lo: int, hi: int, target_size: int = 10) -> list[tuple[int, int]]:
+    """把一卷均匀切成小片；常规片为8-10章，小卷保持单片。"""
+    total = hi - lo + 1
+    count = max(1, (total + target_size - 1) // target_size)
+    while count > 1 and total // count < 8:
+        count -= 1
+    ranges = []
+    for index in range(count):
+        start = lo + index * total // count
+        end = lo + (index + 1) * total // count - 1
+        ranges.append((start, end))
+    return ranges
+
+
+def build_outline_prompt(title: str, volume: dict, bible: dict, user_prompt: str = "",
+                         part_range: tuple[int, int] | None = None,
+                         include_overview: bool = True,
+                         volume_overview: str = "") -> str:
+    """构建单个8-20章大纲分片提示词，不依赖文件或模型调用。"""
+    volume_lo, volume_hi = volume["chapters"]
+    lo, hi = part_range or volume["chapters"]
     clues = bible.get("clues", {}).get("clues", {})
     foreshadowing = bible.get("clues", {}).get("active_foreshadowing", {})
+    overview_template = (
+        "### 卷概览\n这里写100-150字的单段卷概览，不换行。\n\n"
+        if include_overview else ""
+    )
+    overview_rule = (
+        "本片是本卷首片，必须从“### 卷概览”开始且概览只出现一次。"
+        if include_overview else
+        "本片不是首片，禁止输出“### 卷概览”及概览正文，必须直接从小节标题开始。"
+    )
+    prior_overview = f"\n【既定卷概览】{volume_overview}\n" if volume_overview else ""
+    ending_rule = (
+        f"第{hi}章必须完成本卷收束。" if hi == volume_hi
+        else f"第{hi}章只完成当前阶段并自然衔接第{hi + 1}章，不得提前收束全卷。"
+    )
     result = (
         f"你是资深小说策划编辑。请为《{title}》{volume['name']}生成详细大纲。\n\n"
         f"【世界观】{bible.get('master_bible', '')[:2500]}\n\n"
-        f"【本卷】{volume['name']}（第{lo}-{hi}章） | 情绪:{volume['core_emotion']} | 重点:{volume['focus']}\n\n"
+        f"【本卷】{volume['name']}（第{volume_lo}-{volume_hi}章） | 情绪:{volume['core_emotion']} | 重点:{volume['focus']}\n"
+        f"【当前分片】第{lo}-{hi}章，共{hi - lo + 1}章。{prior_overview}\n"
         f"【人物】{json.dumps(bible.get('characters', {}), ensure_ascii=False, indent=2)[:2000]}\n\n"
         f"【线索池】{json.dumps({key: value.get('name', '') for key, value in clues.items()}, ensure_ascii=False)}\n"
         f"【伏笔池】{json.dumps({key: value.get('name', '') for key, value in foreshadowing.items()}, ensure_ascii=False)}\n\n"
         "【输出边界】\n"
-        f"只输出{volume['name']}的卷内容，不要输出或重复“## {volume['name']}”这类卷标题，卷标题由程序添加。"
+        f"只输出{volume['name']}的卷内容中第{lo}-{hi}章，不要输出或重复“## {volume['name']}”这类卷标题。"
         "不要输出前言、结语、自查结果、卷总结标题或其他说明。\n\n"
-        "【精确模板】\n"
-        "### 卷概览\n"
-        "这里写100-150字的单段卷概览，不换行。\n\n"
+        "【精确模板】\n" + overview_template +
         "### 第N-M章：小节名\n"
         "- **第N章 章名**：核心剧情（明确谁做什么导致什么）。*功能：该章的结构功能；伏笔：引入 F001*\n\n"
         "【硬性规则】\n"
         f"1. 必须且只能输出第{lo}章至第{hi}章，每个章号恰好出现一次，连续排列，禁止跳号、重复或越界。\n"
         "2. 每章严格占一行，并严格使用模板中的顶层 bullet；章名2-6字；核心剧情必须明确谁做什么导致什么。\n"
         "3. 功能字段必填；伏笔字段只能写“引入 Fxxx”“推进 Fxxx”“回收 Fxxx”或“无”，Fxxx为三位数字编号。\n"
-        "4. 每个小节使用“### 第N-M章：小节名”，其范围必须与下方章节一致且各小节连续无重叠。"
-        "小节原则上8-12章；本卷总章数少于8章时允许整卷单节；为贴合卷末边界，最后一节允许少于8章。\n"
-        "5. 禁止在章节下添加二级 bullet 或任何补充行；禁止Markdown代码块；禁止额外标题；禁止重复卷概览或卷总结。\n"
-        f"6. 第{hi}章必须完成本卷收束。最终答案从“### 卷概览”开始，写完最后一章立即结束。"
+        "4. 小节标题范围必须与下方章节一致；当前分片通常就是一个8-12章小节。\n"
+        "5. 禁止在章节下添加二级 bullet 或任何补充行；禁止Markdown代码块；禁止额外标题。\n"
+        f"6. {overview_rule}{ending_rule}写完本片最后一章立即结束。"
     )
     if user_prompt:
         result += f"\n\n【用户要求】{user_prompt}"
     return result
 
 
-def validate_outline_output(content: str, lo: int, hi: int) -> list[str]:
-    """校验单卷模型输出，返回可直接反馈给模型的具体错误。"""
+def validate_outline_output(content: str, lo: int, hi: int,
+                            include_overview: bool = True) -> list[str]:
+    """校验单个大纲分片，返回可直接反馈给模型的具体错误。"""
     errors = []
     lines = content.strip().splitlines()
     nonempty = [(index + 1, line) for index, line in enumerate(lines) if line.strip()]
     overview_heading = [(number, line) for number, line in nonempty if line == "### 卷概览"]
-    if len(overview_heading) != 1:
-        errors.append(f"“### 卷概览”应恰好出现1次，实际{len(overview_heading)}次")
+    expected_overviews = 1 if include_overview else 0
+    if len(overview_heading) != expected_overviews:
+        errors.append(f"“### 卷概览”应恰好出现{expected_overviews}次，实际{len(overview_heading)}次")
+    if not include_overview and nonempty and not nonempty[0][1].startswith("### 第"):
+        errors.append("非首片必须直接从小节标题开始")
 
     if any(re.match(r"^##(?:\s|$)", line) for _, line in nonempty):
         errors.append("包含禁止的H2卷标题（## ...），不要重复程序生成的卷标题")
@@ -512,21 +550,25 @@ def validate_outline_output(content: str, lo: int, hi: int) -> list[str]:
     return list(dict.fromkeys(errors))
 
 
-def _generate_valid_outline_part(chat, model, initial_prompt: str, lo: int, hi: int) -> str:
+def _generate_valid_outline_part(chat, model, initial_prompt: str, lo: int, hi: int,
+                                 include_overview: bool = True,
+                                 on_attempt=None) -> tuple[str, int] | str:
     prompt = initial_prompt
     last_errors = []
-    for attempt in range(3):
+    for attempt in range(1, 4):
+        if on_attempt:
+            on_attempt(attempt)
         part = chat(model, user_prompt=prompt).strip()
-        last_errors = validate_outline_output(part, lo, hi)
+        last_errors = validate_outline_output(part, lo, hi, include_overview)
         if not last_errors:
-            return part
-        if attempt < 2:
+            return (part, attempt) if on_attempt else part
+        if attempt < 3:
             feedback = "\n".join(f"- {error}" for error in last_errors)
             prompt = (
                 initial_prompt
                 + "\n\n【上次输出未通过格式校验】\n"
                 + feedback
-                + "\n请修正全部问题并重新输出完整卷内容，不要解释。\n\n【上次输出】\n"
+                + "\n请修正全部问题并重新输出完整分片，不要解释。\n\n【上次输出】\n"
                 + part
             )
     raise OutlineValidationError(
@@ -534,32 +576,127 @@ def _generate_valid_outline_part(chat, model, initial_prompt: str, lo: int, hi: 
     )
 
 
-def cmd_outline(prompt=""):
-    """分卷生成全书大纲 → bible/outline.md"""
-    config = get_config()
+def _atomic_write(path: Path, content: str):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_name = None
+    try:
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent,
+                                         prefix=path.name + ".", suffix=".tmp",
+                                         delete=False) as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+            temp_name = handle.name
+        for attempt in range(5):
+            try:
+                os.replace(temp_name, path)
+                temp_name = None
+                return
+            except PermissionError:
+                if attempt == 4:
+                    raise
+                time.sleep(0.02 * (attempt + 1))
+    finally:
+        if temp_name:
+            try:
+                Path(temp_name).unlink()
+            except OSError:
+                pass
 
+
+def _outline_hash(content: str) -> str:
+    return hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+
+def _save_outline_manifest(path: Path, records: dict):
+    payload = {"version": 1, "parts": list(records.values())}
+    _atomic_write(path, json.dumps(payload, ensure_ascii=False, indent=2))
+
+
+def cmd_outline(prompt=""):
+    """按8-20章分片生成全书大纲，支持合法分片断点续跑。"""
+    config = get_config()
+    config.bible_dir.mkdir(parents=True, exist_ok=True)
     bible = {}
     for fn in ["master_bible.md", "characters.json", "clues.json", "motif_bank.json"]:
         fp = config.bible_dir / fn
         if fp.exists():
-            if fp.suffix == ".json":
-                bible[fp.stem] = json.loads(fp.read_text(encoding="utf-8"))
-            else:
-                bible[fp.stem] = fp.read_text(encoding="utf-8")
+            bible[fp.stem] = (json.loads(fp.read_text(encoding="utf-8"))
+                              if fp.suffix == ".json" else fp.read_text(encoding="utf-8"))
 
     from engine.llm_client import chat
 
-    all_parts = []
-    for _, volume in config.volume_config.items():
-        lo, hi = volume["chapters"]
-        print(f"生成 {volume['name']} (第{lo}-{hi}章) ...")
-        vol_prompt = build_outline_prompt(config.story_title, volume, bible, prompt)
-        part = _generate_valid_outline_part(chat, config.planner_model, vol_prompt, lo, hi)
-        all_parts.append(f"## {volume['name']}（第{lo}-{hi}章）\n{part}")
+    manifest_path = config.bible_dir / "outline_manifest.json"
+    records = {}
+    if manifest_path.exists():
+        try:
+            loaded = json.loads(manifest_path.read_text(encoding="utf-8"))
+            records = {f"{item['volume']}:{item['range'][0]}-{item['range'][1]}": item
+                       for item in loaded.get("parts", [])}
+        except (OSError, ValueError, KeyError, TypeError):
+            records = {}
 
-    outline = f"# {config.story_title} — 全书大纲\n\n" + "\n\n".join(all_parts)
+    assembled_volumes = []
+    for volume_key, volume in config.volume_config.items():
+        volume_lo, volume_hi = volume["chapters"]
+        volume_parts = []
+        volume_overview = ""
+        for index, (lo, hi) in enumerate(outline_section_ranges(volume_lo, volume_hi)):
+            include_overview = index == 0
+            relative = f"outline_parts/{volume_key}/section_{lo}_{hi}.md"
+            part_path = config.bible_dir / relative
+            record_key = f"{volume_key}:{lo}-{hi}"
+            existing = part_path.read_text(encoding="utf-8") if part_path.exists() else ""
+            valid_existing = bool(existing) and not validate_outline_output(
+                existing, lo, hi, include_overview)
+            old_record = records.get(record_key, {})
+            hash_matches = (not old_record.get("hash") or
+                            old_record.get("hash") == _outline_hash(existing))
+            if valid_existing and hash_matches:
+                part = existing.strip()
+                records[record_key] = {
+                    "volume": volume_key, "range": [lo, hi], "status": "complete",
+                    "attempt": old_record.get("attempt", 0), "hash": _outline_hash(part),
+                    "path": relative,
+                }
+                _save_outline_manifest(manifest_path, records)
+                print(f"跳过合法分片 {volume['name']} 第{lo}-{hi}章")
+            else:
+                print(f"生成 {volume['name']} 第{lo}-{hi}章 ...")
+                def mark_attempt(attempt, key=record_key, rel=relative):
+                    records[key] = {
+                        "volume": volume_key, "range": [lo, hi], "status": "running",
+                        "attempt": attempt, "hash": "", "path": rel,
+                    }
+                    _save_outline_manifest(manifest_path, records)
+                part_prompt = build_outline_prompt(
+                    config.story_title, volume, bible, prompt, (lo, hi),
+                    include_overview, volume_overview)
+                try:
+                    part, attempts = _generate_valid_outline_part(
+                        chat, config.planner_model, part_prompt, lo, hi,
+                        include_overview, mark_attempt)
+                except Exception:
+                    records[record_key]["status"] = "failed"
+                    _save_outline_manifest(manifest_path, records)
+                    raise
+                _atomic_write(part_path, part)
+                records[record_key] = {
+                    "volume": volume_key, "range": [lo, hi], "status": "complete",
+                    "attempt": attempts, "hash": _outline_hash(part), "path": relative,
+                }
+                _save_outline_manifest(manifest_path, records)
+            if include_overview:
+                nonempty = [line.strip() for line in part.splitlines() if line.strip()]
+                volume_overview = nonempty[1] if len(nonempty) > 1 else ""
+            volume_parts.append(part)
+        assembled_volumes.append(
+            f"## {volume['name']}（第{volume_lo}-{volume_hi}章）\n" +
+            "\n\n".join(volume_parts))
+
+    outline = f"# {config.story_title} — 全书大纲\n\n" + "\n\n".join(assembled_volumes)
     outline_file = config.bible_dir / "outline.md"
-    outline_file.write_text(outline, encoding="utf-8")
+    _atomic_write(outline_file, outline)
     print(f"大纲已保存: {outline_file} ({len(outline)} 字符)")
     print("请审阅。修改后运行: python novel.py --novel {} titles".format(get_novel()))
 
@@ -673,6 +810,24 @@ def cmd_titles(prompt=""):
         print(f"章名已保存: {titles_file} ({total}/{config.chapter_count} 章)")
 
 
+class SceneQualityError(RuntimeError):
+    """场景在限定重试次数内未通过全部质量闸门。"""
+
+
+def _save_failed_draft(config, chapter_num: int, scene_id, draft: str,
+                       diagnostics: dict) -> Path:
+    failed_dir = config.cache_dir / "failed_drafts"
+    failed_dir.mkdir(parents=True, exist_ok=True)
+    safe_scene_id = re.sub(r"[^0-9A-Za-z_-]+", "_", str(scene_id))
+    stem = f"chapter_{chapter_num:02d}_scene_{safe_scene_id}"
+    target = failed_dir / f"{stem}.md"
+    target.write_text(draft, encoding="utf-8")
+    (failed_dir / f"{stem}.json").write_text(
+        json.dumps(diagnostics, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    return target
+
+
 def cmd_generate(chapter_num: int, instruction: str = ""):
     """生成单章"""
     from engine.agents.planner import PlannerAgent
@@ -733,81 +888,122 @@ def cmd_generate(chapter_num: int, instruction: str = ""):
     plan_json = planner.run(chapter_num, instruction or f"继续推进第{chapter_num}章剧情", bible, lessons, locked_title)
     log.info(f"大纲: {plan_json.get('chapter_title','')} ({len(plan_json.get('scene_outline',[]))} 场景)")
 
-    # 伏笔管家审计大纲
+    # 伏笔管家审计大纲；确定性严重错误会在任何正文生成前抛出。
     steward_result = steward.audit(plan_json, chapter_num, bible)
     if steward_result.get("operation_warnings"):
         log.warning(f"伏笔管家警告: {steward_result['operation_warnings']}")
-    if steward_result.get("overdue"):
-        print(f"  [伏笔管家] 过期伏笔: {steward_result['overdue']}")
+    reminders = steward_result.get("reminders", [])
+    if reminders:
+        plan_json["foreshadowing_reminders"] = reminders
+        print(f"  [伏笔管家] 提醒: {reminders}")
 
     context_pack = researcher.run(plan_json, chapter_num, bible)
     context_pack["_plan"] = plan_json
+    if reminders:
+        context_pack["foreshadowing_reminders"] = reminders
+        context_pack["research_notes"] = (
+            context_pack.get("research_notes", "")
+            + "\n\n## 伏笔管家提醒（规划与写作必须处理）\n"
+            + "\n".join(f"- {item}" for item in reminders)
+        ).strip()
 
     keeper_cache = keeper.init_cache(chapter_num)
 
     from engine.style_kit import scanner
-    style_hits = []
     feedback_map = {}
     for scene in plan_json.get("scene_outline", []):
         sid = scene.get("scene_id", "?")
-        fail = 0
-        max_fail = config.immediate_review_max_retries
-        while True:
-            fb = feedback_map.get(sid, "")
-            draft = writer.run(scene, keeper_cache, context_pack, chapter_num, fb)
-
-            # 第一道：确定性扫描（零成本、必命中，禁用词/句式/排版）
+        max_retries = config.immediate_review_max_retries
+        accepted = False
+        draft = ""
+        diagnostics = {}
+        for attempt in range(max_retries + 1):
+            draft = writer.run(
+                scene, keeper_cache, context_pack, chapter_num,
+                feedback_map.get(sid, ""),
+            )
             scan_result = scanner.scan(draft)
-            style_hits.extend(scan_result.to_rows(chapter_num))
-            if not scan_result.passed and fail < max_fail:
-                fail += 1
-                feedback_map[sid] = scan_result.to_suggestions()
-                log.warning(f"  场景 {sid} 机械扫描拦截 {len(scan_result.violations)} 条")
-                continue
+            review = reviewers.immediate_check(
+                draft, scene, keeper_cache, context_pack,
+            )
+            audit = auditor.audit(
+                draft, context_pack, scene.get("type", "high_conflict"),
+            )
+            accepted = (
+                scan_result.passed
+                and review.get("passed", False) is True
+                and audit.get("passed", False) is True
+            )
+            diagnostics = {
+                "attempt": attempt + 1,
+                "scan_passed": scan_result.passed,
+                "scan_violations": scan_result.violations,
+                "review_passed": review.get("passed", False) is True,
+                "review": review,
+                "dialogue_passed": audit.get("passed", False) is True,
+                "dialogue_audit": audit,
+            }
+            if accepted:
+                break
+            suggestions = [
+                scan_result.to_suggestions(),
+                review.get("suggestions", ""),
+                audit.get("suggestions", ""),
+            ]
+            feedback_map[sid] = "；".join(item for item in suggestions if item)
+            log.warning(
+                f"  场景 {sid} 第{attempt + 1}轮未通过全部质量闸门"
+            )
 
-            # 第二道：LLM 语义审阅
-            review = reviewers.immediate_check(draft, scene, keeper_cache, context_pack)
-            if not review.get("passed", False) and fail < max_fail:
-                fail += 1
-                feedback_map[sid] = review.get("suggestions", "")
-                continue
-
-            # 第三道：对话声纹审计
-            audit = auditor.audit(draft, context_pack)
-            if not audit.get("passed", False) and fail < max_fail:
-                fail += 1
-                feedback_map[sid] = audit.get("suggestions", "")
-                log.warning(f"  场景 {sid} 声纹违规: {audit.get('suggestions','')}")
-                continue
-
-            if fail >= max_fail:
-                draft = "[系统提示：场景生成失败，启用骨架降级]\n" + draft
-            keeper_cache = keeper.update(keeper_cache, draft, chapter_num, sid)
-            break
-    keeper_cache["_style_hits"] = style_hits
-    if style_hits:
-        print(f"  [风格扫描] 本章命中风格问题 {len(style_hits)} 条")
+        if not accepted:
+            failed_path = _save_failed_draft(
+                config, chapter_num, sid, draft, diagnostics,
+            )
+            raise SceneQualityError(
+                f"第 {chapter_num} 章场景 {sid} 重试耗尽，失败稿已保存: {failed_path}"
+            )
+        keeper_cache = keeper.update(keeper_cache, draft, chapter_num, sid)
 
     all_scenes = keeper_cache.get("all_scenes", [])
     full_chapter = writer.merge_scenes(all_scenes, plan_json, chapter_num)
+    final_scan = scanner.scan(full_chapter)
 
     if chapter_num % config.heavy_review_interval == 0:
         heavy = reviewers.heavy_check(full_chapter, plan_json, chapter_num)
         if heavy.get("patch_instructions"):
             log.warning(f"重型审查: {heavy.get('score','?')}分, {len(heavy['patch_instructions'])} 条指示")
             patched = writer.apply_patches(full_chapter, plan_json, heavy["patch_instructions"], chapter_num)
-            before, re_scan = scanner.scan(full_chapter), scanner.scan(patched)
-            if re_scan.passed or len(re_scan.violations) < len(before.violations):
-                full_chapter = patched
-                style_hits.extend(re_scan.to_rows(chapter_num))
+            patched_scan = scanner.scan(patched)
+            before_weight = len(final_scan.violations) * 100 + len(final_scan.warnings)
+            after_weight = len(patched_scan.violations) * 100 + len(patched_scan.warnings)
+            metrics_worse = (
+                patched_scan.metrics.get("max_same_len_run", 0)
+                > final_scan.metrics.get("max_same_len_run", 0)
+            )
+            if patched_scan.violations or after_weight > before_weight or metrics_worse:
+                log.warning("补丁引入硬违规或扫描结果更差，保留补丁前正文")
             else:
-                log.warning("补丁后扫描更差，保留原稿")
+                full_chapter = patched
+                final_scan = patched_scan
     else:
         heavy = {"score": None, "patch_instructions": []}
+
+    style_hits = final_scan.to_rows(chapter_num)
     keeper_cache["_style_hits"] = style_hits
+    if style_hits:
+        print(f"  [风格扫描] 最终正文命中风格问题 {len(style_hits)} 条")
+    if not final_scan.passed:
+        failed_path = _save_failed_draft(
+            config, chapter_num, "merged", full_chapter,
+            {"stage": "final_scan", "scan_violations": final_scan.violations},
+        )
+        raise SceneQualityError(
+            f"第 {chapter_num} 章合并正文未通过最终风格扫描，失败稿已保存: {failed_path}"
+        )
 
     archivist.save_chapter(chapter_num, full_chapter)
-    archivist.update_bible(chapter_num, plan_json, keeper_cache)
+    if not archivist.update_bible(chapter_num, plan_json, keeper_cache, full_chapter):
+        raise RuntimeError(f"第 {chapter_num} 章正文已保存，但知识归档失败")
     keeper.save_cache(chapter_num, keeper_cache)
 
     # 读者代理人反馈
@@ -899,11 +1095,16 @@ def cmd_revise(chapter_num: int, feedback: str):
         _db = NovelDB(get_novel_dir())
         _db.add_lesson(chapter_num, feedback, "用户手动修订", "user")
         rows = scanner.scan(revised).to_rows(chapter_num)
+        _db.delete_style_hits(chapter_num)
         if rows:
             _db.add_style_hits(rows)
+        _db.clear_chapter_derivatives(chapter_num)
+        _db.log_chapter(chapter_num, words=len(revised), status="knowledge_stale")
         _db.close()
+        from engine.agents.keeper import KeeperAgent
+        KeeperAgent().invalidate_from(chapter_num)
     except Exception as e:
-        log.warning(f"DB lesson 写入失败: {e}")
+        log.warning(f"修订后知识失效标记失败: {e}")
     post = scanner.scan(revised)
     if not post.passed:
         print(f"  ⚠ 修订稿仍含机械违规 {len(post.violations)} 条（已记入风格档案）")
@@ -922,14 +1123,24 @@ def cmd_summary(volume_num: int, prompt: str = ""):
         return
     lo, hi = vol["chapters"]
 
-    # 收集本章摘要
     gen_dir = config.generated_dir
     summaries = []
-    for ch in range(lo, hi + 1):
-        cf = gen_dir / f"chapter_{ch:02d}.md"
-        if cf.exists():
+    from engine.db import NovelDB
+    db = NovelDB(get_novel_dir())
+    try:
+        rows = db.conn.execute(
+            "SELECT chapter,summary FROM chapter_summaries "
+            "WHERE chapter BETWEEN ? AND ? ORDER BY chapter", (lo, hi)
+        ).fetchall()
+    finally:
+        db.close()
+    summaries = [f"第{row['chapter']}章: {row['summary']}" for row in rows]
+    if not summaries:
+        for cf in chapter_files(gen_dir, first_chapter=lo, last_chapter=hi):
+            ch = parse_chapter_number(cf)
             text = cf.read_text(encoding="utf-8")
-            summaries.append(f"第{ch}章: {text[:200]}...")
+            first_line = text.strip().split("\n")[0] if text else cf.stem
+            summaries.append(f"第{ch}章: {first_line}")
 
     if not summaries:
         print(f"错误: 第{volume_num}卷尚未生成任何章节")

@@ -1,3 +1,5 @@
+import json
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -131,6 +133,43 @@ class TestOutlineValidator(unittest.TestCase):
                     novel.cmd_outline()
             self.assertEqual(chat.call_count, 3)
             self.assertEqual(outline_file.read_text(encoding="utf-8"), "原大纲")
+
+    def test_1500_chapters_are_small_parts_and_resume(self):
+        def output_for_prompt(model, user_prompt):
+            lo, hi = map(int, re.search(r"【当前分片】第(\d+)-(\d+)章", user_prompt).groups())
+            lines = []
+            if "本片是本卷首片" in user_prompt:
+                lines.extend(["### 卷概览", OVERVIEW, ""])
+            lines.append(f"### 第{lo}-{hi}章：阶段推进")
+            lines.extend(chapter_line(number) for number in range(lo, hi + 1))
+            return "\n".join(lines)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            bible_dir = Path(tmp)
+            config = SimpleNamespace(
+                bible_dir=bible_dir, story_title="长书", planner_model=object(),
+                volume_config=novel_creator._volume_config(1500),
+            )
+            for volume in config.volume_config.values():
+                volume["core_emotion"] = "紧张"
+                volume["focus"] = "推进主线"
+            with patch.object(novel, "get_config", return_value=config), patch.object(
+                    novel, "get_novel", return_value="long-book"), patch(
+                    "engine.llm_client.chat", side_effect=output_for_prompt) as chat:
+                novel.cmd_outline()
+                first_calls = chat.call_count
+                novel.cmd_outline()
+            self.assertEqual(chat.call_count, first_calls)
+            manifest = json.loads((bible_dir / "outline_manifest.json").read_text(encoding="utf-8"))
+            ranges = [item["range"] for item in manifest["parts"]]
+            self.assertEqual(ranges[0][0], 1)
+            self.assertEqual(ranges[-1][1], 1500)
+            self.assertTrue(all(8 <= hi - lo + 1 <= 20 for lo, hi in ranges))
+            self.assertTrue(all(item["status"] == "complete" and item["hash"]
+                                for item in manifest["parts"]))
+            outline = (bible_dir / "outline.md").read_text(encoding="utf-8")
+            self.assertEqual(len(set(map(int, re.findall(r"\*\*第(\d+)章", outline)))), 1500)
+            self.assertEqual(outline.count("### 卷概览"), len(config.volume_config))
 
 
 if __name__ == "__main__":

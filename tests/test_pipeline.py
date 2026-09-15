@@ -75,7 +75,7 @@ class PipelineTestCase(unittest.TestCase):
         w = self.step(out, "write")
         self.assertTrue(w["available"])
         self.assertEqual(w["detail"]["next_chapter"], 1)
-        self.assertEqual(w["detail"]["range"], [1, 2])   # 8章4卷 → 卷一(1,2)
+        self.assertEqual(w["detail"]["range"], [1, 8])
 
     def test_gap_detection_and_next(self):
         self.write_titles()
@@ -90,17 +90,16 @@ class PipelineTestCase(unittest.TestCase):
     def test_summary_unlock_when_volume_full(self):
         self.write_titles()
         (self.book / "bible" / "outline.md").write_text("第1章 x", encoding="utf-8")
-        for n in (1, 2, 3):
+        for n in range(1, 9):
             (self.book / "generated" / f"chapter_{n:02d}.md").write_text("正文", encoding="utf-8")
         out = self.client.get("/api/novels/pipe/pipeline").json()
-        self.assertEqual(out["stage"], "volume_summary")   # 卷一(1,2)已满缺总结
+        self.assertEqual(out["stage"], "volume_summary")
         s = self.step(out, "summary")
         self.assertTrue(s["available"])
         self.assertEqual(s["pending"][0]["key"], "volume_1")
-        # 补上卷一总结后阶段回到逐章写作（卷二未完）
         (self.book / "generated" / "volume_1_summary.md").write_text("总结", encoding="utf-8")
         out = self.client.get("/api/novels/pipe/pipeline").json()
-        self.assertEqual(out["stage"], "write")
+        self.assertEqual(out["stage"], "publish")
 
     def test_publish_stage_at_end(self):
         self.write_titles()

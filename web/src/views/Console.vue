@@ -114,11 +114,14 @@
           <div><h2>任务输出</h2><p>{{ running ? `运行中：${taskLabel}` : '最近任务的实时日志' }}</p></div>
           <div class="toolbar-group">
             <el-tag v-if="running && stepInfo.total > 1" type="warning">{{ stepInfo.done }}/{{ stepInfo.total }} 步</el-tag>
+            <el-button v-if="running" size="small" type="danger" plain :loading="cancelling" @click="cancelCurrent">取消任务</el-button>
             <el-button size="small" @click="clearLog" :disabled="running">清屏</el-button>
           </div>
         </div>
-        <el-alert v-if="taskStatus === 'failed'" title="任务失败，见日志末尾" type="error" :closable="false" class="log-alert" />
+        <el-alert v-if="['failed', 'error'].includes(taskStatus)" title="任务失败，见日志末尾" type="error" :closable="false" class="log-alert" />
         <el-alert v-else-if="taskStatus === 'done'" title="任务完成" type="success" :closable="false" class="log-alert" />
+        <el-alert v-else-if="taskStatus === 'cancelled'" title="任务已取消" type="warning" :closable="false" class="log-alert" />
+        <el-alert v-else-if="taskStatus === 'orphaned'" title="服务重启，任务已中断" type="warning" :closable="false" class="log-alert" />
         <div ref="logBox" class="log"><span v-if="logText">{{ logText }}</span><span v-else class="log-placeholder">点上方任意步骤的执行按钮，输出会实时显示在这里</span></div>
       </section>
 
@@ -130,6 +133,7 @@
           <el-table-column label="进度" width="90"><template #default="{ row }"><span class="mono" v-if="row.steps > 1">{{ row.done_steps||0 }}/{{ row.steps }}</span><span v-else>—</span></template></el-table-column>
           <el-table-column label="状态" width="90"><template #default="{ row }"><el-tag :type="tagType(row.status)" effect="plain" size="small">{{ row.status }}</el-tag></template></el-table-column>
           <el-table-column label="开始" min-width="150"><template #default="{ row }">{{ row.started ? new Date(row.started * 1000).toLocaleString() : '—' }}</template></el-table-column>
+          <el-table-column label="操作" width="90"><template #default="{ row }"><el-button v-if="row.status === 'running'" link type="danger" :loading="cancelling" @click="cancelTask(row.id)">取消</el-button><span v-else>—</span></template></el-table-column>
         </el-table>
         <el-empty v-else :image-size="64" description="暂无历史任务" />
       </section>
@@ -158,6 +162,8 @@ const reviseChapter = ref(1)
 const revisePrompt = ref('')
 const logText = ref('')
 const running = ref(false)
+const cancelling = ref(false)
+const currentTaskId = ref('')
 const taskStatus = ref('')
 const taskLabel = ref('')
 const stepInfo = ref({ total: 1, done: 0 })
@@ -246,7 +252,8 @@ function runBatch() {
   run('generate', { chapter: start, chapter_end: batchEnd.value, prompt: genPrompt.value })
 }
 function startStream(id) {
-  running.value = true; taskStatus.value = ''; logText.value = ''; es?.close()
+  currentTaskId.value = id
+  running.value = true; cancelling.value = false; taskStatus.value = ''; logText.value = ''; es?.close()
   es = taskEventSource(id)
   es.onmessage = event => {
     const data = JSON.parse(event.data)
@@ -263,6 +270,21 @@ function startStream(id) {
   }
   es.onerror = () => { es?.close(); running.value = false; refreshHistory() }
 }
+async function cancelTask(id) {
+  if (!id || cancelling.value) return
+  cancelling.value = true
+  try {
+    const result = await api.cancelTask(id)
+    taskStatus.value = result.status
+    if (id === currentTaskId.value) running.value = false
+    es?.close()
+    ElMessage.success(result.cancelled ? '任务已取消' : `任务已是 ${result.status}`)
+    await refresh()
+  } catch (e) {
+    ElMessage.error(e.response?.data?.detail || '取消失败')
+  } finally { cancelling.value = false }
+}
+function cancelCurrent() { return cancelTask(currentTaskId.value) }
 function clearLog() { logText.value = '' }
 function goto(view) { router.push({ name: view, params: { name: novelName.value } }) }
 
