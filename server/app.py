@@ -10,7 +10,7 @@ from pathlib import Path
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse, StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -23,6 +23,7 @@ from engine.novel_creator import (  # noqa: E402
     validate_slug,
 )
 from engine.theme_generator import (  # noqa: E402
+    THEME_DIRECTIONS,
     ThemeConfigurationError,
     ThemeGenerationError,
     generate_themes,
@@ -128,12 +129,21 @@ def api_novels():
 class ThemeGenerationBody(BaseModel):
     inspiration: str = Field(default="", max_length=1000)
     genre: str = Field(default="", max_length=100)
+    direction: str = Field(..., max_length=20)
+
+    @field_validator("direction")
+    @classmethod
+    def validate_direction(cls, value: str) -> str:
+        value = value.strip()
+        if value not in THEME_DIRECTIONS:
+            raise ValueError("请选择有效的主题方向")
+        return value
 
 
 @app.post("/api/novel-themes/generate")
 def api_generate_novel_themes(body: ThemeGenerationBody):
     try:
-        options = generate_themes(body.inspiration, body.genre)
+        options = generate_themes(body.inspiration, body.genre, body.direction)
     except ThemeConfigurationError as exc:
         raise HTTPException(400, str(exc)) from exc
     except ThemeGenerationError as exc:

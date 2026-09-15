@@ -13,6 +13,10 @@ from engine.env_loader import load_env
 
 DEFAULT_BASE_URL = "https://api.deepseek.com/v1"
 DEFAULT_MODEL = "deepseek-chat"
+THEME_DIRECTIONS = (
+    "悬疑推理", "都市情感", "科幻未来", "奇幻冒险",
+    "历史权谋", "成长热血", "惊悚生存", "自由创作",
+)
 _SLUG_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$")
 
 
@@ -115,9 +119,12 @@ def parse_theme_response(content: str) -> list[dict]:
     return normalized
 
 
-def generate_themes(inspiration: str = "", genre: str = "", *, client=None,
+def generate_themes(inspiration: str = "", genre: str = "", direction: str = "", *, client=None,
                     environ: Mapping[str, str] | None = None) -> list[dict]:
     """Generate three novel concepts without reading or creating any novel workspace."""
+    direction = direction.strip()
+    if direction not in THEME_DIRECTIONS:
+        raise ThemeGenerationError("请选择有效的主题方向")
     if environ is None:
         environ = load_env(root_path=Path(__file__).resolve().parent.parent / ".env")
     api_key, base_url, model = _configuration(environ)
@@ -130,6 +137,7 @@ def generate_themes(inspiration: str = "", genre: str = "", *, client=None,
         "每个对象必须且只能包含 title、id、genre、description、chapter_count、"
         "words_per_chapter、theme、conflict。id 使用小写英文字母、数字和连字符，"
         "chapter_count 与 words_per_chapter 使用整数。"
+        f"\n创作方向：{direction}（必须围绕此方向设计，不得偏离）"
         f"\n用户灵感：{inspiration or '无，由你自由构思'}"
         f"\n题材偏好：{genre or '不限'}"
     )

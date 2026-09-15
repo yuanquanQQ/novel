@@ -42,7 +42,7 @@ class ThemeGeneratorTests(unittest.TestCase):
 
         with patch("engine.theme_generator.OpenAI", return_value=client) as openai:
             result = generate_themes(
-                "雨夜里的旧车站", "悬疑",
+                "雨夜里的旧车站", "悬疑", "悬疑推理",
                 environ={
                     "DEEPSEEK_API_KEY": "secret",
                     "DEEPSEEK_BASE_URL": "https://example.test/v1",
@@ -59,6 +59,7 @@ class ThemeGeneratorTests(unittest.TestCase):
         self.assertEqual(request["model"], "theme-model")
         self.assertEqual(request["response_format"], {"type": "json_object"})
         self.assertIn("雨夜里的旧车站", request["messages"][1]["content"])
+        self.assertIn("创作方向：悬疑推理", request["messages"][1]["content"])
 
     def test_generate_uses_root_env_when_environ_is_omitted(self):
         content = json.dumps({"options": _options()}, ensure_ascii=False)
@@ -72,7 +73,7 @@ class ThemeGeneratorTests(unittest.TestCase):
             "API_KEY": "root-key", "API_BASE_URL": "https://root.example/v1",
             "THEME_MODEL": "root-theme",
         }), patch("engine.theme_generator.OpenAI", return_value=client) as openai:
-            generate_themes(client=client)
+            generate_themes("", "", "自由创作", client=client)
         openai.assert_not_called()
         self.assertEqual(create.call_args.kwargs["model"], "root-theme")
 
@@ -82,7 +83,7 @@ class ThemeGeneratorTests(unittest.TestCase):
                 with self.assertRaisesRegex(
                     ThemeConfigurationError, "API_KEY 或 DEEPSEEK_API_KEY"
                 ):
-                    generate_themes(environ=environ)
+                    generate_themes(direction="自由创作", environ=environ)
 
     def test_invalid_and_duplicate_ids_receive_unique_safe_fallbacks(self):
         options = _options()
@@ -115,11 +116,11 @@ class ThemeGeneratorAPITests(unittest.TestCase):
         with patch.object(server_app, "generate_themes", return_value=options) as generate:
             response = self.client.post(
                 "/api/novel-themes/generate",
-                json={"inspiration": "逆行列车", "genre": "科幻"},
+                json={"inspiration": "逆行列车", "genre": "科幻", "direction": "科幻未来"},
             )
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(response.json(), {"options": options})
-        generate.assert_called_once_with("逆行列车", "科幻")
+        generate.assert_called_once_with("逆行列车", "科幻", "科幻未来")
 
     def test_api_maps_configuration_and_generation_errors(self):
         cases = [
@@ -131,10 +132,18 @@ class ThemeGeneratorAPITests(unittest.TestCase):
                 server_app, "generate_themes", side_effect=error
             ):
                 response = self.client.post(
-                    "/api/novel-themes/generate", json={}
+                    "/api/novel-themes/generate", json={"direction": "自由创作"}
                 )
             self.assertEqual(response.status_code, status)
             self.assertEqual(response.json()["detail"], str(error))
+
+    def test_api_requires_and_validates_direction(self):
+        missing = self.client.post("/api/novel-themes/generate", json={})
+        self.assertEqual(missing.status_code, 422)
+        invalid = self.client.post(
+            "/api/novel-themes/generate", json={"direction": "不存在"}
+        )
+        self.assertEqual(invalid.status_code, 422)
 
     def test_api_validates_input_lengths(self):
         response = self.client.post(

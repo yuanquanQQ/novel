@@ -49,9 +49,15 @@
           <strong>AI 主题构思</strong>
           <span>生成三个建议，选中后仅填入表单</span>
         </div>
-        <el-button type="primary" plain :loading="themeLoading" @click="generateThemes">
+        <el-button type="primary" plain :loading="themeLoading" :disabled="!themeRequest.direction" @click="generateThemes">
           <el-icon v-if="!themeLoading"><MagicStick /></el-icon>生成方案
         </el-button>
+      </div>
+      <div class="direction-picker">
+        <span class="direction-label">先选创作方向（必选）</span>
+        <button v-for="direction in THEME_DIRECTIONS" :key="direction" type="button" class="direction-card" :class="{ selected: themeRequest.direction === direction }" @click="themeRequest.direction = direction">
+          {{ direction }}
+        </button>
       </div>
       <div class="theme-inputs">
         <el-input v-model="themeRequest.inspiration" maxlength="1000" show-word-limit placeholder="可选：一句灵感、人物或场景" />
@@ -124,7 +130,8 @@ const deleting = ref(false)
 const themeLoading = ref(false)
 const themeError = ref('')
 const themeOptions = ref([])
-const themeRequest = reactive({ inspiration: '', genre: '' })
+const THEME_DIRECTIONS = ['悬疑推理', '都市情感', '科幻未来', '奇幻冒险', '历史权谋', '成长热血', '惊悚生存', '自由创作']
+const themeRequest = reactive({ inspiration: '', genre: '', direction: '' })
 const createFormRef = ref(null)
 const form = reactive({ id: '', title: '', chapter_count: 200, words_per_chapter: 3000, genre: '', description: '' })
 const createPanels = ref([])
@@ -171,7 +178,7 @@ function openCreate() {
   Object.assign(form, { id: '', title: '', chapter_count: 200, words_per_chapter: 3000, genre: '', description: '' })
   Object.assign(modelForm, emptyModelForm())
   createPanels.value = []
-  Object.assign(themeRequest, { inspiration: '', genre: '' })
+  Object.assign(themeRequest, { inspiration: '', genre: '', direction: '' })
   themeOptions.value = []
   themeError.value = ''
   createVisible.value = true
@@ -179,6 +186,10 @@ function openCreate() {
 
 async function generateThemes() {
   if (themeLoading.value) return
+  if (!themeRequest.direction) {
+    themeError.value = '请先选择创作方向'
+    return
+  }
   themeLoading.value = true
   themeError.value = ''
   try {
@@ -312,6 +323,10 @@ async function submitCreate() {
 .theme-heading strong, .theme-heading span { display: block; }
 .theme-heading strong { color: var(--text); font-size: 15px; }
 .theme-heading span { margin-top: 3px; color: var(--muted); font-size: 12px; }
+.direction-picker { display: flex; flex-wrap: wrap; align-items: center; gap: 7px; margin-top: 14px; }
+.direction-label { width: 100%; color: var(--muted); font-size: 12px; }
+.direction-card { padding: 7px 12px; color: #52606d; background: #fff; border: 1px solid var(--border); border-radius: 8px; cursor: pointer; }
+.direction-card:hover, .direction-card.selected { color: var(--primary); border-color: var(--primary); background: var(--primary-soft); }
 .theme-inputs { display: grid; grid-template-columns: 2fr 1fr; gap: 10px; margin-top: 14px; }
 .theme-error { margin-top: 12px; }
 .theme-cards { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; margin-top: 14px; }
