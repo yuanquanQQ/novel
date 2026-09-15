@@ -60,6 +60,22 @@ class ThemeGeneratorTests(unittest.TestCase):
         self.assertEqual(request["response_format"], {"type": "json_object"})
         self.assertIn("雨夜里的旧车站", request["messages"][1]["content"])
 
+    def test_generate_uses_root_env_when_environ_is_omitted(self):
+        content = json.dumps({"options": _options()}, ensure_ascii=False)
+        create = Mock(return_value=SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=content))]
+        ))
+        client = SimpleNamespace(chat=SimpleNamespace(
+            completions=SimpleNamespace(create=create)
+        ))
+        with patch("engine.theme_generator.load_env", return_value={
+            "API_KEY": "root-key", "API_BASE_URL": "https://root.example/v1",
+            "THEME_MODEL": "root-theme",
+        }), patch("engine.theme_generator.OpenAI", return_value=client) as openai:
+            generate_themes(client=client)
+        openai.assert_not_called()
+        self.assertEqual(create.call_args.kwargs["model"], "root-theme")
+
     def test_missing_or_placeholder_key_has_clear_error(self):
         for environ in ({}, {"API_KEY": ""}, {"API_KEY": "your-api-key-here"}):
             with self.subTest(environ=environ):

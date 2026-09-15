@@ -49,46 +49,23 @@ def _volume_config(chapter_count: int) -> dict:
 
 def _config_py(title: str, chapter_count: int, words_per_chapter: int, volumes: dict) -> str:
     return f'''"""Standalone configuration for this novel."""
-import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from engine.env_loader import load_env, root_env_path
+
 PROJECT_ROOT = Path(__file__).resolve().parent
-
-
-def _load_local_env() -> dict[str, str]:
-    values = {{}}
-    env_file = PROJECT_ROOT / ".env"
-    if not env_file.is_file():
-        return values
-    for raw_line in env_file.read_text(encoding="utf-8").splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        key = key.strip()
-        value = value.strip()
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\\\"'":
-            value = value[1:-1]
-        if key:
-            values[key] = value
-    return values
-
-
-_LOCAL_ENV = _load_local_env()
+_LOCAL_ENV = load_env(local_path=PROJECT_ROOT / ".env", root_path=root_env_path(PROJECT_ROOT.parent))
 
 
 def _env(name: str, default: str) -> str:
-    return _LOCAL_ENV.get(name) or os.getenv(name) or default
+    return _LOCAL_ENV.get(name) or default
 
 
 def _env_alias(*names: str, default: str) -> str:
     for name in names:
         if _LOCAL_ENV.get(name):
             return _LOCAL_ENV[name]
-    for name in names:
-        if os.getenv(name):
-            return os.getenv(name)
     return default
 
 

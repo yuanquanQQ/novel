@@ -12,6 +12,7 @@ import time
 from pathlib import Path
 
 from engine.settings import NOVELS_DIR
+from engine.env_loader import load_env, read_env_file as _read_env_file, root_env_path
 
 ENV_API_KEY = "API_KEY"
 ENV_BASE_URL = "API_BASE_URL"
@@ -59,17 +60,11 @@ def env_path(novel_dir_: Path) -> Path:
 
 
 def read_env_file(path: Path) -> dict:
-    result = {}
-    if not Path(path).is_file():
-        return result
-    for line in Path(path).read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        value = value.strip().strip('"').strip("'")
-        result[key.strip()] = value
-    return result
+    return _read_env_file(path)
+
+
+def effective_env(novel_dir_: Path) -> dict[str, str]:
+    return load_env(local_path=env_path(novel_dir_), root_path=root_env_path(NOVELS_DIR))
 
 
 def update_env_file(path: Path, updates: dict) -> dict:
@@ -188,12 +183,12 @@ def get_view(name: str) -> dict:
     novel_dir_ = NOVELS_DIR / name
     env_file = env_path(novel_dir_)
     env = read_env_file(env_file)
+    effective = effective_env(novel_dir_)
     cfg = load_config(name)
     supported = env_supported(novel_dir_)
 
-    key_env = env.get(ENV_API_KEY) or env.get("DEEPSEEK_API_KEY")
-    global_key = key_env or ""
-    base = env.get(ENV_BASE_URL) or env.get("DEEPSEEK_BASE_URL") \
+    key_env = effective.get(ENV_API_KEY) or effective.get("DEEPSEEK_API_KEY")
+    base = effective.get(ENV_BASE_URL) or effective.get("DEEPSEEK_BASE_URL") \
         or getattr(cfg, "base_url", None) or getattr(cfg, "deepseek_base_url", "")
 
     roles = []
@@ -201,7 +196,7 @@ def get_view(name: str) -> dict:
         cfg_attr = getattr(cfg, role["attr"], None)
         current = getattr(cfg_attr, "model_name", "") if cfg_attr else ""
         if not current:
-            current = env.get(role["env"]) or role["default"]
+            current = effective.get(role["env"]) or role["default"]
         roles.append({
             **{k: role[k] for k in ("attr", "env", "label", "default")},
             "model": current,
@@ -213,7 +208,7 @@ def get_view(name: str) -> dict:
         "api_key_masked": _mask_key(key_env or _effective_key(cfg)),
         "api_key_set": bool(key_env) or _effective_key(cfg) not in ("", "your-api-key-here"),
         "base_url": base,
-        "theme_model": env.get(ENV_THEME_MODEL, ""),
+        "theme_model": effective.get(ENV_THEME_MODEL, "deepseek-chat"),
         "roles": roles,
     }
 
@@ -234,15 +229,11 @@ def save(name: str, updates: dict) -> dict:
 # -------------------------------------------------------------------- test
 def test_connection(novel_dir_: Path, model: str, api_key: str = "",
                     base_url: str = "") -> dict:
-    env = read_env_file(env_path(novel_dir_))
+    env = effective_env(novel_dir_)
     if not api_key:
-        from engine.settings import load_config
-        cfg = load_config(novel_dir_.name)
-        api_key = getattr(cfg, "api_key", "") or getattr(cfg, "deepseek_api_key", "")
+        api_key = env.get(ENV_API_KEY) or env.get("DEEPSEEK_API_KEY", "")
     if not base_url:
-        from engine.settings import load_config
-        cfg = load_config(novel_dir_.name)
-        base_url = getattr(cfg, "base_url", "") or getattr(cfg, "deepseek_base_url", "")
+        base_url = env.get(ENV_BASE_URL) or env.get("DEEPSEEK_BASE_URL", "")
     if not api_key:
         return {"ok": False, "model": model, "error": "未配置 API Key（本书 .env、系统环境变量都没有）"}
     model = (model or "").strip()
@@ -270,7 +261,7 @@ def test_connection(novel_dir_: Path, model: str, api_key: str = "",
 
 
 def _model_config_for(novel_dir_: Path, model: str) -> str:
-    env = read_env_file(env_path(novel_dir_))
+    env = effective_env(novel_dir_)
     if model in ALLOWED_ENVS:
         return env.get(model, "")
     if model in ENV_BY_ATTR:

@@ -4,9 +4,12 @@ import hashlib
 import json
 import os
 import re
+from pathlib import Path
 from typing import Mapping
 
 from openai import OpenAI
+
+from engine.env_loader import load_env
 
 DEFAULT_BASE_URL = "https://api.deepseek.com/v1"
 DEFAULT_MODEL = "deepseek-chat"
@@ -115,7 +118,9 @@ def parse_theme_response(content: str) -> list[dict]:
 def generate_themes(inspiration: str = "", genre: str = "", *, client=None,
                     environ: Mapping[str, str] | None = None) -> list[dict]:
     """Generate three novel concepts without reading or creating any novel workspace."""
-    api_key, base_url, model = _configuration(os.environ if environ is None else environ)
+    if environ is None:
+        environ = load_env(root_path=Path(__file__).resolve().parent.parent / ".env")
+    api_key, base_url, model = _configuration(environ)
     inspiration = inspiration.strip()
     genre = genre.strip()
     prompt = (

@@ -85,6 +85,26 @@ class TestNovelCreationAPI(unittest.TestCase):
         self.assertEqual(config.planner_model.model_name, "local-planner")
         self.assertEqual(config.writer_model.model_name, "local-writer")
 
+    def test_config_uses_root_env_when_local_is_absent_and_local_wins(self):
+        (self.novels_dir.parent / ".env").write_text(
+            "API_KEY=root-key\nAPI_BASE_URL=https://root.example/v1\n"
+            "PLANNER_MODEL=root-planner\nWRITER_MODEL=root-writer\nTHEME_MODEL=root-theme\n",
+            encoding="utf-8",
+        )
+        novel_creator.create_novel("global-book", "全局测试", 1, 1000, "", "")
+        config = settings.load_config("global-book")
+        self.assertEqual(config.api_key, "root-key")
+        self.assertEqual(config.writer_model.model_name, "root-writer")
+        view = model_config.get_view("global-book")
+        self.assertEqual(view["theme_model"], "root-theme")
+        self.assertEqual(view["roles"][-1]["model"], "deepseek-chat")
+        (self.novels_dir / "global-book" / ".env").write_text(
+            "WRITER_MODEL=local-writer\nTHEME_MODEL=local-theme\n", encoding="utf-8"
+        )
+        settings.invalidate_config("global-book")
+        self.assertEqual(settings.load_config("global-book").writer_model.model_name, "local-writer")
+        self.assertEqual(model_config.get_view("global-book")["theme_model"], "local-theme")
+
     def test_saved_env_invalidates_cached_config(self):
         novel_creator.create_novel(
             "cached-book", "缓存测试", 1, 1000, "", "",

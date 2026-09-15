@@ -6,6 +6,8 @@ import sys
 import uuid
 from pathlib import Path
 
+from engine.env_loader import read_env_file, root_env_path
+
 ENGINE_ROOT = Path(__file__).resolve().parent.parent
 NOVELS_DIR = ENGINE_ROOT / "novels"
 
@@ -46,7 +48,30 @@ def load_config(name: str):
     except Exception:
         sys.modules.pop(module_name, None)
         raise
-    return module.config
+    config = module.config
+    local_env = read_env_file(novel_dir / ".env")
+    root_env = read_env_file(root_env_path(root))
+    for keys, attr in ((
+        ("API_KEY", "DEEPSEEK_API_KEY"), "api_key"),
+        (("API_BASE_URL", "DEEPSEEK_BASE_URL"), "base_url"),
+    ):
+        if not any(key in local_env for key in keys) and hasattr(config, attr):
+            for key in keys:
+                if root_env.get(key):
+                    setattr(config, attr, root_env[key])
+                    break
+    for attr in (
+        "planner_model", "researcher_model", "writer_model", "immediate_reviewer_model",
+        "heavy_reviewer_model", "keeper_model", "archivist_model",
+        "foreshadowing_steward_model", "reader_proxy_model", "marketer_model",
+    ):
+        key = attr.upper()
+        if key in local_env or key not in root_env:
+            continue
+        model_config = getattr(config, attr, None)
+        if model_config is not None and hasattr(model_config, "model_name"):
+            model_config.model_name = root_env[key]
+    return config
 
 
 def get_novel() -> str:
