@@ -11,6 +11,14 @@
         <el-select v-model="novelStore.current" placeholder="暂无小说" :disabled="!novelStore.hasNovels" @change="onNovelChange">
           <el-option v-for="n in novelStore.novels" :key="n.id" :label="`${n.title} · ${n.chapters_written}/${n.chapter_count || '?'}`" :value="n.id" />
         </el-select>
+        <div v-if="novelStore.current" class="novel-actions">
+          <el-button plain :loading="exporting" :disabled="deleting" @click="exportCurrentNovel">
+            <el-icon v-if="!exporting"><Download /></el-icon>导出整本
+          </el-button>
+          <el-button plain type="danger" :loading="deleting" :disabled="exporting" @click="deleteCurrentNovel">
+            <el-icon v-if="!deleting"><Delete /></el-icon>删除小说
+          </el-button>
+        </div>
         <el-button class="create-side-button" plain @click="openCreate"><el-icon><Plus /></el-icon>新建小说</el-button>
       </div>
 
@@ -103,7 +111,7 @@
 <script setup>
 import { computed, onMounted, reactive, ref } from 'vue'
 import { useRouter } from 'vue-router'
-import { ElMessage } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import { useNovelStore } from './stores/novel'
 import { api } from './api'
 
@@ -111,6 +119,8 @@ const novelStore = useNovelStore()
 const router = useRouter()
 const createVisible = ref(false)
 const creating = ref(false)
+const exporting = ref(false)
+const deleting = ref(false)
 const themeLoading = ref(false)
 const themeError = ref('')
 const themeOptions = ref([])
@@ -200,6 +210,55 @@ function onNovelChange(name) {
   else router.replace({ name: 'dashboard' })
 }
 
+async function exportCurrentNovel() {
+  const id = novelStore.current
+  if (!id || exporting.value || deleting.value) return
+  exporting.value = true
+  try {
+    const blob = await api.exportNovel(id)
+    const url = URL.createObjectURL(blob)
+    const link = document.createElement('a')
+    link.href = url
+    link.download = `${id}.zip`
+    document.body.appendChild(link)
+    link.click()
+    link.remove()
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000)
+    ElMessage.success('整本小说已导出')
+  } catch (error) {
+    ElMessage.error(error.response?.data?.detail || '导出失败，请稍后重试')
+  } finally {
+    exporting.value = false
+  }
+}
+
+async function deleteCurrentNovel() {
+  const id = novelStore.current
+  if (!id || deleting.value || exporting.value) return
+  try {
+    await ElMessageBox.confirm(
+      `删除后将无法恢复，确定删除小说“${id}”吗？`,
+      '删除小说',
+      { confirmButtonText: '删除', cancelButtonText: '取消', type: 'warning' },
+    )
+  } catch {
+    return
+  }
+  deleting.value = true
+  try {
+    await api.deleteNovel(id)
+    novelStore.reset()
+    await novelStore.reload('')
+    await router.push({ name: 'dashboard' })
+    ElMessage.success('小说已删除')
+  } catch (error) {
+    const detail = error.response?.data?.detail
+    ElMessage.error(detail || '删除失败，请稍后重试')
+  } finally {
+    deleting.value = false
+  }
+}
+
 async function submitCreate() {
   if (!createFormRef.value || creating.value) return
   try {
@@ -238,6 +297,8 @@ async function submitCreate() {
 .brand small { margin-top: 2px; color: var(--muted); font-size: 10px; letter-spacing: .08em; text-transform: uppercase; }
 .novel-picker { padding: 4px 14px 14px; }
 .side-label { display: block; margin: 0 2px 7px; color: var(--muted); font-size: 12px; }
+.novel-actions { display: flex; gap: 8px; margin-top: 8px; }
+.novel-actions .el-button { flex: 1; margin-left: 0; }
 .create-side-button { width: 100%; margin-top: 8px; }
 .side :deep(.el-menu) { flex: 1; background: transparent; border-right: 0; padding: 4px 10px; }
 .side :deep(.el-menu-item) { height: 44px; margin: 3px 0; border-radius: 9px; color: #52606d; }
@@ -280,7 +341,8 @@ async function submitCreate() {
   .brand-mark { width: 32px; height: 32px; }
   .novel-picker { display: grid; grid-template-columns: 1fr auto; gap: 8px; padding: 4px 12px 10px; }
   .novel-picker .side-label { grid-column: 1 / -1; margin-bottom: 0; }
-  .create-side-button { width: auto; margin-top: 0; }
+  .novel-actions { grid-column: 1 / -1; margin-top: 0; }
+  .create-side-button { grid-column: 1 / -1; width: auto; margin-top: 0; }
   .side :deep(.el-menu) { display: flex; overflow-x: auto; padding: 4px 8px 8px; }
   .side :deep(.el-menu-item) { flex: 0 0 auto; padding: 0 13px; }
   .side-footer { display: none; }

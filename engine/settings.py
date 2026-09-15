@@ -59,6 +59,13 @@ def get_novel_dir() -> Path:
     return NOVELS_DIR / get_novel()
 
 
+def invalidate_config(name: str | None = None):
+    """丢弃缓存配置，确保本书 .env 的更新立即生效。"""
+    global _config
+    if name is None or name == _current_novel:
+        _config = None
+
+
 def get_config():
     global _config
     if _config is None:

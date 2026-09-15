@@ -225,6 +225,8 @@ def save(name: str, updates: dict) -> dict:
     if updates:
         validate_updates(updates)
         update_env_file(env_path(novel_dir_), updates)
+        from engine.settings import invalidate_config
+        invalidate_config(name)
     return {"ok": True, "upgraded_config": upgraded, "written": sorted(updates),
             "view": get_view(name)}
 

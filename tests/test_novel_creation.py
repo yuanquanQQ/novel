@@ -1,6 +1,8 @@
+import io
 import json
 import os
 import tempfile
+import zipfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -10,6 +12,7 @@ from fastapi.testclient import TestClient
 import engine.novel_creator as novel_creator
 import engine.settings as settings
 import server.app as server_app
+from engine import model_config
 
 
 class TestNovelCreationAPI(unittest.TestCase):
@@ -20,15 +23,22 @@ class TestNovelCreationAPI(unittest.TestCase):
         self._creator_dir = novel_creator.NOVELS_DIR
         self._server_dir = server_app.NOVELS_DIR
         self._settings_dir = settings.NOVELS_DIR
+        self._model_config_dir = model_config.NOVELS_DIR
+        self._current_novel = settings._current_novel
+        self._config = settings._config
         novel_creator.NOVELS_DIR = self.novels_dir
         server_app.NOVELS_DIR = self.novels_dir
         settings.NOVELS_DIR = self.novels_dir
+        model_config.NOVELS_DIR = self.novels_dir
         self.client = TestClient(server_app.app)
 
     def tearDown(self):
         novel_creator.NOVELS_DIR = self._creator_dir
         server_app.NOVELS_DIR = self._server_dir
         settings.NOVELS_DIR = self._settings_dir
+        model_config.NOVELS_DIR = self._model_config_dir
+        settings._current_novel = self._current_novel
+        settings._config = self._config
         self._tmp.cleanup()
 
     def test_create_initializes_complete_workspace(self):
@@ -74,6 +84,41 @@ class TestNovelCreationAPI(unittest.TestCase):
         self.assertEqual(config.base_url, "https://local.example/v1")
         self.assertEqual(config.planner_model.model_name, "local-planner")
         self.assertEqual(config.writer_model.model_name, "local-writer")
+
+    def test_saved_env_invalidates_cached_config(self):
+        novel_creator.create_novel(
+            "cached-book", "缓存测试", 1, 1000, "", "",
+            model_env={"WRITER_MODEL": "first-model"})
+        settings.set_novel("cached-book")
+        self.assertEqual(settings.get_config().writer_model.model_name, "first-model")
+        model_config.save("cached-book", {"WRITER_MODEL": "second-model"})
+        self.assertEqual(settings.get_config().writer_model.model_name, "second-model")
+
+    def test_export_and_delete_are_safe(self):
+        novel_creator.create_novel("archive-book", "归档测试", 1, 1000, "", "")
+        d = self.novels_dir / "archive-book"
+        (d / ".env").write_text("API_KEY=secret", encoding="utf-8")
+        (d / "db").mkdir(exist_ok=True)
+        (d / "db" / "private.sqlite").write_text("private", encoding="utf-8")
+        response = self.client.get("/api/novels/archive-book/export")
+        self.assertEqual(response.status_code, 200, response.text)
+        with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
+            names = set(archive.namelist())
+        self.assertIn("config.py", names)
+        self.assertIn("bible/master_bible.md", names)
+        self.assertNotIn(".env", names)
+        self.assertNotIn("db/private.sqlite", names)
+        deleted = self.client.delete("/api/novels/archive-book")
+        self.assertEqual(deleted.status_code, 200, deleted.text)
+        self.assertEqual(deleted.json(), {"ok": True, "id": "archive-book"})
+        self.assertFalse(d.exists())
+
+    def test_delete_rejects_running_task(self):
+        novel_creator.create_novel("busy-book", "忙书", 1, 1000, "", "")
+        with patch.object(server_app.T, "running_task", return_value="task-id"):
+            response = self.client.delete("/api/novels/busy-book")
+        self.assertEqual(response.status_code, 409)
+        self.assertTrue((self.novels_dir / "busy-book").exists())
 
     def test_knowledge_base_fields_round_trip(self):
         created = self.client.post("/api/novels", json={

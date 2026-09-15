@@ -1,7 +1,10 @@
 """小说创作引擎 — Web 控制台后端 (FastAPI)"""
+import io
 import json
 import re
+import shutil
 import sys
+import zipfile
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
@@ -17,6 +20,7 @@ from engine.novel_creator import (  # noqa: E402
     NovelCreationError,
     _resolve_model_env,
     create_novel,
+    validate_slug,
 )
 from engine.theme_generator import (  # noqa: E402
     ThemeConfigurationError,
@@ -43,6 +47,49 @@ def novel_dir(name: str) -> Path:
     if d.parent != root or not d.is_dir():
         raise HTTPException(404, f"小说不存在: {name}")
     return d
+
+
+@app.get("/api/novels/{name}/export")
+def api_export_novel(name: str):
+    try:
+        validate_slug(name)
+    except NovelCreationError as exc:
+        raise HTTPException(404, f"小说不存在: {name}") from exc
+    d = novel_dir(name)
+    archive = io.BytesIO()
+    top_files = {"novel_prompts.json", "config.py", ".env.example"}
+    excluded = {".env", "db", "cache", "vector_db", "__pycache__"}
+    with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as zf:
+        for path in d.rglob("*"):
+            if path.is_symlink() or not path.is_file():
+                continue
+            relative = path.relative_to(d)
+            if relative.parts[0] in excluded:
+                continue
+            if len(relative.parts) == 1 and relative.name not in top_files:
+                continue
+            if len(relative.parts) > 1 and relative.parts[0] not in {"bible", "generated"}:
+                continue
+            if any(part in excluded for part in relative.parts):
+                continue
+            zf.write(path, relative.as_posix())
+    archive.seek(0)
+    return StreamingResponse(
+        archive, media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{name}.zip"'})
+
+
+@app.delete("/api/novels/{name}")
+def api_delete_novel(name: str):
+    try:
+        validate_slug(name)
+    except NovelCreationError as exc:
+        raise HTTPException(404, f"小说不存在: {name}") from exc
+    d = novel_dir(name)
+    if T.running_task(name):
+        raise HTTPException(409, "该小说已有任务运行中")
+    shutil.rmtree(d)
+    return {"ok": True, "id": name}
 
 
 # ------------------------------------------------------------------ novels

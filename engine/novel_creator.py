@@ -82,6 +82,16 @@ def _env(name: str, default: str) -> str:
     return _LOCAL_ENV.get(name) or os.getenv(name) or default
 
 
+def _env_alias(*names: str, default: str) -> str:
+    for name in names:
+        if _LOCAL_ENV.get(name):
+            return _LOCAL_ENV[name]
+    for name in names:
+        if os.getenv(name):
+            return os.getenv(name)
+    return default
+
+
 @dataclass
 class ModelConfig:
     provider: str = "deepseek"
@@ -94,8 +104,8 @@ class ModelConfig:
 
 @dataclass
 class Config:
-    api_key: str = field(default_factory=lambda: _env("API_KEY", _env("DEEPSEEK_API_KEY", "your-api-key-here")))
-    base_url: str = field(default_factory=lambda: _env("API_BASE_URL", _env("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1")))
+    api_key: str = field(default_factory=lambda: _env_alias("API_KEY", "DEEPSEEK_API_KEY", default="your-api-key-here"))
+    base_url: str = field(default_factory=lambda: _env_alias("API_BASE_URL", "DEEPSEEK_BASE_URL", default="https://api.deepseek.com/v1"))
     planner_model: ModelConfig = field(default_factory=lambda: ModelConfig(model_name=_env("PLANNER_MODEL", "deepseek-reasoner"), temperature=0.6))
     researcher_model: ModelConfig = field(default_factory=lambda: ModelConfig(model_name=_env("RESEARCHER_MODEL", "deepseek-reasoner"), temperature=0.15))
     writer_model: ModelConfig = field(default_factory=lambda: ModelConfig(model_name=_env("WRITER_MODEL", "deepseek-chat"), temperature=0.9, max_tokens=8192))

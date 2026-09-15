@@ -6,6 +6,8 @@ export const api = {
   novels: () => http.get('/novels').then(r => r.data),
   generateNovelThemes: (data) => http.post('/novel-themes/generate', data, { timeout: 90000 }).then(r => r.data),
   createNovel: (data) => http.post('/novels', data).then(r => r.data),
+  exportNovel: (n) => http.get(`/novels/${n}/export`, { responseType: 'blob' }).then(r => r.data),
+  deleteNovel: (n) => http.delete(`/novels/${n}`).then(r => r.data),
   status: (n) => http.get(`/novels/${n}/status`).then(r => r.data),
 
   outline: (n) => http.get(`/novels/${n}/outline`).then(r => r.data),
