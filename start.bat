@@ -36,6 +36,14 @@ echo.
 
 cd /d "%ROOT%"
 start "" /b "%PYTHON%" -X utf8 -m uvicorn server.app:app --host 127.0.0.1 --port 11452 --reload
+
+:wait_backend
+curl -fsS http://127.0.0.1:11452/docs >nul 2>&1
+if errorlevel 1 (
+    timeout /t 1 /nobreak >nul
+    goto wait_backend
+)
+
 cd /d "%ROOT%web"
 start "" /b cmd /c "npm run dev"
 cd /d "%ROOT%"
