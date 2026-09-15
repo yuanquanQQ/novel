@@ -170,7 +170,23 @@ def _prompts(title: str, genre: str, description: str) -> dict:
             "## 已写章节摘要\n{outline_summary}\n\n"
             "请为第 {chapter_num} 章撰写结构化大纲。"
         )},
-        "outline_generator": {"system": generic + "\n请根据世界观、人物和分卷规划生成完整章节大纲。", "chapter_template": ""},
+        "outline_generator": {"system": generic + (
+            "\n请根据世界观、人物和分卷规划生成指定单卷的章节大纲。只输出本卷内容，"
+            "不要输出“## 第X卷”类卷标题，外层程序会统一包装。\n\n"
+            "【精确模板】\n"
+            "### 卷概览\n"
+            "100-150字单段卷概览，不换行。\n\n"
+            "### 第N-M章：小节名\n"
+            "- **第N章 章名**：核心剧情（明确谁做什么导致什么）。*功能：该章的结构功能；伏笔：引入 F001*\n\n"
+            "【硬性规则】\n"
+            "1. 指定范围内每个章号恰好出现一次并连续升序，禁止跳号、重复或输出范围外章节。\n"
+            "2. 每章严格一行且只能使用上述顶层bullet；章名2-6字；功能必填；伏笔只能写“引入 Fxxx”"
+            "“推进 Fxxx”“回收 Fxxx”或“无”，Fxxx为三位数字编号。\n"
+            "3. 小节标题严格使用“### 第N-M章：小节名”，范围须与下方章节一致。小节原则上8-12章；"
+            "本卷不足8章时允许整卷单节；最后一节为贴合边界可少于8章。\n"
+            "4. 禁止章节下附加二级bullet，禁止自查文本、重复卷总结、额外前言或结语、Markdown代码块及其他标题。\n"
+            "最终答案必须从“### 卷概览”开始，写完本卷最后一章立即结束。"
+        ), "chapter_template": ""},
         "title_generator": {"system": generic + "\n请根据以下大纲生成章名并输出 JSON：\n{outline}", "chapter_template": ""},
         "volume_summary": {"system": generic + "\n请总结《{volume_name}》（第{vol_start}-{vol_end}章）。\n核心情绪：{volume_emotion}\n章节摘要：\n{chapter_summaries}", "chapter_template": ""},
         "researcher": {"system": generic + "\n输出研究笔记（Markdown），只列与本章直接相关的事实。",

@@ -360,6 +360,180 @@ def cmd_promo(args):
         print("  python novel.py --novel X promo scene N     章节插图提示词")
 
 
+class OutlineValidationError(ValueError):
+    """模型连续返回无法安全解析的分卷大纲。"""
+
+
+def build_outline_prompt(title: str, volume: dict, bible: dict, user_prompt: str = "") -> str:
+    """构建单卷大纲提示词，不依赖文件或模型调用。"""
+    lo, hi = volume["chapters"]
+    clues = bible.get("clues", {}).get("clues", {})
+    foreshadowing = bible.get("clues", {}).get("active_foreshadowing", {})
+    result = (
+        f"你是资深小说策划编辑。请为《{title}》{volume['name']}生成详细大纲。\n\n"
+        f"【世界观】{bible.get('master_bible', '')[:2500]}\n\n"
+        f"【本卷】{volume['name']}（第{lo}-{hi}章） | 情绪:{volume['core_emotion']} | 重点:{volume['focus']}\n\n"
+        f"【人物】{json.dumps(bible.get('characters', {}), ensure_ascii=False, indent=2)[:2000]}\n\n"
+        f"【线索池】{json.dumps({key: value.get('name', '') for key, value in clues.items()}, ensure_ascii=False)}\n"
+        f"【伏笔池】{json.dumps({key: value.get('name', '') for key, value in foreshadowing.items()}, ensure_ascii=False)}\n\n"
+        "【输出边界】\n"
+        f"只输出{volume['name']}的卷内容，不要输出或重复“## {volume['name']}”这类卷标题，卷标题由程序添加。"
+        "不要输出前言、结语、自查结果、卷总结标题或其他说明。\n\n"
+        "【精确模板】\n"
+        "### 卷概览\n"
+        "这里写100-150字的单段卷概览，不换行。\n\n"
+        "### 第N-M章：小节名\n"
+        "- **第N章 章名**：核心剧情（明确谁做什么导致什么）。*功能：该章的结构功能；伏笔：引入 F001*\n\n"
+        "【硬性规则】\n"
+        f"1. 必须且只能输出第{lo}章至第{hi}章，每个章号恰好出现一次，连续排列，禁止跳号、重复或越界。\n"
+        "2. 每章严格占一行，并严格使用模板中的顶层 bullet；章名2-6字；核心剧情必须明确谁做什么导致什么。\n"
+        "3. 功能字段必填；伏笔字段只能写“引入 Fxxx”“推进 Fxxx”“回收 Fxxx”或“无”，Fxxx为三位数字编号。\n"
+        "4. 每个小节使用“### 第N-M章：小节名”，其范围必须与下方章节一致且各小节连续无重叠。"
+        "小节原则上8-12章；本卷总章数少于8章时允许整卷单节；为贴合卷末边界，最后一节允许少于8章。\n"
+        "5. 禁止在章节下添加二级 bullet 或任何补充行；禁止Markdown代码块；禁止额外标题；禁止重复卷概览或卷总结。\n"
+        f"6. 第{hi}章必须完成本卷收束。最终答案从“### 卷概览”开始，写完最后一章立即结束。"
+    )
+    if user_prompt:
+        result += f"\n\n【用户要求】{user_prompt}"
+    return result
+
+
+def validate_outline_output(content: str, lo: int, hi: int) -> list[str]:
+    """校验单卷模型输出，返回可直接反馈给模型的具体错误。"""
+    errors = []
+    lines = content.strip().splitlines()
+    nonempty = [(index + 1, line) for index, line in enumerate(lines) if line.strip()]
+    overview_heading = [(number, line) for number, line in nonempty if line == "### 卷概览"]
+    if len(overview_heading) != 1:
+        errors.append(f"“### 卷概览”应恰好出现1次，实际{len(overview_heading)}次")
+
+    if any(re.match(r"^##(?:\s|$)", line) for _, line in nonempty):
+        errors.append("包含禁止的H2卷标题（## ...），不要重复程序生成的卷标题")
+    if "自查" in content:
+        errors.append("包含禁止的自查文本")
+
+    overview_line = None
+    if overview_heading:
+        heading_position = next(i for i, item in enumerate(nonempty) if item[0] == overview_heading[0][0])
+        if heading_position != 0:
+            errors.append("输出必须从“### 卷概览”开始")
+        if heading_position + 1 >= len(nonempty):
+            errors.append("缺少卷概览正文")
+        else:
+            overview_line = nonempty[heading_position + 1]
+            overview_length = len(overview_line[1].strip())
+            if not 100 <= overview_length <= 150:
+                errors.append(f"卷概览必须为100-150字单段，实际{overview_length}字")
+            if overview_line[1].lstrip().startswith(("#", "-", "*")):
+                errors.append("卷概览正文必须是普通单段，不能使用标题或列表")
+
+    section_re = re.compile(r"^### 第(\d+)-(\d+)章：([^\n]+)$")
+    chapter_re = re.compile(
+        r"^- \*\*第(\d+)章 ([^*\n]+)\*\*：(.+)。\*功能：([^*\n；]+(?:；[^*\n]+)*?)；"
+        r"伏笔：(?:(引入|推进|回收) (F\d{3})|无)\*$"
+    )
+    sections = []
+    chapters = []
+    unexpected = []
+    current_section = None
+
+    for line_number, line in nonempty:
+        if line == "### 卷概览" or (overview_line and line_number == overview_line[0]):
+            continue
+        section_match = section_re.fullmatch(line)
+        if section_match:
+            current_section = {
+                "lo": int(section_match.group(1)),
+                "hi": int(section_match.group(2)),
+                "line": line_number,
+                "chapters": [],
+            }
+            sections.append(current_section)
+            continue
+        chapter_match = chapter_re.fullmatch(line)
+        if chapter_match:
+            chapter_number = int(chapter_match.group(1))
+            chapters.append(chapter_number)
+            if current_section is None:
+                errors.append(f"第{line_number}行章节前缺少小节标题")
+            else:
+                current_section["chapters"].append(chapter_number)
+            continue
+        unexpected.append(line_number)
+
+    if unexpected:
+        shown = "、".join(str(number) for number in unexpected[:10])
+        errors.append(f"第{shown}行不符合允许格式（只接受小节标题和顶层单行章节bullet）")
+    if not sections:
+        errors.append("至少需要一个“### 第N-M章：小节名”小节")
+
+    expected = set(range(lo, hi + 1))
+    counts = {number: chapters.count(number) for number in set(chapters)}
+    missing = sorted(expected - set(chapters))
+    duplicates = sorted(number for number, count in counts.items() if count > 1)
+    out_of_range = sorted(set(chapters) - expected)
+    if missing:
+        errors.append("缺失章号：" + "、".join(map(str, missing)))
+    if duplicates:
+        errors.append("重复章号：" + "、".join(map(str, duplicates)))
+    if out_of_range:
+        errors.append("越界章号：" + "、".join(map(str, out_of_range)))
+    if chapters and chapters != list(range(lo, hi + 1)):
+        errors.append(f"章节必须按第{lo}章至第{hi}章连续升序排列")
+
+    for index, section in enumerate(sections):
+        section_expected = list(range(section["lo"], section["hi"] + 1))
+        if section["lo"] < lo or section["hi"] > hi or section["lo"] > section["hi"]:
+            errors.append(f"第{section['line']}行小节范围越界或倒置：{section['lo']}-{section['hi']}")
+        if section["chapters"] != section_expected:
+            errors.append(
+                f"第{section['line']}行小节范围{section['lo']}-{section['hi']}与其下章节"
+                f"{section['chapters'] or '空'}不一致"
+            )
+        size = section["hi"] - section["lo"] + 1
+        is_last = index == len(sections) - 1
+        if hi - lo + 1 < 8:
+            if len(sections) != 1 or section["lo"] != lo or section["hi"] != hi:
+                errors.append("本卷少于8章时必须整卷使用一个小节")
+        elif size > 12 or (size < 8 and not is_last):
+            errors.append(f"第{section['line']}行小节应为8-12章，仅最后一节可少于8章")
+
+    if sections:
+        ranges = [(section["lo"], section["hi"]) for section in sections]
+        expected_start = lo
+        for start, end in ranges:
+            if start != expected_start:
+                errors.append(f"小节范围不连续：期望从第{expected_start}章开始，实际从第{start}章开始")
+                break
+            expected_start = end + 1
+        if expected_start != hi + 1:
+            errors.append(f"小节范围未覆盖至第{hi}章")
+
+    return list(dict.fromkeys(errors))
+
+
+def _generate_valid_outline_part(chat, model, initial_prompt: str, lo: int, hi: int) -> str:
+    prompt = initial_prompt
+    last_errors = []
+    for attempt in range(3):
+        part = chat(model, user_prompt=prompt).strip()
+        last_errors = validate_outline_output(part, lo, hi)
+        if not last_errors:
+            return part
+        if attempt < 2:
+            feedback = "\n".join(f"- {error}" for error in last_errors)
+            prompt = (
+                initial_prompt
+                + "\n\n【上次输出未通过格式校验】\n"
+                + feedback
+                + "\n请修正全部问题并重新输出完整卷内容，不要解释。\n\n【上次输出】\n"
+                + part
+            )
+    raise OutlineValidationError(
+        f"第{lo}-{hi}章大纲连续3次格式不合格：" + "；".join(last_errors)
+    )
+
+
 def cmd_outline(prompt=""):
     """分卷生成全书大纲 → bible/outline.md"""
     config = get_config()
@@ -376,33 +550,12 @@ def cmd_outline(prompt=""):
     from engine.llm_client import chat
 
     all_parts = []
-    vols = list(config.volume_config.items())
-
-    for vk, v in vols:
-        lo, hi = v["chapters"]
-        print(f"生成 {v['name']} (第{lo}-{hi}章) ...")
-
-        vol_prompt = (
-            f"你是资深小说策划编辑。请为《{config.story_title}》{v['name']}生成详细大纲。\n\n"
-            f"【世界观】{bible.get('master_bible','')[:2500]}\n\n"
-            f"【本卷】{v['name']}(第{lo}-{hi}章) | 情绪:{v['core_emotion']} | 重点:{v['focus']}\n\n"
-            f"【人物】{json.dumps(bible.get('characters',{}), ensure_ascii=False, indent=2)[:2000]}\n\n"
-            f"【线索池】{json.dumps({k:v.get('name','') for k,v in bible.get('clues',{}).get('clues',{}).items()}, ensure_ascii=False)}\n"
-            f"【伏笔池】{json.dumps({k:v.get('name','') for k,v in bible.get('clues',{}).get('active_foreshadowing',{}).items()}, ensure_ascii=False)}\n\n"
-            f"【强制格式】\n"
-            f"开头先写一段卷总结要100-150字。\n\n"
-            f"然后分小节列大纲，必须输出第{lo}到第{hi}章全部{hi-lo+1}章，一章不能少！\n"
-            f"输出完毕后请自查：是否恰好{hi-lo+1}行？缺了任何一章都是失败的。\n\n"
-            f"每行格式：\n"
-            f"- **第N章 章名**：核心剧情（10-30字）。*功能 / 引入/回收*\n\n"
-            f"章名2-6字精炼。功能必填。最后第{hi}章是卷末收束章。\n"
-            f"按故事弧线分小节（每8-12章），小节标题 ### 第N-M章：小节名"
-        )
-        if prompt:
-            vol_prompt += f"\n【用户要求】{prompt}\n"
-
-        part = chat(config.planner_model, user_prompt=vol_prompt)
-        all_parts.append(f"## {v['name']} (第{lo}-{hi}章)\n{v['focus']}\n{part}")
+    for _, volume in config.volume_config.items():
+        lo, hi = volume["chapters"]
+        print(f"生成 {volume['name']} (第{lo}-{hi}章) ...")
+        vol_prompt = build_outline_prompt(config.story_title, volume, bible, prompt)
+        part = _generate_valid_outline_part(chat, config.planner_model, vol_prompt, lo, hi)
+        all_parts.append(f"## {volume['name']}（第{lo}-{hi}章）\n{part}")
 
     outline = f"# {config.story_title} — 全书大纲\n\n" + "\n\n".join(all_parts)
     outline_file = config.bible_dir / "outline.md"
