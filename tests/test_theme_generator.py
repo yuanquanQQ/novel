@@ -147,9 +147,11 @@ class ThemeGeneratorTests(unittest.TestCase):
                 self.assertEqual(len(result), 3)
                 self.assertEqual(create.call_count, 2)
                 retry_prompt = create.call_args_list[1].kwargs["messages"][1]["content"]
-                self.assertIn(f"具体错误：{expected_error}", retry_prompt)
+                self.assertIn(f"第 1 轮校验错误：{expected_error}", retry_prompt)
                 self.assertIn("重新生成完整响应", retry_prompt)
                 self.assertIn("恰好 3 个全部合格", retry_prompt)
+                # 重试提示必须带上模型上一轮实际返回的内容，方便它对照修正
+                self.assertIn(json.dumps({"options": invalid_options}, ensure_ascii=False), retry_prompt)
 
     def test_generate_stops_after_three_invalid_responses(self):
         options = _options()
@@ -164,7 +166,7 @@ class ThemeGeneratorTests(unittest.TestCase):
 
         with self.assertRaisesRegex(
             ThemeGenerationError,
-            "连续 3 轮返回无效方案.*chapter_count 必须是 200 到 400",
+            "(?s)连续 3 轮返回的方案都未通过校验.*chapter_count 必须是 200 到 400",
         ):
             generate_themes(
                 direction="自由创作", client=client,
@@ -172,6 +174,73 @@ class ThemeGeneratorTests(unittest.TestCase):
             )
 
         self.assertEqual(create.call_count, 3)
+
+    def test_final_error_lists_each_round_and_hint(self):
+        options = _options()
+        options[0]["protagonist_gender"] = "女主角"
+        content = json.dumps({"options": options}, ensure_ascii=False)
+        create = Mock(return_value=SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=content))]
+        ))
+        client = SimpleNamespace(chat=SimpleNamespace(
+            completions=SimpleNamespace(create=create)
+        ))
+
+        with self.assertRaises(ThemeGenerationError) as ctx:
+            generate_themes(
+                direction="自由创作", channel="男频",
+                protagonist_gender="男主角", client=client,
+                environ={"API_KEY": "secret"},
+            )
+        message = str(ctx.exception)
+        self.assertIn("第 1 轮", message)
+        self.assertIn("第 2 轮", message)
+        self.assertIn("第 3 轮", message)
+        self.assertIn("主角类型", message)
+        self.assertIn("建议：", message)
+        self.assertIn("改用“不限”", message)
+
+    def test_final_error_hints_at_unusual_channel_gender_pairing(self):
+        options = _options()
+        for option in options:
+            option["protagonist_gender"] = "男主角"
+        content = json.dumps({"options": options}, ensure_ascii=False)
+        create = Mock(return_value=SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=content))]
+        ))
+        client = SimpleNamespace(chat=SimpleNamespace(
+            completions=SimpleNamespace(create=create)
+        ))
+
+        with self.assertRaises(ThemeGenerationError) as ctx:
+            generate_themes(
+                direction="都市情感", channel="男频",
+                protagonist_gender="女主角", client=client,
+                environ={"API_KEY": "secret"},
+            )
+        self.assertIn("“男频”搭配“女主角”", str(ctx.exception))
+
+    def test_retry_feedback_grows_with_each_failure(self):
+        """Round 3 feedback must list both earlier rounds and the round-2 content."""
+        options = _options()
+        options[0]["protagonist_gender"] = "女主角"
+        bad = json.dumps({"options": options}, ensure_ascii=False)
+        create = Mock(return_value=SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=bad))]
+        ))
+        client = SimpleNamespace(chat=SimpleNamespace(
+            completions=SimpleNamespace(create=create)
+        ))
+
+        with self.assertRaises(ThemeGenerationError):
+            generate_themes(
+                direction="自由创作", client=client,
+                environ={"API_KEY": "secret"},
+            )
+        last_prompt = create.call_args_list[2].kwargs["messages"][1]["content"]
+        self.assertIn("第 1 轮校验错误", last_prompt)
+        self.assertIn("第 2 轮校验错误", last_prompt)
+        self.assertIn("此前已有 2 轮方案未通过校验", last_prompt)
 
     def test_generate_does_not_retry_api_error(self):
         create = Mock(side_effect=ConnectionError("连接中断"))

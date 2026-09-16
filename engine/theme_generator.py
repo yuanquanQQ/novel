@@ -162,6 +162,60 @@ def parse_theme_response(
     return normalized
 
 
+def _retry_instruction(failures: list[dict]) -> str:
+    """Build escalating retry feedback from prior parse failures.
+
+    ``failures`` is a list of dicts with keys ``round``, ``error``, ``content``.
+    Each retry shows the model every earlier validation error plus its own
+    most recent raw output, so it can see exactly which field it got wrong
+    instead of guessing from an error string alone.
+    """
+    if not failures:
+        return ""
+    history = "\n".join(
+        f"第 {item['round']} 轮校验错误：{item['error']}" for item in failures
+    )
+    recent = failures[-1]
+    return (
+        f"\n此前已有 {len(failures)} 轮方案未通过校验，逐轮错误如下：\n{history}"
+        f"\n你最近一轮实际返回的内容如下，请对照上面的错误逐字段检查并重写：\n{recent['content']}"
+        "\n请重新生成完整响应，不要只修改单个字段；仍须返回恰好 3 个全部合格、字段完整且互不雷同的方案，"
+        "并严格遵守用户消息中的主角类型、章节范围和字段约束。"
+    )
+
+
+def _failure_hint(failures: list[dict], channel: str, protagonist_gender: str, length: str) -> str:
+    """Turn the collected validation errors into concrete user guidance."""
+    errors = "\n".join(item["error"] for item in failures)
+    hints = []
+    if "主角类型" in errors:
+        if (channel, protagonist_gender) in (("女频", "男主角"), ("男频", "女主角")):
+            hints.append(
+                f"“{channel}”搭配“{protagonist_gender}”比较特殊，AI 可能因此反复生成相反的主角类型，"
+                "可改用“不限”或调整搭配后重试"
+            )
+        else:
+            hints.append("AI 反复生成的主角类型与选择不符，可改用“不限”后重试")
+    if "chapter_count" in errors:
+        hints.append(f"章节数不在所选篇幅“{length}”的范围内，可更换篇幅档位后重试")
+    if "JSON" in errors or "恰好 3 个" in errors or "字段不完整" in errors or "空内容" in errors:
+        hints.append("AI 返回内容的格式不符合要求，可能是模型临时异常，请稍后重试")
+    if not hints:
+        hints.append("请调整灵感或题材偏好后重试，或稍后再试")
+    return "建议：" + "；".join(hints) + "。"
+
+
+def _final_failure_message(failures: list[dict], channel: str, protagonist_gender: str, length: str) -> str:
+    """Compose the user-facing error after all retries are exhausted."""
+    detail = "\n".join(f"第 {item['round']} 轮：{item['error']}" for item in failures)
+    return (
+        "AI 主题构思连续 3 轮返回的方案都未通过校验，已停止尝试。\n"
+        f"逐轮错误如下：\n{detail}\n"
+        f"{_failure_hint(failures, channel, protagonist_gender, length)}\n"
+        "请根据建议调整参数后点击“生成方案”重试。"
+    )
+
+
 def generate_themes(inspiration: str = "", genre: str = "", direction: str = "",
                     channel: str = "男频", protagonist_gender: str = "男主角",
                     length: str = "长篇200-400章", *, client=None,
@@ -205,15 +259,9 @@ def generate_themes(inspiration: str = "", genre: str = "", direction: str = "",
         f"\n题材偏好：{genre or '不限'}"
     )
     api_client = client or OpenAI(api_key=api_key, base_url=base_url)
-    validation_error = None
+    failures: list[dict] = []
     for attempt in range(1, 4):
-        retry_instruction = ""
-        if validation_error is not None:
-            retry_instruction = (
-                f"\n上一轮返回未通过校验，具体错误：{validation_error}"
-                "\n请重新生成完整响应，不要只修改单个方案；仍须返回恰好 3 个全部合格、"
-                "字段完整且互不雷同的方案。"
-            )
+        retry_instruction = _retry_instruction(failures)
         try:
             response = api_client.chat.completions.create(
                 model=model,
@@ -232,8 +280,13 @@ def generate_themes(inspiration: str = "", genre: str = "", direction: str = "",
         try:
             return parse_theme_response(content, protagonist_gender, chapter_range)
         except ThemeGenerationError as exc:
-            validation_error = exc
+            failures.append({
+                "round": attempt,
+                "error": str(exc),
+                "content": content or "（模型未返回内容）",
+                "exception": exc,
+            })
 
     raise ThemeGenerationError(
-        f"主题构思模型连续 3 轮返回无效方案，最后错误：{validation_error}"
-    ) from validation_error
+        _final_failure_message(failures, channel, protagonist_gender, length)
+    ) from failures[-1]["exception"]

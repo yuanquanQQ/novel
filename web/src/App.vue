@@ -87,6 +87,7 @@
             <el-option v-for="preset in LENGTH_PRESETS" :key="preset" :label="preset" :value="preset" />
           </el-select>
         </div>
+        <p v-if="themeComboHint" class="theme-combo-hint">{{ themeComboHint }}</p>
         <el-alert v-if="themeError" class="theme-error" type="error" :title="themeError" :closable="false" show-icon />
         <div v-if="themeOptions.length" class="theme-cards">
           <button v-for="option in themeOptions" :key="option.id" type="button" class="theme-card" @click="applyTheme(option)">
@@ -334,6 +335,12 @@ const rules = {
 }
 
 const currentNovel = computed(() => novelStore.current)
+const themeComboHint = computed(() => {
+  const { channel, protagonist_gender } = themeRequest
+  if (channel === '女频' && protagonist_gender === '男主角') return '提示：女频与男主角搭配较特殊，AI 可能反复返回女主角，可改用“不限”或调整搭配后再生成。'
+  if (channel === '男频' && protagonist_gender === '女主角') return '提示：男频与女主角搭配较特殊，AI 可能反复返回男主角，可改用“不限”或调整搭配后再生成。'
+  return ''
+})
 const novelRoute = (name) => ({ name, params: { name: currentNovel.value } })
 
 onMounted(async () => {
@@ -601,7 +608,8 @@ async function submitCreate() {
 .direction-card:hover, .direction-card.selected { color: var(--primary); border-color: var(--primary); background: var(--primary-soft); }
 .theme-inputs { display: grid; grid-template-columns: 2fr 1fr; gap: 10px; margin-top: 14px; }
 .theme-selects { grid-template-columns: repeat(3, minmax(0, 1fr)); }
-.theme-error { margin-top: 12px; }
+.theme-error { margin-top: 12px; white-space: pre-line; }
+.theme-combo-hint { margin: 10px 0 0; color: #b26a00; font-size: 12px; line-height: 1.5; }
 .theme-cards { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; margin-top: 14px; }
 .theme-card { display: flex; flex-direction: column; gap: 7px; min-width: 0; padding: 14px; color: var(--text); text-align: left; background: #fff; border: 1px solid var(--border); border-radius: 10px; cursor: pointer; transition: border-color .2s, box-shadow .2s; }
 .theme-card:hover, .theme-card:focus-visible { border-color: var(--primary); box-shadow: 0 4px 14px rgba(24, 80, 69, .1); outline: none; }
