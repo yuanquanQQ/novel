@@ -157,6 +157,24 @@ class TestNovelDB(unittest.TestCase):
         buckets = self.db.open_foreshadowing(current_ch=13, stale_after=30)
         self.assertIn("F100", [item["id"] for item in buckets["stale"]])
 
+    def test_invalidate_from_removes_derivatives_and_marks_following_stale(self):
+        for chapter in (2, 3):
+            self.db.replace_chapter_derivatives(
+                chapter, [{"kind": "plot", "subject": str(chapter),
+                           "content": "事实"}], {}, "摘要", f"hash-{chapter}",
+            )
+            self.db.log_chapter(chapter, words=10)
+        self.db.invalidate_from(3)
+        self.assertIsNotNone(self.db.conn.execute(
+            "SELECT 1 FROM chapter_summaries WHERE chapter=2"
+        ).fetchone())
+        self.assertIsNone(self.db.conn.execute(
+            "SELECT 1 FROM chapter_summaries WHERE chapter=3"
+        ).fetchone())
+        self.assertEqual(self.db.conn.execute(
+            "SELECT status FROM chapter_log WHERE chapter=3"
+        ).fetchone()[0], "knowledge_stale")
+
 
 if __name__ == "__main__":
     unittest.main()

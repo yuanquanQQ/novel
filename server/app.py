@@ -9,6 +9,7 @@ import stat
 import sys
 import tempfile
 import zipfile
+from contextlib import contextmanager
 from pathlib import Path, PurePosixPath
 
 from fastapi import FastAPI, HTTPException, Query, Request
@@ -23,6 +24,7 @@ from engine.chapter_files import chapter_files, parse_chapter_number  # noqa: E4
 from engine.settings import NOVELS_DIR, load_config  # noqa: E402
 from engine.novel_creator import (  # noqa: E402
     NovelCreationError,
+    _config_py,
     _resolve_model_env,
     create_novel,
     validate_slug,
@@ -40,6 +42,7 @@ from engine import model_config  # noqa: E402
 from engine.db import NovelDB  # noqa: E402
 from engine.style_kit import scanner  # noqa: E402
 from server import tasks as T  # noqa: E402
+import novel as novel_cli  # noqa: E402
 
 app = FastAPI(title="Novel Console API")
 app.add_middleware(
@@ -56,6 +59,29 @@ def novel_dir(name: str) -> Path:
     if d.parent != root or not d.is_dir():
         raise HTTPException(404, f"小说不存在: {name}")
     return d
+
+
+@contextmanager
+def novel_operation(name: str):
+    try:
+        with T.novel_guard(name):
+            yield
+    except T.BusyError as exc:
+        raise HTTPException(409, "该小说已有任务或操作运行中") from exc
+
+
+def _atomic_write_text(path: Path, content: str):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent,
+                                     prefix=path.name + ".", suffix=".tmp",
+                                     delete=False) as handle:
+        handle.write(content)
+        temp_name = handle.name
+    try:
+        os.replace(temp_name, path)
+    except Exception:
+        Path(temp_name).unlink(missing_ok=True)
+        raise
 
 
 @app.get("/api/novels/{name}/export")
@@ -92,7 +118,9 @@ MAX_BACKUP_UPLOAD_BYTES = 100 * 1024 * 1024
 MAX_BACKUP_FILES = 5000
 MAX_BACKUP_FILE_BYTES = 100 * 1024 * 1024
 MAX_BACKUP_TOTAL_BYTES = 2 * 1024 * 1024 * 1024
-_BACKUP_TOP_FILES = {"config.py", "novel_prompts.json", ".env.example"}
+BACKUP_METADATA_FILE = "backup_metadata.json"
+_BACKUP_TOP_FILES = {BACKUP_METADATA_FILE, "novel_prompts.json", ".env.example"}
+_BACKUP_IMPORT_TOP_FILES = _BACKUP_TOP_FILES | {"config.py"}
 _BACKUP_DIRS = {"bible", "generated", "cache"}
 
 
@@ -101,10 +129,54 @@ def _backup_file_allowed(relative: Path) -> bool:
     if not parts or any(part == ".env" for part in parts):
         return False
     if len(parts) == 1:
-        return parts[0] in _BACKUP_TOP_FILES
+        return parts[0] in _BACKUP_TOP_FILES and parts[0] != BACKUP_METADATA_FILE
     if parts[0] not in _BACKUP_DIRS:
         return False
     return not (parts[0] == "cache" and len(parts) > 1 and parts[1] == "failed_drafts")
+
+
+def _backup_metadata(cfg) -> dict:
+    return {
+        "format_version": 1,
+        "title": cfg.story_title,
+        "chapter_count": cfg.chapter_count,
+        "words_per_chapter": cfg.words_per_chapter,
+        "language": getattr(cfg, "language", "zh-CN"),
+        "volume_config": cfg.volume_config,
+    }
+
+
+def _validate_backup_metadata(data) -> dict:
+    if not isinstance(data, dict) or data.get("format_version") != 1:
+        raise HTTPException(400, "备份 metadata 格式或版本无效")
+    title = data.get("title")
+    chapter_count = data.get("chapter_count")
+    words_per_chapter = data.get("words_per_chapter")
+    volumes = data.get("volume_config")
+    if not isinstance(title, str) or not title.strip() or len(title) > 10000:
+        raise HTTPException(400, "备份 metadata 的 title 无效")
+    if (not isinstance(chapter_count, int) or isinstance(chapter_count, bool)
+            or not 1 <= chapter_count <= 100000):
+        raise HTTPException(400, "备份 metadata 的 chapter_count 无效")
+    if (not isinstance(words_per_chapter, int) or isinstance(words_per_chapter, bool)
+            or not 1 <= words_per_chapter <= 1000000):
+        raise HTTPException(400, "备份 metadata 的 words_per_chapter 无效")
+    if not isinstance(volumes, dict) or not volumes:
+        raise HTTPException(400, "备份 metadata 的 volume_config 无效")
+    normalized = {}
+    for key, volume in volumes.items():
+        if not isinstance(key, str) or not isinstance(volume, dict):
+            raise HTTPException(400, "备份 metadata 的分卷结构无效")
+        chapters = volume.get("chapters")
+        if (not isinstance(chapters, (list, tuple)) or len(chapters) != 2
+                or not all(isinstance(value, int) and not isinstance(value, bool)
+                           for value in chapters)
+                or chapters[0] < 1 or chapters[0] > chapters[1]
+                or chapters[1] > chapter_count):
+            raise HTTPException(400, f"备份 metadata 的分卷范围无效: {key}")
+        normalized[key] = dict(volume, chapters=tuple(chapters))
+    return {"title": title.strip(), "chapter_count": chapter_count,
+            "words_per_chapter": words_per_chapter, "volume_config": normalized}
 
 
 @app.get("/api/novels/{name}/backup")
@@ -113,29 +185,33 @@ def api_backup_novel(name: str):
         validate_slug(name)
     except NovelCreationError as exc:
         raise HTTPException(404, f"小说不存在: {name}") from exc
-    d = novel_dir(name)
     archive = io.BytesIO()
     try:
-        with tempfile.TemporaryDirectory() as temp_name:
-            snapshot = Path(temp_name) / "novel.db"
-            db_path = d / "db" / "novel.db"
-            if db_path.is_file() and not db_path.is_symlink():
-                source = sqlite3.connect(str(db_path))
-                target = sqlite3.connect(str(snapshot))
-                try:
-                    source.backup(target)
-                finally:
-                    target.close()
-                    source.close()
-            with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as zf:
-                for path in d.rglob("*"):
-                    if path.is_symlink() or not path.is_file():
-                        continue
-                    relative = path.relative_to(d)
-                    if _backup_file_allowed(relative):
-                        zf.write(path, relative.as_posix())
-                if snapshot.exists():
-                    zf.write(snapshot, "db/novel.db")
+        with novel_operation(name):
+            d = novel_dir(name)
+            metadata = _backup_metadata(load_config(name))
+            with tempfile.TemporaryDirectory() as temp_name:
+                snapshot = Path(temp_name) / "novel.db"
+                db_path = d / "db" / "novel.db"
+                if db_path.is_file() and not db_path.is_symlink():
+                    source = sqlite3.connect(str(db_path))
+                    target = sqlite3.connect(str(snapshot))
+                    try:
+                        source.backup(target)
+                    finally:
+                        target.close()
+                        source.close()
+                with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as zf:
+                    zf.writestr(BACKUP_METADATA_FILE,
+                                json.dumps(metadata, ensure_ascii=False, indent=2))
+                    for path in d.rglob("*"):
+                        if path.is_symlink() or not path.is_file():
+                            continue
+                        relative = path.relative_to(d)
+                        if _backup_file_allowed(relative):
+                            zf.write(path, relative.as_posix())
+                    if snapshot.exists():
+                        zf.write(snapshot, "db/novel.db")
     except (OSError, sqlite3.Error, zipfile.BadZipFile) as exc:
         raise HTTPException(500, f"工作区备份失败: {exc}") from exc
     archive.seek(0)
@@ -144,7 +220,7 @@ def api_backup_novel(name: str):
         headers={"Content-Disposition": f'attachment; filename="{name}-workspace.zip"'})
 
 
-def _validated_backup_members(zf: zipfile.ZipFile) -> list[tuple[zipfile.ZipInfo, PurePosixPath]]:
+def _validated_backup_members(zf: zipfile.ZipFile):
     infos = zf.infolist()
     if len(infos) > MAX_BACKUP_FILES:
         raise HTTPException(413, f"备份文件数量超过限制（{MAX_BACKUP_FILES}）")
@@ -152,6 +228,7 @@ def _validated_backup_members(zf: zipfile.ZipFile) -> list[tuple[zipfile.ZipInfo
     seen = set()
     total = 0
     allowed_roots = _BACKUP_DIRS | {"db"}
+    metadata_info = None
     for info in infos:
         raw = info.filename
         if not raw or "\\" in raw or raw.startswith("/"):
@@ -171,7 +248,7 @@ def _validated_backup_members(zf: zipfile.ZipFile) -> list[tuple[zipfile.ZipInfo
         if stat.S_ISLNK(mode):
             raise HTTPException(400, f"备份不得包含符号链接: {raw}")
         if len(relative.parts) == 1:
-            allowed = relative.name in _BACKUP_TOP_FILES
+            allowed = relative.name in _BACKUP_IMPORT_TOP_FILES
         else:
             allowed = relative.parts[0] in allowed_roots
             if relative.parts[0] == "db":
@@ -187,12 +264,19 @@ def _validated_backup_members(zf: zipfile.ZipFile) -> list[tuple[zipfile.ZipInfo
         total += info.file_size
         if total > MAX_BACKUP_TOTAL_BYTES:
             raise HTTPException(413, "备份解压后总大小超过限制")
-        members.append((info, relative))
-    required = {"config.py", "novel_prompts.json", "bible/master_bible.md"}
+        if relative.as_posix() == BACKUP_METADATA_FILE:
+            metadata_info = info
+        elif relative.as_posix() != "config.py":
+            members.append((info, relative))
+    required = {BACKUP_METADATA_FILE, "novel_prompts.json", "bible/master_bible.md"}
     missing = required - seen
     if missing:
         raise HTTPException(400, f"备份缺少必要文件: {', '.join(sorted(missing))}")
-    return members
+    try:
+        metadata = json.loads(zf.read(metadata_info).decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError, KeyError) as exc:
+        raise HTTPException(400, "备份 metadata 不是有效 JSON") from exc
+    return members, _validate_backup_metadata(metadata)
 
 
 @app.post("/api/novels/import-backup", status_code=201)
@@ -204,8 +288,6 @@ async def api_import_backup(request: Request, id: str = Query(..., min_length=1,
     root = NOVELS_DIR.resolve()
     root.mkdir(parents=True, exist_ok=True)
     target = root / novel_id
-    if target.exists():
-        raise HTTPException(409, f"小说 id 已存在: {novel_id}")
     content_length = request.headers.get("content-length")
     if content_length:
         try:
@@ -220,30 +302,37 @@ async def api_import_backup(request: Request, id: str = Query(..., min_length=1,
             raise HTTPException(413, "备份压缩包超过上传限制")
     temp_dir = Path(tempfile.mkdtemp(prefix=f".{novel_id}-restore-", dir=str(root)))
     try:
-        with zipfile.ZipFile(io.BytesIO(payload)) as zf:
-            members = _validated_backup_members(zf)
-            for info, relative in members:
-                destination = temp_dir.joinpath(*relative.parts)
-                destination.parent.mkdir(parents=True, exist_ok=True)
-                written = 0
-                with zf.open(info) as source, destination.open("wb") as output:
-                    while chunk := source.read(1024 * 1024):
-                        written += len(chunk)
-                        if written > MAX_BACKUP_FILE_BYTES or written > info.file_size:
-                            raise HTTPException(413, f"文件解压大小异常: {info.filename}")
-                        output.write(chunk)
-        restored_db = temp_dir / "db" / "novel.db"
-        if restored_db.exists():
-            conn = sqlite3.connect(str(restored_db))
-            try:
-                result = conn.execute("PRAGMA integrity_check").fetchone()
-                if not result or result[0] != "ok":
-                    raise HTTPException(400, "备份数据库完整性检查失败")
-            except sqlite3.DatabaseError as exc:
-                raise HTTPException(400, "备份数据库无法打开") from exc
-            finally:
-                conn.close()
-        os.replace(str(temp_dir), str(target))
+        with novel_operation(novel_id):
+            if target.exists():
+                raise HTTPException(409, f"小说 id 已存在: {novel_id}")
+            with zipfile.ZipFile(io.BytesIO(payload)) as zf:
+                members, metadata = _validated_backup_members(zf)
+                for info, relative in members:
+                    destination = temp_dir.joinpath(*relative.parts)
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    written = 0
+                    with zf.open(info) as source, destination.open("wb") as output:
+                        while chunk := source.read(1024 * 1024):
+                            written += len(chunk)
+                            if written > MAX_BACKUP_FILE_BYTES or written > info.file_size:
+                                raise HTTPException(413, f"文件解压大小异常: {info.filename}")
+                            output.write(chunk)
+            (temp_dir / "config.py").write_text(
+                _config_py(metadata["title"], metadata["chapter_count"],
+                           metadata["words_per_chapter"], metadata["volume_config"]),
+                encoding="utf-8")
+            restored_db = temp_dir / "db" / "novel.db"
+            if restored_db.exists():
+                conn = sqlite3.connect(str(restored_db))
+                try:
+                    result = conn.execute("PRAGMA integrity_check").fetchone()
+                    if not result or result[0] != "ok":
+                        raise HTTPException(400, "备份数据库完整性检查失败")
+                except sqlite3.DatabaseError as exc:
+                    raise HTTPException(400, "备份数据库无法打开") from exc
+                finally:
+                    conn.close()
+            os.replace(str(temp_dir), str(target))
     except HTTPException:
         shutil.rmtree(temp_dir, ignore_errors=True)
         raise
@@ -259,10 +348,8 @@ def api_delete_novel(name: str):
         validate_slug(name)
     except NovelCreationError as exc:
         raise HTTPException(404, f"小说不存在: {name}") from exc
-    d = novel_dir(name)
-    if T.running_task(name):
-        raise HTTPException(409, "该小说已有任务运行中")
-    shutil.rmtree(d)
+    with novel_operation(name):
+        shutil.rmtree(novel_dir(name))
     return {"ok": True, "id": name}
 
 
@@ -272,6 +359,10 @@ def api_novels():
     out = []
     for d in sorted(NOVELS_DIR.iterdir()):
         if not d.is_dir():
+            continue
+        try:
+            validate_slug(d.name)
+        except NovelCreationError:
             continue
         title = d.name
         chapter_count = None
@@ -380,9 +471,10 @@ class CreateNovelBody(BaseModel):
 def api_create_novel(body: CreateNovelBody):
     try:
         model_env = _resolve_model_env(body.model)
-        path = create_novel(body.id, body.title, body.chapter_count,
-                            body.words_per_chapter, body.genre, body.description,
-                            model_env=model_env)
+        with novel_operation(body.id):
+            path = create_novel(body.id, body.title, body.chapter_count,
+                                body.words_per_chapter, body.genre, body.description,
+                                model_env=model_env)
     except FileExistsError as exc:
         raise HTTPException(409, str(exc))
     except (NovelCreationError, model_config.ModelConfigError, ValueError) as exc:
@@ -392,11 +484,44 @@ def api_create_novel(body: CreateNovelBody):
 
 
 class ModelConfigBody(BaseModel):
-    api_key: str | None = None
-    base_url: str | None = None
-    theme_model: str | None = None
+    api_key: str | None = Field(default=None, max_length=10000)
+    base_url: str | None = Field(default=None, max_length=2000)
+    theme_model: str | None = Field(default=None, max_length=500)
     models: dict[str, str] | None = None      # {env或attr: 模型名}
     quick: dict | None = None                 # {chat_model, reasoner_model}
+
+
+class OutlineBody(BaseModel):
+    content: str = Field(default="", max_length=5 * 1024 * 1024)
+
+    @field_validator("content")
+    @classmethod
+    def validate_bytes(cls, value: str) -> str:
+        if len(value.encode("utf-8")) > 5 * 1024 * 1024:
+            raise ValueError("content 不能超过 5MB")
+        return value
+
+
+class ChapterContentBody(BaseModel):
+    content: str = Field(default="", max_length=2 * 1024 * 1024)
+
+    @field_validator("content")
+    @classmethod
+    def validate_bytes(cls, value: str) -> str:
+        if len(value.encode("utf-8")) > 2 * 1024 * 1024:
+            raise ValueError("content 不能超过 2MB")
+        return value
+
+
+class BibleContentBody(BaseModel):
+    content: str = Field(..., max_length=5 * 1024 * 1024)
+
+    @field_validator("content")
+    @classmethod
+    def validate_bytes(cls, value: str) -> str:
+        if len(value.encode("utf-8")) > 5 * 1024 * 1024:
+            raise ValueError("content 不能超过 5MB")
+        return value
 
 
 @app.get("/api/novels/{name}/model-config")
@@ -416,14 +541,17 @@ def api_model_config_put(name: str, body: ModelConfigBody):
         "THEME_MODEL": body.theme_model,
     }.items() if v}
     try:
-        updates = model_config.expand_quick(body.quick)
-        if body.models:
-            updates.update(model_config.sanitize_input(body.models))
-        updates.update(model_config.sanitize_input(
-            {k: v for k, v in explicit.items()}))
-        result = model_config.save(name, updates)
+        with novel_operation(name):
+            updates = model_config.expand_quick(body.quick)
+            if body.models:
+                updates.update(model_config.sanitize_input(body.models))
+            updates.update(model_config.sanitize_input(
+                {k: v for k, v in explicit.items()}))
+            result = model_config.save(name, updates)
     except model_config.ModelConfigError as exc:
         raise HTTPException(400, str(exc))
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(500, f"保存失败: {exc}")
     return result
@@ -475,10 +603,13 @@ def api_outline(name: str):
 
 
 @app.put("/api/novels/{name}/outline")
-async def api_outline_save(name: str, body: dict):
-    fp = novel_dir(name) / "bible" / "outline.md"
-    fp.write_text(body.get("content", ""), encoding="utf-8")
-    return {"ok": True, "chars": len(body.get("content", ""))}
+async def api_outline_save(name: str, body: OutlineBody):
+    with novel_operation(name):
+        bible_dir = novel_dir(name) / "bible"
+        fp = bible_dir / "outline.md"
+        _atomic_write_text(fp, body.content)
+        novel_cli.mark_outline_manual(bible_dir, body.content)
+    return {"ok": True, "chars": len(body.content), "manual": True}
 
 
 @app.get("/api/novels/{name}/titles")
@@ -490,21 +621,22 @@ def api_titles(name: str):
 
 
 class TitleBody(BaseModel):
-    chapter: int
-    title: str
+    chapter: int = Field(..., ge=1, le=100000)
+    title: str = Field(..., max_length=500)
 
 
 @app.put("/api/novels/{name}/titles")
 def api_title_update(name: str, body: TitleBody):
-    fp = novel_dir(name) / "bible" / "chapter_titles.json"
-    data = json.loads(fp.read_text(encoding="utf-8"))
-    for v in data.get("volumes", {}).values():
-        if str(body.chapter) in v.get("chapters", {}):
-            v["chapters"][str(body.chapter)] = body.title
-            break
-    else:
-        raise HTTPException(404, "章号不在章名库")
-    fp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    with novel_operation(name):
+        fp = novel_dir(name) / "bible" / "chapter_titles.json"
+        data = json.loads(fp.read_text(encoding="utf-8"))
+        for v in data.get("volumes", {}).values():
+            if str(body.chapter) in v.get("chapters", {}):
+                v["chapters"][str(body.chapter)] = body.title
+                break
+        else:
+            raise HTTPException(404, "章号不在章名库")
+        _atomic_write_text(fp, json.dumps(data, ensure_ascii=False, indent=2))
     return {"ok": True}
 
 
@@ -594,32 +726,37 @@ def api_chapter(name: str, num: int):
 
 
 @app.put("/api/novels/{name}/chapters/{num}")
-async def api_chapter_save(name: str, num: int, body: dict):
+async def api_chapter_save(name: str, num: int, body: ChapterContentBody):
     if num <= 0:
         raise HTTPException(400, "章号必须为正数")
-    fp = novel_dir(name) / "generated" / f"chapter_{num:02d}.md"
-    content = body.get("content", "")
-    fp.write_text(content, encoding="utf-8")
-    r = scanner.scan(content)
-    d = novel_dir(name)
-    db = NovelDB(d)
-    try:
-        rows = r.to_rows(num)
-        db.delete_style_hits(num)
-        db.add_style_hits(rows)
-        db.clear_chapter_derivatives(num)
-        db.log_chapter(num, words=len(content), status="knowledge_stale",
-                       violations=sum(x[3] for x in rows
-                                      if x[1] in ("禁用词", "句式", "排版")))
-    finally:
-        db.close()
-    for cache_file in (d / "cache").glob("keeper_cache_*.json"):
+    with novel_operation(name):
+        d = novel_dir(name)
+        if num > load_config(name).chapter_count:
+            raise HTTPException(422, "章号超过小说总章数")
+        fp = d / "generated" / f"chapter_{num:02d}.md"
+        if not fp.is_file():
+            raise HTTPException(404, f"第{num}章未生成")
+        content = body.content
+        _atomic_write_text(fp, content)
+        r = scanner.scan(content)
+        db = NovelDB(d)
         try:
-            cached_chapter = int(cache_file.stem.rsplit("_", 1)[-1])
-        except ValueError:
-            continue
-        if cached_chapter >= num:
-            cache_file.unlink()
+            rows = r.to_rows(num)
+            db.delete_style_hits(num)
+            db.add_style_hits(rows)
+            db.invalidate_from(num)
+            db.log_chapter(num, words=len(content), status="knowledge_stale",
+                           violations=sum(x[3] for x in rows
+                                          if x[1] in ("禁用词", "句式", "排版")))
+        finally:
+            db.close()
+        for cache_file in (d / "cache").glob("keeper_cache_*.json"):
+            try:
+                cached_chapter = int(cache_file.stem.rsplit("_", 1)[-1])
+            except ValueError:
+                continue
+            if cached_chapter >= num:
+                cache_file.unlink()
     return {"ok": True, "words": len(content), "knowledge_stale": True,
             "scan": {"passed": r.passed,
                      "violations": r.violations, "warnings": r.warnings}}
@@ -635,9 +772,13 @@ def api_scan(name: str, num: int):
             "violations": r.violations, "warnings": r.warnings}
 
 
+class ScanPreviewBody(BaseModel):
+    text: str = Field(default="", max_length=2 * 1024 * 1024)
+
+
 @app.post("/api/scan-preview")
-async def api_scan_preview(body: dict):
-    r = scanner.scan(body.get("text", ""))
+async def api_scan_preview(body: ScanPreviewBody):
+    r = scanner.scan(body.text)
     return {"passed": r.passed, "metrics": r.metrics,
             "violations": r.violations, "warnings": r.warnings}
 
@@ -667,65 +808,119 @@ def api_bible_file(name: str, fn: str):
     return PlainTextResponse(fp.read_text(encoding="utf-8"))
 
 
-@app.put("/api/novels/{name}/bible/{fn}")
-async def api_bible_save(name: str, fn: str, body: dict):
-    if fn not in BIBLE_FILES:
-        raise HTTPException(400, "不允许的文件")
-    content = body.get("content")
-    if not isinstance(content, str):
-        raise HTTPException(422, "content 必须是字符串")
+def _validate_bible_content(fn: str, content: str):
     try:
         if fn.endswith(".json"):
-            json.loads(content)
+            data = json.loads(content)
+            if not isinstance(data, dict):
+                raise ValueError("JSON 根节点必须是对象")
+            containers = {
+                "characters.json": (("characters", dict),),
+                "clues.json": (("clues", dict), ("active_foreshadowing", dict)),
+                "motif_bank.json": (("motifs", list),),
+                "chapter_titles.json": (("volumes", dict),),
+            }.get(fn, ())
+            for key, expected in containers:
+                if key not in data or not isinstance(data[key], expected):
+                    raise ValueError(f"{key} 必须是{expected.__name__}")
+            values = []
+            if fn == "characters.json":
+                values = data["characters"].values()
+            elif fn == "clues.json":
+                values = [*data["clues"].values(), *data["active_foreshadowing"].values()]
+            elif fn == "motif_bank.json":
+                values = data["motifs"]
+            elif fn == "chapter_titles.json":
+                values = data["volumes"].values()
+                if any(not isinstance(volume, dict)
+                       or not isinstance(volume.get("chapters"), dict) for volume in values):
+                    raise ValueError("volumes 中每一卷及 chapters 必须是对象")
+                values = []
+            if any(not isinstance(value, dict) for value in values):
+                raise ValueError("关键容器中的条目必须是对象")
         elif fn.endswith(".jsonl"):
             for line_no, line in enumerate(content.splitlines(), 1):
-                if line.strip():
-                    json.loads(line)
+                if line.strip() and not isinstance(json.loads(line), dict):
+                    raise ValueError(f"JSONL 第 {line_no} 行必须是对象")
     except json.JSONDecodeError as exc:
         detail = f"JSON 格式错误: {exc.msg}（第 {exc.lineno} 行，第 {exc.colno} 列）"
         if fn.endswith(".jsonl"):
             detail = f"JSONL 第 {line_no} 行格式错误: {exc.msg}"
         raise HTTPException(422, detail) from exc
-    d = novel_dir(name)
-    fp = d / "bible" / fn
-    fp.write_text(content, encoding="utf-8")
-    db = NovelDB(d, auto_import=False)
-    try:
-        synced = db.ensure_imported(force=True)
-    finally:
-        db.close()
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+def _validate_bible_import(d: Path, fn: str, content: str):
+    with tempfile.TemporaryDirectory() as temp_name:
+        validation_dir = Path(temp_name)
+        shutil.copytree(d / "bible", validation_dir / "bible")
+        (validation_dir / "generated").mkdir()
+        (validation_dir / "bible" / fn).write_text(content, encoding="utf-8")
+        db = NovelDB(validation_dir, auto_import=False)
+        try:
+            db.ensure_imported(force=True)
+        finally:
+            db.close()
+
+
+@app.put("/api/novels/{name}/bible/{fn}")
+async def api_bible_save(name: str, fn: str, body: BibleContentBody):
+    if fn not in BIBLE_FILES:
+        raise HTTPException(400, "不允许的文件")
+    _validate_bible_content(fn, body.content)
+    with novel_operation(name):
+        d = novel_dir(name)
+        try:
+            _validate_bible_import(d, fn, body.content)
+        except (OSError, ValueError, TypeError, KeyError, sqlite3.Error) as exc:
+            raise HTTPException(422, f"Bible 数据无法导入: {exc}") from exc
+        fp = d / "bible" / fn
+        previous = fp.read_text(encoding="utf-8") if fp.exists() else None
+        _atomic_write_text(fp, body.content)
+        db = NovelDB(d, auto_import=False)
+        try:
+            synced = db.ensure_imported(force=True)
+        except (OSError, ValueError, TypeError, KeyError, sqlite3.Error) as exc:
+            if previous is None:
+                fp.unlink(missing_ok=True)
+            else:
+                _atomic_write_text(fp, previous)
+            raise HTTPException(422, f"Bible 数据无法导入: {exc}") from exc
+        finally:
+            db.close()
     return {"ok": True, "synced": synced}
 
 
 class CharacterBody(BaseModel):
-    profile: dict = Field(default_factory=dict)
+    profile: dict | None = None
     chapter: int | None = Field(default=None, ge=1)
 
 
 class ClueBody(BaseModel):
-    name: str = ""
-    type: str = ""
-    description: str = ""
+    name: str | None = None
+    type: str | None = None
+    description: str | None = None
     introduced_chapter: int | None = Field(default=None, ge=1)
     intended_reveal_chapter: int | None = Field(default=None, ge=1)
     intended_resolution_chapter: int | None = Field(default=None, ge=1)
-    resolved: bool = False
-    state: dict = Field(default_factory=dict)
+    resolved: bool | None = None
+    state: dict | None = None
     chapter: int | None = Field(default=None, ge=1)
 
 
 class ForeshadowBody(BaseModel):
-    name: str = ""
-    status: str = Field(
-        default="pending", pattern="^(pending|active|escalated|resolved|retired)$"
+    name: str | None = None
+    status: str | None = Field(
+        default=None, pattern="^(pending|active|escalated|resolved|retired)$"
     )
     introduced_chapter: int | None = Field(default=None, ge=1)
     intended_payoff_chapter: int | None = Field(default=None, ge=1)
     payoff_start_chapter: int | None = Field(default=None, ge=1)
     payoff_end_chapter: int | None = Field(default=None, ge=1)
     resolved_chapter: int | None = Field(default=None, ge=1)
-    description: str = ""
-    hinted_chapters: list[int] = Field(default_factory=list)
+    description: str | None = None
+    hinted_chapters: list[int] | None = None
     scope: str | None = None
     importance: str | None = None
     touch_interval: int | None = Field(default=None, ge=1)
@@ -734,12 +929,13 @@ class ForeshadowBody(BaseModel):
 # ------------------------------------------------------------------ db browse
 @app.post("/api/novels/{name}/knowledge-base/sync")
 def api_knowledge_base_sync(name: str):
-    db = NovelDB(novel_dir(name), auto_import=False)
-    try:
-        counts = db.ensure_imported(force=True)
-        stats = db.stats()
-    finally:
-        db.close()
+    with novel_operation(name):
+        db = NovelDB(novel_dir(name), auto_import=False)
+        try:
+            counts = db.ensure_imported(force=True)
+            stats = db.stats()
+        finally:
+            db.close()
     return {"ok": True, "counts": counts, "stats": stats}
 
 
@@ -763,6 +959,75 @@ def _foreshadow_response(row) -> dict:
     }
 
 
+def _patch_db_and_bible(d: Path, kind: str, item_id: str, changes: dict):
+    db = NovelDB(d)
+    bible_file = d / "bible" / ("characters.json" if kind == "character" else "clues.json")
+    original = bible_file.read_text(encoding="utf-8")
+    bible = json.loads(original)
+    try:
+        if kind == "character":
+            row = db.conn.execute(
+                "SELECT * FROM characters WHERE name=?", (item_id,),
+            ).fetchone()
+            current = json.loads(row["profile_json"] or "{}") if row else {}
+            profile_patch = changes.get("profile")
+            if profile_patch is not None:
+                current.update(profile_patch)
+            chapter = changes.get("chapter") if "chapter" in changes else None
+            bible.setdefault("characters", {})[item_id] = current
+            db.conn.execute("BEGIN IMMEDIATE")
+            db.upsert_character(item_id, current, chapter, commit=False)
+        elif kind == "clue":
+            row = db.conn.execute("SELECT * FROM clues WHERE id=?", (item_id,)).fetchone()
+            current = ({
+                "name": row["name"], "type": row["type"],
+                "description": row["description"],
+                "introduced_chapter": row["introduced_ch"],
+                "intended_reveal_chapter": row["intended_reveal_ch"],
+                "resolved": bool(row["resolved"]),
+                "state": json.loads(row["state_json"] or "{}"),
+            } if row else {"name": "", "type": "", "description": "",
+                           "resolved": False, "state": {}})
+            state_patch = changes.pop("state", None)
+            chapter = changes.pop("chapter", None)
+            current.update(changes)
+            if state_patch is not None:
+                current.setdefault("state", {}).update(state_patch)
+            bible.setdefault("clues", {})[item_id] = {
+                key: value for key, value in current.items() if key != "state"
+            } | current.get("state", {})
+            db.conn.execute("BEGIN IMMEDIATE")
+            db.upsert_clue(item_id, current, chapter, commit=False)
+        else:
+            row = db.conn.execute(
+                "SELECT * FROM foreshadowing WHERE id=?", (item_id,),
+            ).fetchone()
+            current = (_foreshadow_response(row) if row else {
+                "name": "", "status": "pending", "description": "",
+                "hinted_chapters": [],
+            })
+            current.pop("id", None)
+            current.update(changes)
+            bible.setdefault("active_foreshadowing", {})[item_id] = current
+            db.conn.execute("BEGIN IMMEDIATE")
+            db.upsert_foreshadow(item_id, current, commit=False)
+        _atomic_write_text(
+            bible_file, json.dumps(bible, ensure_ascii=False, indent=2),
+        )
+        signature = db._bible_signature()
+        db.conn.execute(
+            "INSERT OR REPLACE INTO meta(key,value) VALUES('bible_signature',?)",
+            (signature,),
+        )
+        db.conn.commit()
+    except Exception:
+        db.conn.rollback()
+        _atomic_write_text(bible_file, original)
+        raise
+    finally:
+        db.close()
+
+
 @app.get("/api/novels/{name}/db/foreshadowing")
 def api_db_foreshadow(name: str, current: int = 1):
     db = NovelDB(novel_dir(name))
@@ -780,18 +1045,23 @@ def api_db_foreshadow(name: str, current: int = 1):
     }
 
 
-@app.put("/api/novels/{name}/db/foreshadowing/{fid}")
+@app.patch("/api/novels/{name}/db/foreshadowing/{fid}")
 def api_db_foreshadow_update(name: str, fid: str, body: ForeshadowBody):
-    db = NovelDB(novel_dir(name))
-    try:
-        db.upsert_foreshadow(fid, body.model_dump())
-    finally:
-        db.close()
+    with novel_operation(name):
+        _patch_db_and_bible(
+            novel_dir(name), "foreshadow", fid,
+            body.model_dump(exclude_unset=True),
+        )
     return {"ok": True, "id": fid}
 
 
 @app.get("/api/novels/{name}/db/facts")
-def api_db_facts(name: str, q: str = "", chapter: int = 0, limit: int = 30):
+def api_db_facts(
+    name: str,
+    q: str = Query("", max_length=500),
+    chapter: int = Query(0, ge=0, le=100000),
+    limit: int = Query(30, ge=1, le=200),
+):
     db = NovelDB(novel_dir(name))
     try:
         if q:
@@ -834,13 +1104,13 @@ def api_db_characters(name: str):
         db.close()
 
 
-@app.put("/api/novels/{name}/db/characters/{character}")
+@app.patch("/api/novels/{name}/db/characters/{character}")
 def api_db_character_update(name: str, character: str, body: CharacterBody):
-    db = NovelDB(novel_dir(name))
-    try:
-        db.upsert_character(character, body.profile, body.chapter)
-    finally:
-        db.close()
+    with novel_operation(name):
+        _patch_db_and_bible(
+            novel_dir(name), "character", character,
+            body.model_dump(exclude_unset=True),
+        )
     return {"ok": True, "name": character}
 
 
@@ -864,13 +1134,13 @@ def api_db_clues(name: str):
     } for row in rows]
 
 
-@app.put("/api/novels/{name}/db/clues/{cid}")
+@app.patch("/api/novels/{name}/db/clues/{cid}")
 def api_db_clue_update(name: str, cid: str, body: ClueBody):
-    db = NovelDB(novel_dir(name))
-    try:
-        db.upsert_clue(cid, body.model_dump(), body.chapter)
-    finally:
-        db.close()
+    with novel_operation(name):
+        _patch_db_and_bible(
+            novel_dir(name), "clue", cid,
+            body.model_dump(exclude_unset=True),
+        )
     return {"ok": True, "id": cid}
 
 
@@ -960,23 +1230,14 @@ def api_pipeline(name: str):
     written = [parse_chapter_number(fp) for fp in chapter_files(gen)]
     missing = [c for c in range(1, (written[-1] + 1) if written else 1) if c not in written]
 
+    readiness = novel_cli.planning_readiness(cfg)
     outline_fp = b / "outline.md"
     outline_text = outline_fp.read_text(encoding="utf-8") if outline_fp.exists() else ""
-    outline_chapters = len(set(re.findall(r"第(\d+)章", outline_text))) if outline_text else 0
-
-    titles_ready, titles_total, titles_auto = False, 0, 0
-    tf = b / "chapter_titles.json"
-    if tf.exists():
-        try:
-            td = json.loads(tf.read_text(encoding="utf-8"))
-            for v in td.get("volumes", {}).values():
-                for t in v.get("chapters", {}).values():
-                    titles_total += 1
-                    if re.fullmatch(r"第?\d+章", str(t)):
-                        titles_auto += 1
-            titles_ready = titles_total > 0
-        except Exception:
-            pass
+    outline_chapters = len(readiness["outline_numbers"])
+    outline_ready = readiness["outline_ready"]
+    titles_total = len(readiness["titles"])
+    titles_auto = len(readiness["placeholders"])
+    titles_ready = readiness["titles_ready"]
 
     next_chapter = (written[-1] + 1) if written else 1
     while next_chapter <= cfg.chapter_count and next_chapter in written:
@@ -1000,7 +1261,7 @@ def api_pipeline(name: str):
             pending_summaries.append({"key": vk, "num": int(vnum), "name": v["name"]})
     vol_done = len([c for c in written if lo <= c <= hi])
 
-    if not outline_text:
+    if not outline_ready:
         stage = "outline"
     elif not titles_ready:
         stage = "titles"
@@ -1016,14 +1277,16 @@ def api_pipeline(name: str):
     target_summary = pending_summaries[0] if pending_summaries else None
     steps = [
         {"key": "outline", "title": "① 生成全书大纲", "file": "bible/outline.md",
-         "done": bool(outline_text), "detected": outline_chapters,
+         "done": outline_ready, "detected": outline_chapters,
+         "missing": readiness["missing_outline"][:20],
          "unit": "章条目", "available": True},
         {"key": "titles", "title": "② 提取章名库", "file": "bible/chapter_titles.json",
          "done": titles_ready, "detected": titles_total, "auto_named": titles_auto,
-         "unit": "章名", "available": bool(outline_text)},
+         "missing": readiness["missing_titles"][:20],
+         "unit": "章名", "available": outline_ready},
         {"key": "write", "title": f"③ 逐章写作 · {vol['name']}", "file": "generated/",
          "done": next_chapter > cfg.chapter_count, "detected": len(written),
-         "unit": f"/ {cfg.chapter_count} 章", "available": titles_ready,
+         "unit": f"/ {cfg.chapter_count} 章", "available": outline_ready and titles_ready,
          "detail": {"volume": vol["name"], "range": [lo, hi], "volume_done": vol_done,
                     "volume_total": hi - lo + 1, "next_chapter": next_chapter,
                     "missing": missing[:20]}},
@@ -1045,10 +1308,13 @@ def api_pipeline(name: str):
 
 # -------------------------------------------------------------------- tasks
 class TaskBody(BaseModel):
-    chapter: int | None = None
-    chapter_end: int | None = None
-    volume: int | None = None
-    prompt: str = ""
+    chapter: int | None = Field(default=None, ge=1, le=100000)
+    chapter_end: int | None = Field(default=None, ge=1, le=100000)
+    volume: int | None = Field(default=None, ge=1, le=100000)
+    prompt: str = Field(default="", max_length=10000)
+    overwrite: bool = False
+    force: bool = False
+    outline_override: bool = False
 
 
 ALLOWED = {"outline", "titles", "generate", "revise", "summary", "db"}
@@ -1061,7 +1327,7 @@ def api_task_list(name: str):
 
 @app.post("/api/novels/{name}/tasks/{action}")
 async def api_task(name: str, action: str, body: TaskBody):
-    novel_dir(name)
+    d = novel_dir(name)
     if action not in ALLOWED:
         raise HTTPException(400, f"不支持: {action}")
     args: list[str] = []
@@ -1078,27 +1344,52 @@ async def api_task(name: str, action: str, body: TaskBody):
             raise HTTPException(400, f"超出本章总数 {cfg.chapter_count}")
         if end - start + 1 > 20:
             raise HTTPException(422, "单次批量最多连续 20 章，成本高且便于中断")
+        readiness = novel_cli.planning_readiness(cfg)
+        if not body.outline_override and not readiness["outline_ready"]:
+            raise HTTPException(409, "写作门禁：全书大纲未按章号完整覆盖")
+        if not body.outline_override and not readiness["titles_ready"]:
+            raise HTTPException(409, "写作门禁：章名未完整生成或仍含占位名")
+        suffix = (["-p", body.prompt] if body.prompt else [])
+        if body.overwrite:
+            suffix += ["--overwrite"]
+        if body.outline_override:
+            suffix += ["--outline-override"]
         if end > start:
-            steps = [{"action": "generate",
-                      "args": [str(n)] + (["-p", body.prompt] if body.prompt else [])}
+            steps = [{"action": "generate", "args": [str(n)] + suffix}
                      for n in range(start, end + 1)]
-        args = [str(start)] + (["-p", body.prompt] if body.prompt else [])
+        args = [str(start)] + suffix
     elif action == "revise":
         if body.chapter is None or body.chapter <= 0 or not body.prompt:
             raise HTTPException(400, "chapter 必须为正数且 prompt 不能为空")
+        if not (d / "generated" / f"chapter_{body.chapter:02d}.md").exists():
+            raise HTTPException(404, f"第 {body.chapter} 章尚未生成，无法修订")
         args = [str(body.chapter), body.prompt]
     elif action == "summary":
         if body.volume is None or body.volume <= 0:
             raise HTTPException(400, "volume 必须为正数")
+        cfg = load_config(name)
+        volume = cfg.volume_config.get(f"volume_{body.volume}")
+        if not volume:
+            raise HTTPException(404, f"未找到第 {body.volume} 卷")
+        lo, hi = volume["chapters"]
+        if not chapter_files(d / "generated", first_chapter=lo, last_chapter=hi):
+            raise HTTPException(409, f"第{body.volume}卷尚未生成任何章节")
         args = [str(body.volume)] + (["-p", body.prompt] if body.prompt else [])
     elif action == "outline":
-        args = ["-p", body.prompt] if body.prompt else []
+        manifest = d / "bible" / "outline_manifest.json"
+        if manifest.exists() and not body.force:
+            try:
+                if json.loads(manifest.read_text(encoding="utf-8")).get("outline", {}).get("status") == "manual":
+                    raise HTTPException(409, "outline.md 已人工修改；普通继续不会覆盖，请使用重新生成（force）")
+            except (OSError, ValueError, TypeError):
+                pass
+        args = (["-p", body.prompt] if body.prompt else []) + (["--force"] if body.force else [])
     elif action == "titles":
+        if not (d / "bible" / "outline.md").exists():
+            raise HTTPException(409, "缺少 outline.md，无法提取章名")
         args = ["-p", body.prompt] if body.prompt else []
     elif action == "db":
         args = ["init"]
-    if T.running_task(name):
-        raise HTTPException(409, "该小说已有任务运行中")
     try:
         tid = T.submit(name, action, args) if steps is None else T.submit(name, action, args, steps=steps)
     except T.BusyError as e:

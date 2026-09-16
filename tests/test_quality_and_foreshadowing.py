@@ -155,6 +155,111 @@ class TestSceneQualityGate(unittest.TestCase):
         failed_file = self.config.cache_dir / "failed_drafts" / "chapter_01_scene_merged.md"
         self.assertEqual(failed_file.read_text(encoding="utf-8"), "场景正文")
 
+    def test_archivist_failure_does_not_publish_staged_chapter(self):
+        passed = ScanResult()
+        patches = self._patches(
+            ["场景正文"], [passed, passed], [{"passed": True}], [{"passed": True}],
+        )
+        with ExitStack() as stack:
+            for item in patches:
+                stack.enter_context(item)
+            stack.enter_context(patch.object(ArchivistAgent, "update_bible", return_value=False))
+            with self.assertRaisesRegex(RuntimeError, "正文未发布"):
+                novel.cmd_generate(1)
+        self.assertFalse((self.config.generated_dir / "chapter_01.md").exists())
+
+    def test_existing_chapter_requires_explicit_overwrite(self):
+        self.config.generated_dir.mkdir()
+        chapter = self.config.generated_dir / "chapter_01.md"
+        chapter.write_text("旧正文", encoding="utf-8")
+        patches = self._patches([], [], [], [])
+        with ExitStack() as stack:
+            for item in patches:
+                stack.enter_context(item)
+            with self.assertRaisesRegex(FileExistsError, "--overwrite"):
+                novel.cmd_generate(1)
+        self.assertEqual(chapter.read_text(encoding="utf-8"), "旧正文")
+
+    def test_overwrite_marks_following_knowledge_stale(self):
+        self.config.generated_dir.mkdir()
+        chapter = self.config.generated_dir / "chapter_01.md"
+        chapter.write_text("旧正文", encoding="utf-8")
+        db = NovelDB(self.root)
+        db.log_chapter(2, words=20)
+        db.replace_chapter_derivatives(2, [], {}, "旧摘要", "old-hash")
+        db.close()
+        passed = ScanResult()
+        patches = self._patches(
+            ["新正文"], [passed, passed], [{"passed": True}], [{"passed": True}],
+        )
+        invalidated = []
+        with ExitStack() as stack:
+            for item in patches:
+                stack.enter_context(item)
+            stack.enter_context(patch.object(
+                KeeperAgent, "invalidate_from",
+                side_effect=lambda chapter_num: invalidated.append(chapter_num),
+            ))
+            novel.cmd_generate(1, overwrite=True)
+        self.assertEqual(chapter.read_text(encoding="utf-8"), "新正文")
+        self.assertEqual(invalidated, [2])
+        db = NovelDB(self.root)
+        try:
+            self.assertEqual(db.conn.execute(
+                "SELECT status FROM chapter_log WHERE chapter=2"
+            ).fetchone()[0], "knowledge_stale")
+            self.assertIsNone(db.conn.execute(
+                "SELECT 1 FROM chapter_summaries WHERE chapter=2"
+            ).fetchone())
+        finally:
+            db.close()
+
+    def test_heavy_patch_is_reviewed_again_and_reconciles_snapshot(self):
+        self.config.heavy_review_interval = 1
+        passed = ScanResult()
+        patches = self._patches(
+            ["原正文"], [passed, passed, passed],
+            [{"passed": True}], [{"passed": True}],
+        )
+        captured = {}
+
+        def reconcile(_self, cache, text, chapter):
+            cache["all_scenes"] = [text]
+            cache["current_chapter_snapshots"] = [{
+                "chapter_num": chapter, "scene_id": "final", "source_hash": text,
+            }]
+            return cache
+
+        def archive(_self, chapter, _plan, cache, text):
+            captured.update(chapter=chapter, cache=cache, text=text)
+            return True
+
+        with ExitStack() as stack:
+            for item in patches:
+                stack.enter_context(item)
+            heavy = stack.enter_context(patch.object(
+                ReviewerAgent, "heavy_check", side_effect=[
+                    {"score": 7, "patch_instructions": ["修正"]},
+                    {"score": 9, "patch_instructions": []},
+                ],
+            ))
+            stack.enter_context(patch.object(
+                WriterAgent, "apply_patches", return_value="修订正文",
+            ))
+            stack.enter_context(patch.object(
+                KeeperAgent, "reconcile_final_chapter", new=reconcile,
+            ))
+            stack.enter_context(patch.object(
+                ArchivistAgent, "update_bible", new=archive,
+            ))
+            novel.cmd_generate(1)
+        self.assertEqual(heavy.call_count, 2)
+        self.assertEqual(captured["text"], "修订正文")
+        self.assertEqual(
+            captured["cache"]["current_chapter_snapshots"][0]["source_hash"],
+            "修订正文",
+        )
+
 
 class TestForeshadowProtocol(unittest.TestCase):
     def test_unknown_and_duplicate_plant_block_before_llm(self):
@@ -230,6 +335,64 @@ class TestForeshadowProtocol(unittest.TestCase):
                 self.assertEqual(row["status"], "resolved")
                 self.assertEqual(row["resolved_ch"], 3)
                 self.assertEqual(json.loads(row["hinted_chs"]), [1, 2])
+            finally:
+                db.close()
+
+    def test_archivist_file_failure_rolls_back_json_and_database(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            bible_dir = root / "bible"
+            bible_dir.mkdir()
+            characters_file = bible_dir / "characters.json"
+            clues_file = bible_dir / "clues.json"
+            characters_file.write_text(
+                json.dumps({"characters": {"林一": {"role": "主角"}}}),
+                encoding="utf-8",
+            )
+            clues_file.write_text(
+                json.dumps({"clues": {}, "active_foreshadowing": {}}),
+                encoding="utf-8",
+            )
+            before_characters = characters_file.read_text(encoding="utf-8")
+            before_clues = clues_file.read_text(encoding="utf-8")
+            archivist = ArchivistAgent.__new__(ArchivistAgent)
+            archivist.model_config = object()
+            archivist.bible_dir = bible_dir
+            archivist._db = lambda: NovelDB(root)
+            real_write = archivist._atomic_write
+            calls = 0
+
+            def fail_second(path, content):
+                nonlocal calls
+                calls += 1
+                if calls == 2:
+                    raise OSError("injected write failure")
+                return real_write(path, content)
+
+            extracted = {
+                "chapter_summary": "摘要",
+                "character_updates": {"林一": {"location": "车站"}},
+                "clue_updates": {"C1": {"status": "new"}},
+                "facts": [{"kind": "plot", "subject": "林一", "content": "抵达"}],
+            }
+            with patch("engine.llm_client.chat_json", return_value=extracted), patch(
+                "engine.prompts_loader.get_prompt", return_value=("system", {})
+            ), patch.object(archivist, "_atomic_write", side_effect=fail_second):
+                ok = archivist.update_bible(
+                    1, {"chapter_title": "抵达", "clue_operations": []},
+                    {"current_chapter_snapshots": [], "_style_hits": []}, "正文",
+                )
+            self.assertFalse(ok)
+            self.assertEqual(characters_file.read_text(encoding="utf-8"), before_characters)
+            self.assertEqual(clues_file.read_text(encoding="utf-8"), before_clues)
+            db = NovelDB(root)
+            try:
+                self.assertIsNone(db.conn.execute(
+                    "SELECT 1 FROM chapter_summaries WHERE chapter=1"
+                ).fetchone())
+                self.assertEqual(db.conn.execute(
+                    "SELECT COUNT(*) FROM chapter_facts WHERE chapter=1"
+                ).fetchone()[0], 0)
             finally:
                 db.close()
 

@@ -85,6 +85,17 @@ class KeeperAgent:
         from engine.llm_client import chat_json
         return chat_json(self.model_config, user_prompt=prompt)
 
+    def reconcile_final_chapter(self, keeper_cache: dict, full_chapter: str,
+                                chapter_num: int) -> dict:
+        snapshot = self._compress_scene(full_chapter, chapter_num, "final")
+        keeper_cache["all_scenes"] = [full_chapter]
+        keeper_cache["scene_count"] = 1
+        keeper_cache["current_chapter_snapshots"] = [snapshot]
+        keeper_cache["running_context"] = self._build_running_context(
+            keeper_cache.get("carry_context", []), [snapshot],
+        )
+        return keeper_cache
+
     def save_cache(self, chapter_num: int, keeper_cache: dict):
         cache_file = self.cache_dir / f"keeper_cache_{chapter_num:02d}.json"
         current = keeper_cache.get("current_chapter_snapshots", [])

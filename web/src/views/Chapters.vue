@@ -92,7 +92,11 @@ const scanFilter = ref('all')
 const filters = reactive({ q: '', volume: '', status: '', from: null, to: null })
 const visibleViolations = computed(() => scanData.value.violations)
 const dirty = computed(() => current.value !== null && content.value !== serverContent.value)
-let requestSeq = 0
+let novelSeq = 0
+let chapterRequestSeq = 0
+let listRequestSeq = 0
+let scanRequestSeq = 0
+let saveRequestSeq = 0
 let filterTimer = null
 let loadingContent = false
 
@@ -102,6 +106,12 @@ function readDraft(name, chapter) {
 }
 function clearDraft(name, chapter) {
   try { localStorage.removeItem(draftKey(name, chapter)) } catch { return }
+}
+function clearSavedDraft(name, chapter, savedContent) {
+  if (readDraft(name, chapter) === savedContent) clearDraft(name, chapter)
+}
+function isCurrentNovel(name, seq) {
+  return name === novelName.value && seq === novelSeq
 }
 async function confirmDiscard() {
   if (!dirty.value) return true
@@ -115,51 +125,72 @@ async function open(n, force = false) {
   const name = novelName.value
   if (!name || !n || (n === current.value && !force)) return
   if (!force && !(await confirmDiscard())) return
-  const seq = ++requestSeq
+  const contextSeq = novelSeq
+  const seq = ++chapterRequestSeq
   try {
-    const [chapter, scan] = await Promise.all([api.chapter(name, n), api.scanChapter(name, n)])
-    if (seq !== requestSeq || name !== novelName.value) return
+    const [chapter, serverScan] = await Promise.all([api.chapter(name, n), api.scanChapter(name, n)])
+    if (seq !== chapterRequestSeq || !isCurrentNovel(name, contextSeq)) return
+    const draft = readDraft(name, n)
+    const restored = draft !== null && draft !== chapter.content
+    const displayedContent = restored ? draft : chapter.content
+    const scan = restored ? await api.scanPreview(displayedContent) : serverScan
+    if (seq !== chapterRequestSeq || !isCurrentNovel(name, contextSeq)) return
     current.value = n
     serverContent.value = chapter.content
-    const draft = readDraft(name, n)
     loadingContent = true
-    content.value = draft !== null && draft !== chapter.content ? draft : chapter.content
+    content.value = displayedContent
     loadingContent = false
     scanData.value = scan
-    editing.value = draft !== null && draft !== chapter.content
-    if (editing.value) ElMessage.warning('已恢复本章未保存草稿')
-  } catch (e) { if (seq === requestSeq) error.value = e.response?.data?.detail || '章节加载失败' }
+    editing.value = restored
+    if (restored) ElMessage.warning('已恢复本章未保存草稿')
+  } catch (e) {
+    if (seq === chapterRequestSeq && isCurrentNovel(name, contextSeq)) error.value = e.response?.data?.detail || '章节加载失败'
+  }
 }
 
 function pageParams() {
   const volume = volumes.value.find(item => item.key === filters.volume)
+  let from = filters.from ?? volume?.lo
+  let to = filters.to ?? volume?.hi
+  if (volume) {
+    if (from != null) from = Math.min(volume.hi, Math.max(volume.lo, from))
+    if (to != null) to = Math.min(volume.hi, Math.max(volume.lo, to))
+  }
+  if (from != null && to != null && from > to) [from, to] = [to, from]
   return {
     offset: (page.value - 1) * pageSize,
     limit: pageSize,
     q: filters.q || undefined,
     status: filters.status || undefined,
-    chapter_from: filters.from || volume?.lo || undefined,
-    chapter_to: filters.to || volume?.hi || undefined,
+    chapter_from: from || undefined,
+    chapter_to: to || undefined,
   }
 }
 async function loadChapters(name = novelName.value) {
-  if (!name) return
-  let result = await api.chaptersPage(name, pageParams())
+  if (!name) return false
+  const contextSeq = novelSeq
+  const seq = ++listRequestSeq
+  const result = await api.chaptersPage(name, pageParams())
+  if (seq !== listRequestSeq || !isCurrentNovel(name, contextSeq)) return false
   const lastPage = Math.max(1, Math.ceil(result.total / pageSize))
   if (page.value > lastPage) {
     page.value = lastPage
-    result = await api.chaptersPage(name, pageParams())
+    return false
   }
   chapters.value = result.items
   total.value = result.total
+  return true
 }
-async function loadVolumes(name) {
+async function fetchVolumes(name) {
   const data = await api.titles(name)
-  volumes.value = Object.entries(data.volumes || {}).map(([key, value]) => ({ key, name: value.name || key, lo: value.range?.[0], hi: value.range?.[1] })).filter(item => item.lo && item.hi)
+  return Object.entries(data.volumes || {}).map(([key, value]) => ({ key, name: value.name || key, lo: value.range?.[0], hi: value.range?.[1] })).filter(item => item.lo && item.hi)
 }
 async function loadNovel() {
   const name = novelName.value
-  const seq = ++requestSeq
+  const seq = ++novelSeq
+  chapterRequestSeq++
+  listRequestSeq++
+  scanRequestSeq++
   current.value = null
   chapters.value = []
   volumes.value = []
@@ -173,14 +204,17 @@ async function loadNovel() {
   if (!name) return
   loading.value = true
   try {
-    await loadVolumes(name)
-    const result = await api.chaptersPage(name, pageParams())
-    if (seq !== requestSeq || name !== novelName.value) return
-    chapters.value = result.items
-    total.value = result.total
+    const loadedVolumes = await fetchVolumes(name)
+    if (!isCurrentNovel(name, seq)) return
+    volumes.value = loadedVolumes
+    const loaded = await loadChapters(name)
+    if (!loaded || !isCurrentNovel(name, seq)) return
     if (chapters.value.length) await open(chapters.value[chapters.value.length - 1].num, true)
-  } catch (e) { if (seq === requestSeq) error.value = e.response?.data?.detail || '章节列表加载失败' }
-  finally { if (name === novelName.value) loading.value = false }
+  } catch (e) {
+    if (isCurrentNovel(name, seq)) error.value = e.response?.data?.detail || '章节列表加载失败'
+  } finally {
+    if (isCurrentNovel(name, seq)) loading.value = false
+  }
 }
 async function refresh() {
   if (!(await confirmDiscard())) return
@@ -189,27 +223,44 @@ async function refresh() {
 async function saveContent() {
   const name = novelName.value
   const chapter = current.value
+  const savedContent = content.value
   if (!name || !chapter) return
+  const seq = ++saveRequestSeq
   saving.value = true
   try {
-    const res = await api.saveChapter(name, chapter, content.value)
-    serverContent.value = content.value
-    clearDraft(name, chapter)
-    scanData.value = res.scan
+    const res = await api.saveChapter(name, chapter, savedContent)
+    clearSavedDraft(name, chapter, savedContent)
+    const sameChapter = name === novelName.value && chapter === current.value
+    if (sameChapter) {
+      serverContent.value = savedContent
+      if (content.value === savedContent) {
+        scanData.value = res.scan
+        editing.value = false
+      }
+    }
     if (res.knowledge_stale) ElMessage.warning('正文已保存；本章知识归档已标记为待同步')
     else if (res.scan.passed) ElMessage.success('保存成功，扫描通过')
     else ElMessage.warning(`已保存，但仍有 ${res.scan.violations.length} 处违规`)
-    editing.value = false
-    await loadChapters()
-  } catch (e) { ElMessage.error(e.response?.data?.detail || '保存失败') }
-  finally { saving.value = false }
+    if (name === novelName.value) await loadChapters(name)
+  } catch (e) {
+    ElMessage.error(e.response?.data?.detail || '保存失败')
+  } finally {
+    if (seq === saveRequestSeq) saving.value = false
+  }
 }
 async function doScan() {
   const name = novelName.value
-  if (!name || !current.value) return
+  const chapter = current.value
+  const scannedContent = content.value
+  if (!name || !chapter) return
+  const contextSeq = novelSeq
+  const seq = ++scanRequestSeq
   try {
-    scanData.value = dirty.value ? await api.scanPreview(content.value) : await api.scanChapter(name, current.value)
-  } catch (e) { error.value = e.response?.data?.detail || '扫描失败' }
+    const scan = scannedContent !== serverContent.value ? await api.scanPreview(scannedContent) : await api.scanChapter(name, chapter)
+    if (seq === scanRequestSeq && isCurrentNovel(name, contextSeq) && chapter === current.value && scannedContent === content.value) scanData.value = scan
+  } catch (e) {
+    if (seq === scanRequestSeq && isCurrentNovel(name, contextSeq)) error.value = e.response?.data?.detail || '扫描失败'
+  }
 }
 function toggleEdit() { editing.value = !editing.value }
 function beforeUnload(event) { if (dirty.value) { event.preventDefault(); event.returnValue = '' } }
@@ -220,12 +271,30 @@ watch(content, value => {
 })
 watch(() => [filters.q, filters.volume, filters.status, filters.from, filters.to], () => {
   clearTimeout(filterTimer)
-  filterTimer = window.setTimeout(async () => { page.value = 1; try { await loadChapters() } catch (e) { error.value = e.response?.data?.detail || '章节筛选失败' } }, 250)
+  const name = novelName.value
+  const contextSeq = novelSeq
+  filterTimer = window.setTimeout(async () => {
+    if (!isCurrentNovel(name, contextSeq)) return
+    page.value = 1
+    try { await loadChapters(name) } catch (e) {
+      if (isCurrentNovel(name, contextSeq)) error.value = e.response?.data?.detail || '章节筛选失败'
+    }
+  }, 250)
 })
-watch(page, () => loadChapters().catch(e => { error.value = e.response?.data?.detail || '章节分页加载失败' }))
+watch(page, () => {
+  const name = novelName.value
+  const contextSeq = novelSeq
+  loadChapters(name).catch(e => {
+    if (isCurrentNovel(name, contextSeq)) error.value = e.response?.data?.detail || '章节分页加载失败'
+  })
+})
 watch(novelName, loadNovel, { immediate: true })
 window.addEventListener('beforeunload', beforeUnload)
-onBeforeUnmount(() => { clearTimeout(filterTimer); window.removeEventListener('beforeunload', beforeUnload) })
+onBeforeUnmount(() => {
+  novelSeq++
+  clearTimeout(filterTimer)
+  window.removeEventListener('beforeunload', beforeUnload)
+})
 </script>
 
 <style scoped>

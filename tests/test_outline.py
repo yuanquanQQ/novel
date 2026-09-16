@@ -164,9 +164,11 @@ class TestOutlineValidator(unittest.TestCase):
             ranges = [item["range"] for item in manifest["parts"]]
             self.assertEqual(ranges[0][0], 1)
             self.assertEqual(ranges[-1][1], 1500)
-            self.assertTrue(all(8 <= hi - lo + 1 <= 20 for lo, hi in ranges))
+            self.assertTrue(all(8 <= hi - lo + 1 <= 12 for lo, hi in ranges))
             self.assertTrue(all(item["status"] == "complete" and item["hash"]
+                                and item["input_hash"] and item["chain_hash"]
                                 for item in manifest["parts"]))
+            self.assertEqual(manifest["version"], 2)
             outline = (bible_dir / "outline.md").read_text(encoding="utf-8")
             self.assertEqual(len(set(map(int, re.findall(r"\*\*第(\d+)章", outline)))), 1500)
             self.assertEqual(outline.count("### 卷概览"), len(config.volume_config))

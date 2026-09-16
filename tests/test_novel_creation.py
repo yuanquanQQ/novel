@@ -147,7 +147,7 @@ class TestNovelCreationAPI(unittest.TestCase):
         })
         self.assertEqual(created.status_code, 201, created.text)
 
-        response = self.client.put(
+        response = self.client.patch(
             "/api/novels/crud-book/db/characters/林一",
             json={
                 "profile": {
@@ -162,8 +162,20 @@ class TestNovelCreationAPI(unittest.TestCase):
         self.assertEqual(character["first_appearance_chapter"], 2)
         self.assertEqual(character["updated_chapter"], 3)
         self.assertNotIn("profile_json", character)
+        response = self.client.patch(
+            "/api/novels/crud-book/db/characters/林一",
+            json={"profile": {"role": "核心主角"}},
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        character = self.client.get("/api/novels/crud-book/db/characters").json()[0]
+        self.assertEqual(character["role"], "核心主角")
+        self.assertEqual(character["voice_print"], "短句")
+        characters_bible = json.loads((
+            self.novels_dir / "crud-book" / "bible" / "characters.json"
+        ).read_text(encoding="utf-8"))
+        self.assertEqual(characters_bible["characters"]["林一"]["role"], "核心主角")
 
-        response = self.client.put(
+        response = self.client.patch(
             "/api/novels/crud-book/db/clues/C001",
             json={
                 "name": "钥匙", "type": "物件", "description": "铜钥匙",
@@ -178,7 +190,7 @@ class TestNovelCreationAPI(unittest.TestCase):
         self.assertEqual(clue["updated_chapter"], 3)
         self.assertEqual(clue["state"], {"holder": "林一"})
 
-        response = self.client.put(
+        response = self.client.patch(
             "/api/novels/crud-book/db/foreshadowing/F001",
             json={
                 "name": "钟声", "status": "active", "introduced_chapter": 1,

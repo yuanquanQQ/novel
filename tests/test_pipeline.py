@@ -40,6 +40,12 @@ class PipelineTestCase(unittest.TestCase):
         (self.book / "bible" / "chapter_titles.json").write_text(
             json.dumps(payload), encoding="utf-8")
 
+    def write_outline(self, count=8):
+        lines = [f"- **第{n}章 名{n}**：剧情。*功能：推进；伏笔：无*"
+                 for n in range(1, count + 1)]
+        (self.book / "bible" / "outline.md").write_text(
+            "\n".join(lines), encoding="utf-8")
+
     def tearDown(self):
         (novel_creator.NOVELS_DIR, server_app.NOVELS_DIR,
          settings.NOVELS_DIR) = self._saved
@@ -57,19 +63,26 @@ class PipelineTestCase(unittest.TestCase):
         self.assertFalse(self.step(out, "outline")["done"])
         self.assertFalse(self.step(out, "titles")["available"])  # 依赖大纲
 
-    def test_titles_unlocked_after_outline(self):
+    def test_titles_unlocked_after_complete_outline(self):
         self.write_titles(0)
-        (self.book / "bible" / "outline.md").write_text(
-            "- **第1章 起**：开场。*引入*\n- **第2章 变**：转折。*推进*\n", encoding="utf-8")
+        self.write_outline()
         out = self.client.get("/api/novels/pipe/pipeline").json()
         self.assertEqual(out["stage"], "titles")
         self.assertTrue(self.step(out, "titles")["available"])
-        self.assertEqual(self.step(out, "outline")["detected"], 2)
+        self.assertEqual(self.step(out, "outline")["detected"], 8)
+        self.assertFalse(self.step(out, "write")["available"])
+
+    def test_incomplete_outline_stays_locked(self):
+        self.write_titles()
+        self.write_outline(2)
+        out = self.client.get("/api/novels/pipe/pipeline").json()
+        self.assertEqual(out["stage"], "outline")
+        self.assertFalse(self.step(out, "outline")["done"])
         self.assertFalse(self.step(out, "write")["available"])
 
     def test_write_stage(self):
         self.write_titles()
-        (self.book / "bible" / "outline.md").write_text("第1章 x", encoding="utf-8")
+        self.write_outline()
         out = self.client.get("/api/novels/pipe/pipeline").json()
         self.assertEqual(out["stage"], "write")
         w = self.step(out, "write")
@@ -79,7 +92,7 @@ class PipelineTestCase(unittest.TestCase):
 
     def test_gap_detection_and_next(self):
         self.write_titles()
-        (self.book / "bible" / "outline.md").write_text("第1章 x", encoding="utf-8")
+        self.write_outline()
         for n in (1, 2, 4):
             (self.book / "generated" / f"chapter_{n:02d}.md").write_text("正文", encoding="utf-8")
         out = self.client.get("/api/novels/pipe/pipeline").json()
@@ -89,7 +102,7 @@ class PipelineTestCase(unittest.TestCase):
 
     def test_summary_unlock_when_volume_full(self):
         self.write_titles()
-        (self.book / "bible" / "outline.md").write_text("第1章 x", encoding="utf-8")
+        self.write_outline()
         for n in range(1, 9):
             (self.book / "generated" / f"chapter_{n:02d}.md").write_text("正文", encoding="utf-8")
         out = self.client.get("/api/novels/pipe/pipeline").json()
@@ -103,7 +116,7 @@ class PipelineTestCase(unittest.TestCase):
 
     def test_publish_stage_at_end(self):
         self.write_titles()
-        (self.book / "bible" / "outline.md").write_text("第1章 x", encoding="utf-8")
+        self.write_outline()
         for n in range(1, 9):
             (self.book / "generated" / f"chapter_{n:02d}.md").write_text("正文", encoding="utf-8")
         for v in range(1, 5):
@@ -127,6 +140,15 @@ class BatchTaskShapeTests(unittest.TestCase):
         self.client = TestClient(server_app.app)
         self.client.post("/api/novels", json={
             "id": "batch", "title": "批量", "chapter_count": 30, "words_per_chapter": 2000})
+        book = self.novels_dir / "batch"
+        outline = "\n".join(
+            f"- **第{n}章 名{n}**：剧情。*功能：推进；伏笔：无*"
+            for n in range(1, 31))
+        (book / "bible" / "outline.md").write_text(outline, encoding="utf-8")
+        titles = {"volumes": {"volume_1": {"chapters": {
+            str(n): f"名{n}" for n in range(1, 31)}}}}
+        (book / "bible" / "chapter_titles.json").write_text(
+            json.dumps(titles), encoding="utf-8")
         self._real_submit = T.submit
         self.captured = {}
 
@@ -146,6 +168,14 @@ class BatchTaskShapeTests(unittest.TestCase):
         self.assertEqual(r.status_code, 200)
         self.assertIsNone(self.captured["steps"])
         self.assertEqual(self.captured["args"], ["3"])
+
+    def test_generate_overwrite_is_explicitly_forwarded(self):
+        r = self.client.post(
+            "/api/novels/batch/tasks/generate",
+            json={"chapter": 3, "overwrite": True},
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(self.captured["args"], ["3", "--overwrite"])
 
     def test_batch_builds_sequential_steps(self):
         r = self.client.post("/api/novels/batch/tasks/generate",
@@ -176,7 +206,7 @@ class WorkerStepStopTests(unittest.TestCase):
     def test_steps_stop_on_failure(self):
         t = {"id": "x", "novel": "n", "action": "generate", "args": [],
              "steps": [{"action": "generate", "args": ["1"]}],
-             "status": "running", "lines": [], "done_steps": 0}
+             "status": "running", "lines": [], "done_steps": 0, "failed_step": None}
         T._TASKS["x"] = t
         calls = []
 
@@ -192,14 +222,15 @@ class WorkerStepStopTests(unittest.TestCase):
         T._TASKS.pop("x", None)
         self.assertEqual(t["status"], "failed")
         self.assertEqual(len(calls), 1)      # 只执行了一步？steps只有1
-        self.assertEqual(t["done_steps"], 1)
+        self.assertEqual(t["done_steps"], 0)
+        self.assertEqual(t["failed_step"], 1)
 
     def test_steps_all_success(self):
         t = {"id": "y", "novel": "n", "action": "generate", "args": [],
              "steps": [{"action": "generate", "args": ["1"]},
                        {"action": "generate", "args": ["2"]},
                        {"action": "summary", "args": ["1"]}],
-             "status": "running", "lines": [], "done_steps": 0}
+             "status": "running", "lines": [], "done_steps": 0, "failed_step": None}
         T._TASKS["y"] = t
         calls = []
         real = T._run_step

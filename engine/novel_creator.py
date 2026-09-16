@@ -5,6 +5,7 @@ import os
 import re
 import shutil
 import tempfile
+import time
 from pathlib import Path
 
 from engine.db import NovelDB
@@ -379,7 +380,14 @@ def create_novel(id, title, chapter_count, words_per_chapter, genre, description
             db.ensure_imported()
         finally:
             db.close()
-        os.replace(str(temp_dir), str(target))
+        for attempt in range(5):
+            try:
+                os.replace(str(temp_dir), str(target))
+                break
+            except PermissionError:
+                if attempt == 4:
+                    raise
+                time.sleep(0.02 * (2 ** attempt))
         return target
     except Exception:
         shutil.rmtree(temp_dir, ignore_errors=True)

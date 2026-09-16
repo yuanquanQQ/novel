@@ -8,6 +8,11 @@ export const api = {
   createNovel: (data) => http.post('/novels', data).then(r => r.data),
   exportNovel: (n) => http.get(`/novels/${n}/export`, { responseType: 'blob' }).then(r => r.data),
   backupNovel: (n) => http.get(`/novels/${n}/backup`, { responseType: 'blob' }).then(r => r.data),
+  importNovelBackup: (id, file) => http.post('/novels/import-backup', file, {
+    params: { id },
+    headers: { 'Content-Type': 'application/zip' },
+    timeout: 120000,
+  }).then(r => r.data),
   deleteNovel: (n) => http.delete(`/novels/${n}`).then(r => r.data),
   status: (n) => http.get(`/novels/${n}/status`).then(r => r.data),
 
@@ -29,11 +34,11 @@ export const api = {
   knowledgeSync: (n) => http.post(`/novels/${n}/knowledge-base/sync`).then(r => r.data),
 
   dbCharacters: (n) => http.get(`/novels/${n}/db/characters`).then(r => r.data),
-  saveCharacter: (n, id, data) => http.put(`/novels/${n}/db/characters/${encodeURIComponent(id)}`, data).then(r => r.data),
+  saveCharacter: (n, id, data) => http.patch(`/novels/${n}/db/characters/${encodeURIComponent(id)}`, data).then(r => r.data),
   dbClues: (n) => http.get(`/novels/${n}/db/clues`).then(r => r.data),
-  saveClue: (n, id, data) => http.put(`/novels/${n}/db/clues/${encodeURIComponent(id)}`, data).then(r => r.data),
+  saveClue: (n, id, data) => http.patch(`/novels/${n}/db/clues/${encodeURIComponent(id)}`, data).then(r => r.data),
   dbMotifs: (n) => http.get(`/novels/${n}/db/motifs`).then(r => r.data),
-  dbForeshadowUpdate: (n, id, data) => http.put(`/novels/${n}/db/foreshadowing/${encodeURIComponent(id)}`, data).then(r => r.data),
+  dbForeshadowUpdate: (n, id, data) => http.patch(`/novels/${n}/db/foreshadowing/${encodeURIComponent(id)}`, data).then(r => r.data),
   dbForeshadow: (n, current) => http.get(`/novels/${n}/db/foreshadowing`, { params: { current } }).then(r => r.data),
   dbFacts: (n, params) => http.get(`/novels/${n}/db/facts`, { params }).then(r => r.data),
   dbStyleHits: (n) => http.get(`/novels/${n}/db/style-hits`).then(r => r.data),

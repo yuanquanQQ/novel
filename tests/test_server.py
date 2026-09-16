@@ -89,6 +89,7 @@ class TestServerAPI(unittest.TestCase):
     def tearDownClass(cls):
         server_app.T._TASKS.clear()
         server_app.T._LOCKS.clear()
+        server_app.T._OPERATIONS.clear()
         scanner.RULES_FILE = cls._original_rules_file
         for item in reversed(cls._patches):
             item.stop()
@@ -147,6 +148,10 @@ class TestServerAPI(unittest.TestCase):
         db.replace_chapter_derivatives(1, [{
             "kind": "plot", "subject": "旧", "content": "旧事实"
         }], {"林一": {"location": "门口"}}, "旧摘要", "old-hash")
+        db.log_chapter(2, words=10)
+        db.replace_chapter_derivatives(2, [{
+            "kind": "plot", "subject": "后续", "content": "依赖旧正文"
+        }], {}, "后续摘要", "later-hash")
         db.close()
         for chapter in (1, 2):
             (book / "cache" / f"keeper_cache_{chapter:02d}.json").write_text("{}")
@@ -161,6 +166,11 @@ class TestServerAPI(unittest.TestCase):
         db = NovelDB(book)
         self.assertEqual(db.conn.execute(
             "SELECT COUNT(*) FROM chapter_summaries WHERE chapter=1").fetchone()[0], 0)
+        self.assertEqual(db.conn.execute(
+            "SELECT COUNT(*) FROM chapter_summaries WHERE chapter=2").fetchone()[0], 0)
+        self.assertEqual(db.conn.execute(
+            "SELECT status FROM chapter_log WHERE chapter=2").fetchone()[0], "knowledge_stale")
+        db.log_chapter(2, words=10, status="generated")
         db.close()
         self.assertFalse((book / "cache" / "keeper_cache_01.json").exists())
         self.assertFalse((book / "cache" / "keeper_cache_02.json").exists())
@@ -191,12 +201,12 @@ class TestServerAPI(unittest.TestCase):
         self.assertEqual(got, ["知识库已导入\n", "__TASK_END__ done"])
 
     def test_09_task_lock(self):
-        with patch.object(server_app.T, "running_task", return_value="busy-task"), patch.object(
-            server_app.T, "submit"
+        with patch.object(
+            server_app.T, "submit", side_effect=server_app.T.BusyError("busy")
         ) as submit:
             response = self.c.post("/api/novels/my-story/tasks/db", json={})
         self.assertEqual(response.status_code, 409)
-        submit.assert_not_called()
+        submit.assert_called_once_with("my-story", "db", ["init"])
 
     def test_10_cancel_task_endpoint(self):
         with patch.object(server_app.T, "cancel", return_value={
@@ -222,7 +232,12 @@ class TestServerAPI(unittest.TestCase):
         payload = response.content
         with zipfile.ZipFile(io.BytesIO(payload)) as zf:
             names = set(zf.namelist())
-            self.assertIn("config.py", names)
+            self.assertNotIn("config.py", names)
+            self.assertIn("backup_metadata.json", names)
+            metadata = json.loads(zf.read("backup_metadata.json"))
+            self.assertEqual(metadata["title"], "我的小说")
+            self.assertEqual(metadata["chapter_count"], 8)
+            self.assertIn("volume_config", metadata)
             self.assertIn("novel_prompts.json", names)
             self.assertIn("db/novel.db", names)
             self.assertIn("cache/keeper_cache_01.json", names)
@@ -315,6 +330,109 @@ class TestServerAPI(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         row = next(item for item in response.json() if item["id"] == "my-story")
         self.assertEqual(row["words"], 579)
+
+    def test_15_restore_never_executes_archived_config(self):
+        payload = self.c.get("/api/novels/my-story/backup").content
+        malicious = io.BytesIO()
+        marker = self.temp_root / "config-executed.txt"
+        with zipfile.ZipFile(io.BytesIO(payload)) as source, zipfile.ZipFile(malicious, "w") as target:
+            for info in source.infolist():
+                target.writestr(info.filename, source.read(info.filename))
+            target.writestr(
+                "config.py",
+                f"from pathlib import Path\nPath({str(marker)!r}).write_text('owned')\n",
+            )
+        response = self.c.post(
+            "/api/novels/import-backup?id=safe-restore", content=malicious.getvalue())
+        self.assertEqual(response.status_code, 201, response.text)
+        self.assertFalse(marker.exists())
+        restored = self.novels_dir / "safe-restore"
+        self.assertNotIn("owned", (restored / "config.py").read_text(encoding="utf-8"))
+        self.assertEqual(settings.load_config("safe-restore").story_title, "我的小说")
+        shutil.rmtree(restored)
+
+        no_metadata = io.BytesIO()
+        with zipfile.ZipFile(no_metadata, "w") as archive:
+            archive.writestr("config.py", "raise RuntimeError('must not run')")
+            archive.writestr("novel_prompts.json", "{}")
+            archive.writestr("bible/master_bible.md", "# x")
+        rejected = self.c.post(
+            "/api/novels/import-backup?id=no-metadata", content=no_metadata.getvalue())
+        self.assertEqual(rejected.status_code, 400)
+        self.assertFalse((self.novels_dir / "no-metadata").exists())
+
+    def test_16_busy_writes_and_backup_return_409(self):
+        task_id = "busy-write"
+        task = {"id": task_id, "novel": "my-story", "action": "db", "args": [],
+                "status": "running", "lines": [], "started": 0}
+        server_app.T._TASKS[task_id] = task
+        server_app.T._LOCKS["my-story"] = task_id
+        try:
+            self.assertEqual(self.c.put(
+                "/api/novels/my-story/outline", json={"content": "new"}).status_code, 409)
+            self.assertEqual(self.c.get("/api/novels/my-story/backup").status_code, 409)
+            self.assertEqual(self.c.delete("/api/novels/my-story").status_code, 409)
+        finally:
+            server_app.T._LOCKS.pop("my-story", None)
+            server_app.T._TASKS.pop(task_id, None)
+
+    def test_17_invalid_bible_does_not_overwrite(self):
+        fp = self.novels_dir / "my-story" / "bible" / "characters.json"
+        before = fp.read_text(encoding="utf-8")
+        response = self.c.put(
+            "/api/novels/my-story/bible/characters.json",
+            json={"content": json.dumps({"characters": []})},
+        )
+        self.assertEqual(response.status_code, 422, response.text)
+        self.assertEqual(fp.read_text(encoding="utf-8"), before)
+
+    def test_18_chapter_save_rejects_missing_and_out_of_range(self):
+        response = self.c.put(
+            "/api/novels/my-story/chapters/3", json={"content": "不可新建"})
+        self.assertEqual(response.status_code, 404, response.text)
+        response = self.c.put(
+            "/api/novels/my-story/chapters/9", json={"content": "越界"})
+        self.assertEqual(response.status_code, 422, response.text)
+        self.assertFalse((self.novels_dir / "my-story" / "generated" / "chapter_03.md").exists())
+
+    def test_19_novel_list_excludes_invalid_and_temporary_directories(self):
+        (self.novels_dir / ".restore-temp").mkdir()
+        (self.novels_dir / "bad_name").mkdir()
+        ids = [row["id"] for row in self.c.get("/api/novels").json()]
+        self.assertNotIn(".restore-temp", ids)
+        self.assertNotIn("bad_name", ids)
+
+    def test_20_fact_query_limits(self):
+        self.assertEqual(
+            self.c.get("/api/novels/my-story/db/facts?limit=201").status_code, 422)
+        self.assertEqual(
+            self.c.get("/api/novels/my-story/db/facts?q=" + "x" * 501).status_code, 422)
+
+    def test_21_db_patch_file_failure_rolls_back_database(self):
+        d = self.novels_dir / "my-story"
+        bible_file = d / "bible" / "characters.json"
+        before = bible_file.read_text(encoding="utf-8")
+        db = NovelDB(d)
+        try:
+            old_role = db.conn.execute(
+                "SELECT role FROM characters WHERE name='林一'"
+            ).fetchone()[0]
+        finally:
+            db.close()
+        with patch.object(server_app, "_atomic_write_text",
+                          side_effect=OSError("injected")):
+            with self.assertRaises(OSError):
+                server_app._patch_db_and_bible(
+                    d, "character", "林一", {"profile": {"role": "破坏值"}},
+                )
+        self.assertEqual(bible_file.read_text(encoding="utf-8"), before)
+        db = NovelDB(d)
+        try:
+            self.assertEqual(db.conn.execute(
+                "SELECT role FROM characters WHERE name='林一'"
+            ).fetchone()[0], old_role)
+        finally:
+            db.close()
 
 
 if __name__ == "__main__":

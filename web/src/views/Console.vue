@@ -26,7 +26,7 @@
             <el-tag v-else size="small">未生成</el-tag>
           </div>
           <div class="step-actions">
-            <el-button :disabled="busy" type="primary" plain @click="run('outline', { prompt })" size="small">{{ s0?.done ? '重新生成' : '生成大纲' }}</el-button>
+            <el-button :disabled="busy" type="primary" plain @click="run('outline', { prompt, force: !!s0?.done })" size="small">{{ s0?.done ? '重新生成' : '生成大纲' }}</el-button>
             <el-input v-model="prompt" size="small" class="grow" placeholder="可选：给策划编辑的修改要求（重生成时生效）" :disabled="busy" />
             <el-button link type="primary" @click="goto('outline')">去审阅 →</el-button>
           </div>
@@ -173,6 +173,18 @@ const error = ref('')
 const logBox = ref(null)
 let es = null
 let poll = null
+let reconnectTimer = null
+let statusPollTimer = null
+let contextSeq = 0
+let pipelineRequestSeq = 0
+let historyRequestSeq = 0
+let taskSessionSeq = 0
+let reconnectAttempts = 0
+let statusPollAttempts = 0
+const maxReconnectAttempts = 3
+const maxStatusPollAttempts = 10
+const taskLabels = { outline: '生成大纲', titles: '提取章名', generate: '生成章节', summary: '卷末总结', revise: '修订章节', db: '知识库操作' }
+const terminalStatuses = new Set(['done', 'failed', 'error', 'orphaned', 'cancelled'])
 
 const s0 = computed(() => step('outline'))
 const s1 = computed(() => step('titles'))
@@ -206,41 +218,74 @@ function cardClass(i) {
     locked: !st?.available && i > idx && !st?.done,
   }
 }
+function isCurrentContext(name, seq) {
+  return name === novelName.value && seq === contextSeq
+}
+function clearTaskTimers() {
+  clearTimeout(reconnectTimer)
+  clearTimeout(statusPollTimer)
+  reconnectTimer = null
+  statusPollTimer = null
+}
+function stopTaskTracking() {
+  taskSessionSeq++
+  clearTaskTimers()
+  es?.close()
+  es = null
+}
 
-async function loadPipeline() {
-  if (!novelName.value) { pipe.value = null; return }
+async function loadPipeline(name = novelName.value, seq = contextSeq) {
+  if (!name) { pipe.value = null; return }
+  const requestSeq = ++pipelineRequestSeq
   pipeLoading.value = true
   try {
-    pipe.value = await api.pipeline(novelName.value)
+    const result = await api.pipeline(name)
+    if (requestSeq !== pipelineRequestSeq || !isCurrentContext(name, seq)) return
+    pipe.value = result
     if (batchEnd.value == null) syncBatchEnd()
   } catch (e) {
-    error.value = e.response?.data?.detail || '流水线状态加载失败'
-  } finally { pipeLoading.value = false }
+    if (requestSeq === pipelineRequestSeq && isCurrentContext(name, seq)) error.value = e.response?.data?.detail || '流水线状态加载失败'
+  } finally {
+    if (requestSeq === pipelineRequestSeq && isCurrentContext(name, seq)) pipeLoading.value = false
+  }
 }
 function syncBatchEnd() {
   const next = pipe.value?.next_chapter || 1
   batchEnd.value = Math.min(next + 4, maxEnd.value)
 }
 
-async function refresh() {
-  await loadPipeline()
-  refreshHistory()
+async function refresh(name = novelName.value, seq = contextSeq) {
+  await Promise.all([loadPipeline(name, seq), refreshHistory(name, seq, true)])
 }
-async function refreshHistory() {
+async function refreshHistory(name = novelName.value, seq = contextSeq, adopt = true) {
+  if (!name) { history.value = []; return [] }
+  const requestSeq = ++historyRequestSeq
   historyLoading.value = true
-  try { history.value = await api.tasks(novelName.value) } finally { historyLoading.value = false }
+  try {
+    const tasks = await api.tasks(name)
+    if (requestSeq !== historyRequestSeq || !isCurrentContext(name, seq)) return []
+    history.value = tasks
+    const active = tasks.find(task => task.status === 'running')
+    if (adopt && active) adoptTask(active, name, seq)
+    return tasks
+  } catch (e) {
+    if (requestSeq === historyRequestSeq && isCurrentContext(name, seq)) error.value = e.response?.data?.detail || '任务历史加载失败'
+    return []
+  } finally {
+    if (requestSeq === historyRequestSeq && isCurrentContext(name, seq)) historyLoading.value = false
+  }
 }
 
 async function run(action, body) {
   if (running.value) return ElMessage.warning('已有任务运行中')
-  const labels = { outline: '生成大纲', titles: '提取章名', generate: '生成章节', summary: '卷末总结', revise: '修订章节' }
+  const name = novelName.value
+  const seq = contextSeq
   try {
-    const res = await api.runTask(novelName.value, action, { prompt: '', ...body })
-    taskLabel.value = labels[action] || action
-    stepInfo.value = { total: res.steps || 1, done: 0 }
-    startStream(res.task_id)
+    const res = await api.runTask(name, action, { prompt: '', ...body })
+    if (!isCurrentContext(name, seq)) return
+    startStream(res.task_id, { action, steps: res.steps || 1, done_steps: 0 }, name, seq)
   } catch (e) {
-    ElMessage.error(e.response?.data?.detail || '任务启动失败')
+    if (isCurrentContext(name, seq)) ElMessage.error(e.response?.data?.detail || '任务启动失败')
   }
 }
 function runNext() {
@@ -251,48 +296,164 @@ function runBatch() {
   if (batchEnd.value <= start) return runNext()
   run('generate', { chapter: start, chapter_end: batchEnd.value, prompt: genPrompt.value })
 }
-function startStream(id) {
+function adoptTask(task, name, seq) {
+  if (!isCurrentContext(name, seq)) return
+  stepInfo.value = { total: task.steps || 1, done: task.done_steps || 0 }
+  taskLabel.value = taskLabels[task.action] || task.action
+  const tracking = es || reconnectTimer || statusPollTimer
+  if (running.value && currentTaskId.value === task.id && tracking) return
+  startStream(task.id, task, name, seq)
+}
+function startStream(id, task, name, seq) {
+  stopTaskTracking()
+  const sessionSeq = taskSessionSeq
   currentTaskId.value = id
-  running.value = true; cancelling.value = false; taskStatus.value = ''; logText.value = ''; es?.close()
-  es = taskEventSource(id)
-  es.onmessage = event => {
+  running.value = true
+  cancelling.value = false
+  taskStatus.value = ''
+  taskLabel.value = taskLabels[task?.action] || task?.action || id
+  stepInfo.value = { total: task?.steps || 1, done: task?.done_steps || 0 }
+  logText.value = ''
+  reconnectAttempts = 0
+  statusPollAttempts = 0
+  connectStream(id, name, seq, sessionSeq)
+}
+function connectStream(id, name, seq, sessionSeq) {
+  if (sessionSeq !== taskSessionSeq || !isCurrentContext(name, seq) || id !== currentTaskId.value) return
+  clearTimeout(reconnectTimer)
+  reconnectTimer = null
+  let replayText = ''
+  let replayStarted = false
+  const source = taskEventSource(id)
+  es = source
+  source.onmessage = event => {
+    if (source !== es || sessionSeq !== taskSessionSeq || !isCurrentContext(name, seq) || id !== currentTaskId.value) return
     const data = JSON.parse(event.data)
-    logText.value += data
-    if (data.startsWith('━━')) { stepInfo.value.done = parseInt((data.match(/步骤 (\d+)\//) || [])[1] || '0', 10) }
     if (data.startsWith('__TASK_END__')) {
-      taskStatus.value = data.split(' ')[1]
-      running.value = false
-      es.close()
-      refresh()
-      store.reload(store.current).catch(() => {})
+      finishTask(data.split(' ')[1], id, name, seq, sessionSeq)
+      return
     }
+    replayText += data
+    logText.value = replayText
+    replayStarted = true
+    if (data.startsWith('━━')) stepInfo.value.done = parseInt((data.match(/步骤 (\d+)\//) || [])[1] || '0', 10)
     nextTick(() => { if (logBox.value) logBox.value.scrollTop = logBox.value.scrollHeight })
   }
-  es.onerror = () => { es?.close(); running.value = false; refreshHistory() }
+  source.onerror = () => {
+    if (source !== es || sessionSeq !== taskSessionSeq || !isCurrentContext(name, seq)) return
+    source.close()
+    es = null
+    if (!replayStarted) replayText = logText.value
+    inspectTask(id, name, seq, sessionSeq)
+  }
+}
+async function inspectTask(id, name, seq, sessionSeq) {
+  if (sessionSeq !== taskSessionSeq || !isCurrentContext(name, seq)) return
+  let tasks
+  try {
+    tasks = await api.tasks(name)
+  } catch {
+    scheduleStatusPoll(id, name, seq, sessionSeq)
+    return
+  }
+  if (sessionSeq !== taskSessionSeq || !isCurrentContext(name, seq)) return
+  history.value = tasks
+  const task = tasks.find(item => item.id === id)
+  if (!task) {
+    running.value = false
+    taskStatus.value = 'error'
+    error.value = '任务状态不可用，实时日志已停止'
+    return
+  }
+  stepInfo.value = { total: task.steps || 1, done: task.done_steps || 0 }
+  if (terminalStatuses.has(task.status)) {
+    finishTask(task.status, id, name, seq, sessionSeq)
+    return
+  }
+  if (reconnectAttempts < maxReconnectAttempts) {
+    reconnectAttempts++
+    reconnectTimer = window.setTimeout(() => connectStream(id, name, seq, sessionSeq), reconnectAttempts * 1000)
+  } else {
+    scheduleStatusPoll(id, name, seq, sessionSeq)
+  }
+}
+function scheduleStatusPoll(id, name, seq, sessionSeq) {
+  if (sessionSeq !== taskSessionSeq || !isCurrentContext(name, seq)) return
+  if (statusPollAttempts >= maxStatusPollAttempts) {
+    error.value = '实时日志连接中断；任务仍可能在后台运行，请稍后点击刷新重新接管'
+    return
+  }
+  statusPollAttempts++
+  statusPollTimer = window.setTimeout(() => {
+    statusPollTimer = null
+    inspectTask(id, name, seq, sessionSeq)
+  }, 3000)
+}
+function finishTask(status, id, name, seq, sessionSeq) {
+  if (sessionSeq !== taskSessionSeq || !isCurrentContext(name, seq) || id !== currentTaskId.value) return
+  stopTaskTracking()
+  taskStatus.value = status
+  running.value = false
+  refresh(name, seq)
+  store.reload(name).catch(() => {})
 }
 async function cancelTask(id) {
   if (!id || cancelling.value) return
+  const name = novelName.value
+  const seq = contextSeq
   cancelling.value = true
   try {
     const result = await api.cancelTask(id)
-    taskStatus.value = result.status
-    if (id === currentTaskId.value) running.value = false
-    es?.close()
+    if (!isCurrentContext(name, seq)) return
+    if (id === currentTaskId.value) {
+      stopTaskTracking()
+      taskStatus.value = result.status
+      running.value = false
+    }
     ElMessage.success(result.cancelled ? '任务已取消' : `任务已是 ${result.status}`)
-    await refresh()
+    await refresh(name, seq)
   } catch (e) {
-    ElMessage.error(e.response?.data?.detail || '取消失败')
-  } finally { cancelling.value = false }
+    if (isCurrentContext(name, seq)) ElMessage.error(e.response?.data?.detail || '取消失败')
+  } finally {
+    if (isCurrentContext(name, seq)) cancelling.value = false
+  }
 }
 function cancelCurrent() { return cancelTask(currentTaskId.value) }
 function clearLog() { logText.value = '' }
 function goto(view) { router.push({ name: view, params: { name: novelName.value } }) }
 
-async function refreshAll() { await store.reload(store.current); refresh() }
+async function refreshAll() {
+  const name = novelName.value
+  const seq = contextSeq
+  await store.reload(name)
+  if (isCurrentContext(name, seq)) await refresh(name, seq)
+}
 
-watch(novelName, () => { es?.close(); running.value = false; pipe.value = null; batchEnd.value = null; refresh() }, { immediate: true })
+watch(novelName, name => {
+  contextSeq++
+  const seq = contextSeq
+  stopTaskTracking()
+  pipelineRequestSeq++
+  historyRequestSeq++
+  running.value = false
+  cancelling.value = false
+  currentTaskId.value = ''
+  taskStatus.value = ''
+  taskLabel.value = ''
+  stepInfo.value = { total: 1, done: 0 }
+  logText.value = ''
+  history.value = []
+  pipe.value = null
+  batchEnd.value = null
+  error.value = ''
+  refresh(name, seq)
+}, { immediate: true })
 onMounted(() => { poll = setInterval(() => { if (!running.value && document.visibilityState === 'visible') loadPipeline() }, 30000) })
-onBeforeUnmount(() => { es?.close(); if (poll) clearInterval(poll) })
+onBeforeUnmount(() => {
+  contextSeq++
+  stopTaskTracking()
+  if (poll) clearInterval(poll)
+})
 </script>
 
 <style scoped>

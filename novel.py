@@ -19,6 +19,7 @@ import os
 import re
 import tempfile
 import time
+from datetime import datetime
 from pathlib import Path
 
 ENGINE_ROOT = Path(__file__).resolve().parent
@@ -49,6 +50,9 @@ def _parse_args():
         "words_per_chapter": 3000,
         "genre": "",
         "description": "",
+        "overwrite": False,
+        "force": False,
+        "outline_override": False,
     }
     i = 0
     while i < len(args):
@@ -71,6 +75,12 @@ def _parse_args():
             i += 1; parsed["novel"] = args[i]
         elif a == "--list":
             parsed["command"] = "list"
+        elif a == "--overwrite":
+            parsed["overwrite"] = True
+        elif a == "--force":
+            parsed["force"] = True
+        elif a == "--outline-override":
+            parsed["outline_override"] = True
         elif a in ("outline", "titles", "status"):
             parsed["command"] = a
         elif a == "db":
@@ -364,29 +374,49 @@ def cmd_promo(args):
         print("  python novel.py --novel X promo scene N     章节插图提示词")
 
 
-class OutlineValidationError(ValueError):
+class CommandError(RuntimeError):
+    """可预期的命令业务失败。"""
+
+
+class OutlineValidationError(CommandError):
     """模型连续返回无法安全解析的分卷大纲。"""
 
 
+OUTLINE_PROTOCOL_VERSION = "2"
+
+
 def outline_section_ranges(lo: int, hi: int, target_size: int = 10) -> list[tuple[int, int]]:
-    """把一卷均匀切成小片；常规片为8-10章，小卷保持单片。"""
+    """切成不超过12章的片；除最后一片外至少8章。"""
+    if lo < 1 or hi < lo or target_size < 8 or target_size > 12:
+        raise ValueError("大纲分片边界或 target_size 无效")
     total = hi - lo + 1
-    count = max(1, (total + target_size - 1) // target_size)
+    if total <= 12:
+        return [(lo, hi)]
+    count = (total + target_size - 1) // target_size
     while count > 1 and total // count < 8:
         count -= 1
+    sizes = [target_size] * (count - 1)
+    sizes.append(total - sum(sizes))
+    while sizes[-1] <= 0:
+        sizes.pop()
+    if len(sizes) > 1 and sizes[-1] > 12:
+        sizes = []
+        base, extra = divmod(total, count)
+        sizes = [base + (1 if index < extra else 0) for index in range(count)]
     ranges = []
-    for index in range(count):
-        start = lo + index * total // count
-        end = lo + (index + 1) * total // count - 1
-        ranges.append((start, end))
+    start = lo
+    for size in sizes:
+        ranges.append((start, start + size - 1))
+        start += size
     return ranges
 
 
 def build_outline_prompt(title: str, volume: dict, bible: dict, user_prompt: str = "",
                          part_range: tuple[int, int] | None = None,
                          include_overview: bool = True,
-                         volume_overview: str = "") -> str:
-    """构建单个8-20章大纲分片提示词，不依赖文件或模型调用。"""
+                         volume_overview: str = "", previous_tail: str = "",
+                         used_foreshadow_ids: list[str] | None = None) -> str:
+    """构建单个大纲分片提示词，不依赖文件或模型调用。"""
     volume_lo, volume_hi = volume["chapters"]
     lo, hi = part_range or volume["chapters"]
     clues = bible.get("clues", {}).get("clues", {})
@@ -401,6 +431,8 @@ def build_outline_prompt(title: str, volume: dict, bible: dict, user_prompt: str
         "本片不是首片，禁止输出“### 卷概览”及概览正文，必须直接从小节标题开始。"
     )
     prior_overview = f"\n【既定卷概览】{volume_overview}\n" if volume_overview else ""
+    prior_tail = f"\n【上一片末2-3章】\n{previous_tail}\n" if previous_tail else ""
+    used_ids = ", ".join(used_foreshadow_ids or []) or "无"
     ending_rule = (
         f"第{hi}章必须完成本卷收束。" if hi == volume_hi
         else f"第{hi}章只完成当前阶段并自然衔接第{hi + 1}章，不得提前收束全卷。"
@@ -409,10 +441,11 @@ def build_outline_prompt(title: str, volume: dict, bible: dict, user_prompt: str
         f"你是资深小说策划编辑。请为《{title}》{volume['name']}生成详细大纲。\n\n"
         f"【世界观】{bible.get('master_bible', '')[:2500]}\n\n"
         f"【本卷】{volume['name']}（第{volume_lo}-{volume_hi}章） | 情绪:{volume['core_emotion']} | 重点:{volume['focus']}\n"
-        f"【当前分片】第{lo}-{hi}章，共{hi - lo + 1}章。{prior_overview}\n"
+        f"【当前分片】第{lo}-{hi}章，共{hi - lo + 1}章。{prior_overview}{prior_tail}\n"
         f"【人物】{json.dumps(bible.get('characters', {}), ensure_ascii=False, indent=2)[:2000]}\n\n"
         f"【线索池】{json.dumps({key: value.get('name', '') for key, value in clues.items()}, ensure_ascii=False)}\n"
-        f"【伏笔池】{json.dumps({key: value.get('name', '') for key, value in foreshadowing.items()}, ensure_ascii=False)}\n\n"
+        f"【伏笔池】{json.dumps({key: value.get('name', '') for key, value in foreshadowing.items()}, ensure_ascii=False)}\n"
+        f"【已用伏笔ID】{used_ids}\n\n"
         "【输出边界】\n"
         f"只输出{volume['name']}的卷内容中第{lo}-{hi}章，不要输出或重复“## {volume['name']}”这类卷标题。"
         "不要输出前言、结语、自查结果、卷总结标题或其他说明。\n\n"
@@ -608,13 +641,59 @@ def _outline_hash(content: str) -> str:
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
 
-def _save_outline_manifest(path: Path, records: dict):
-    payload = {"version": 1, "parts": list(records.values())}
+def _save_outline_manifest(path: Path, records: dict, outline_state: dict | None = None):
+    payload = {
+        "version": 2,
+        "protocol_version": OUTLINE_PROTOCOL_VERSION,
+        "outline": outline_state or {"status": "generating", "invalid": True},
+        "parts": list(records.values()),
+    }
     _atomic_write(path, json.dumps(payload, ensure_ascii=False, indent=2))
 
 
-def cmd_outline(prompt=""):
-    """按8-20章分片生成全书大纲，支持合法分片断点续跑。"""
+def mark_outline_manual(bible_dir: Path, content: str):
+    manifest_path = bible_dir / "outline_manifest.json"
+    records = {}
+    if manifest_path.exists():
+        try:
+            loaded = json.loads(manifest_path.read_text(encoding="utf-8"))
+            records = {f"{item['volume']}:{item['range'][0]}-{item['range'][1]}": item
+                       for item in loaded.get("parts", [])}
+        except (OSError, ValueError, KeyError, TypeError):
+            records = {}
+    _save_outline_manifest(manifest_path, records, {
+        "status": "manual", "invalid": True, "manual_hash": _outline_hash(content),
+    })
+
+
+def _outline_input_hash(title: str, volume_key: str, volume: dict, bible: dict,
+                        user_prompt: str, previous_part_hash: str,
+                        volume_overview: str) -> str:
+    payload = {
+        "protocol_version": OUTLINE_PROTOCOL_VERSION,
+        "user_prompt": user_prompt,
+        "title": title,
+        "volume_key": volume_key,
+        "volume": volume,
+        "master_bible": bible.get("master_bible", ""),
+        "characters": bible.get("characters", {}),
+        "clues": bible.get("clues", {}),
+        "motifs": bible.get("motif_bank", {}),
+        "previous_part_hash": previous_part_hash,
+        "volume_overview": volume_overview,
+    }
+    canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return _outline_hash(canonical)
+
+
+def _outline_tail(part: str, count: int = 3) -> str:
+    chapter_lines = [line for line in part.splitlines()
+                     if re.match(r"^- \*\*第\d+章 ", line)]
+    return "\n".join(chapter_lines[-count:])
+
+
+def cmd_outline(prompt="", force=False):
+    """按分片生成全书大纲；默认安全续跑，force 全量重建。"""
     config = get_config()
     config.bible_dir.mkdir(parents=True, exist_ok=True)
     bible = {}
@@ -627,7 +706,9 @@ def cmd_outline(prompt=""):
     from engine.llm_client import chat
 
     manifest_path = config.bible_dir / "outline_manifest.json"
+    outline_file = config.bible_dir / "outline.md"
     records = {}
+    loaded = {}
     if manifest_path.exists():
         try:
             loaded = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -635,8 +716,21 @@ def cmd_outline(prompt=""):
                        for item in loaded.get("parts", [])}
         except (OSError, ValueError, KeyError, TypeError):
             records = {}
+            loaded = {}
+    if loaded.get("outline", {}).get("status") == "manual" and not force:
+        raise CommandError("outline.md 已人工修改，普通 resume 不会覆盖；请审阅后使用 outline --force 明确重生成")
+    if force and outline_file.exists():
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+        backup = outline_file.with_name(f"outline.{stamp}.bak.md")
+        _atomic_write(backup, outline_file.read_text(encoding="utf-8"))
+        print(f"已备份现有大纲: {backup}")
 
+    state = {"status": "generating", "invalid": True}
     assembled_volumes = []
+    previous_chain_hash = ""
+    previous_tail = ""
+    used_foreshadow_ids = set()
+    active_keys = []
     for volume_key, volume in config.volume_config.items():
         volume_lo, volume_hi = volume["chapters"]
         volume_parts = []
@@ -646,57 +740,72 @@ def cmd_outline(prompt=""):
             relative = f"outline_parts/{volume_key}/section_{lo}_{hi}.md"
             part_path = config.bible_dir / relative
             record_key = f"{volume_key}:{lo}-{hi}"
-            existing = part_path.read_text(encoding="utf-8") if part_path.exists() else ""
-            valid_existing = bool(existing) and not validate_outline_output(
-                existing, lo, hi, include_overview)
+            active_keys.append(record_key)
+            existing = part_path.read_text(encoding="utf-8").strip() if part_path.exists() else ""
+            input_hash = _outline_input_hash(
+                config.story_title, volume_key, volume, bible, prompt,
+                previous_chain_hash, volume_overview)
             old_record = records.get(record_key, {})
-            hash_matches = (not old_record.get("hash") or
-                            old_record.get("hash") == _outline_hash(existing))
-            if valid_existing and hash_matches:
-                part = existing.strip()
-                records[record_key] = {
-                    "volume": volume_key, "range": [lo, hi], "status": "complete",
-                    "attempt": old_record.get("attempt", 0), "hash": _outline_hash(part),
-                    "path": relative,
-                }
-                _save_outline_manifest(manifest_path, records)
-                print(f"跳过合法分片 {volume['name']} 第{lo}-{hi}章")
+            output_hash = _outline_hash(existing) if existing else ""
+            reusable = (
+                not force and old_record.get("status") == "complete"
+                and bool(existing)
+                and not validate_outline_output(existing, lo, hi, include_overview)
+                and old_record.get("hash") == output_hash
+                and old_record.get("input_hash") == input_hash
+            )
+            if reusable:
+                part = existing
+                attempts = old_record.get("attempt", 0)
+                print(f"跳过匹配分片 {volume['name']} 第{lo}-{hi}章")
             else:
                 print(f"生成 {volume['name']} 第{lo}-{hi}章 ...")
-                def mark_attempt(attempt, key=record_key, rel=relative):
-                    records[key] = {
-                        "volume": volume_key, "range": [lo, hi], "status": "running",
-                        "attempt": attempt, "hash": "", "path": rel,
-                    }
-                    _save_outline_manifest(manifest_path, records)
                 part_prompt = build_outline_prompt(
                     config.story_title, volume, bible, prompt, (lo, hi),
-                    include_overview, volume_overview)
+                    include_overview, volume_overview, previous_tail,
+                    sorted(used_foreshadow_ids))
+
+                def mark_attempt(attempt, key=record_key, rel=relative,
+                                 expected_input=input_hash):
+                    records[key] = {
+                        "volume": volume_key, "range": [lo, hi], "status": "running",
+                        "attempt": attempt, "hash": "", "input_hash": expected_input,
+                        "chain_hash": "", "path": rel,
+                    }
+                    _save_outline_manifest(manifest_path, records, state)
                 try:
                     part, attempts = _generate_valid_outline_part(
                         chat, config.planner_model, part_prompt, lo, hi,
                         include_overview, mark_attempt)
                 except Exception:
                     records[record_key]["status"] = "failed"
-                    _save_outline_manifest(manifest_path, records)
+                    _save_outline_manifest(manifest_path, records, state)
                     raise
                 _atomic_write(part_path, part)
-                records[record_key] = {
-                    "volume": volume_key, "range": [lo, hi], "status": "complete",
-                    "attempt": attempts, "hash": _outline_hash(part), "path": relative,
-                }
-                _save_outline_manifest(manifest_path, records)
+                output_hash = _outline_hash(part)
+            chain_hash = _outline_hash(input_hash + ":" + output_hash)
+            records[record_key] = {
+                "volume": volume_key, "range": [lo, hi], "status": "complete",
+                "attempt": attempts, "hash": output_hash, "input_hash": input_hash,
+                "chain_hash": chain_hash, "path": relative,
+            }
+            _save_outline_manifest(manifest_path, records, state)
             if include_overview:
                 nonempty = [line.strip() for line in part.splitlines() if line.strip()]
                 volume_overview = nonempty[1] if len(nonempty) > 1 else ""
+            used_foreshadow_ids.update(re.findall(r"\bF\d{3}\b", part))
+            previous_tail = _outline_tail(part)
+            previous_chain_hash = chain_hash
             volume_parts.append(part)
         assembled_volumes.append(
             f"## {volume['name']}（第{volume_lo}-{volume_hi}章）\n" +
             "\n\n".join(volume_parts))
 
     outline = f"# {config.story_title} — 全书大纲\n\n" + "\n\n".join(assembled_volumes)
-    outline_file = config.bible_dir / "outline.md"
     _atomic_write(outline_file, outline)
+    records = {key: records[key] for key in active_keys}
+    state = {"status": "generated", "invalid": False, "hash": _outline_hash(outline)}
+    _save_outline_manifest(manifest_path, records, state)
     print(f"大纲已保存: {outline_file} ({len(outline)} 字符)")
     print("请审阅。修改后运行: python novel.py --novel {} titles".format(get_novel()))
 
@@ -725,8 +834,9 @@ def cmd_titles(prompt=""):
 
     outline_file = config.bible_dir / "outline.md"
     if not outline_file.exists():
-        print("错误: 未找到 bible/outline.md，请先运行: python novel.py --novel {} outline".format(get_novel()))
-        return
+        raise CommandError(
+            "未找到 bible/outline.md，请先运行: python novel.py --novel {} outline".format(get_novel())
+        )
 
     outline = outline_file.read_text(encoding="utf-8")
 
@@ -746,8 +856,9 @@ def cmd_titles(prompt=""):
         titles_by_vol = _parse_titles_from_outline(outline)
 
     if not titles_by_vol or not isinstance(titles_by_vol, dict):
-        print("未能提取章名。试试: python novel.py --novel {} titles -p '要求'".format(get_novel()))
-        return
+        raise CommandError(
+            "未能从 outline.md 提取章名；请检查大纲格式或使用 titles -p '要求'"
+        )
 
     total_new = sum(len(v) for v in titles_by_vol.values() if isinstance(v, dict))
 
@@ -828,8 +939,48 @@ def _save_failed_draft(config, chapter_num: int, scene_id, draft: str,
     return target
 
 
-def cmd_generate(chapter_num: int, instruction: str = ""):
-    """生成单章"""
+def planning_readiness(config) -> dict:
+    if not hasattr(config, "chapter_count"):
+        return {"outline_ready": True, "outline_numbers": set(), "outline_entries": 0,
+                "titles_ready": True, "titles": {}, "placeholders": [],
+                "missing_outline": [], "missing_titles": []}
+    expected = set(range(1, config.chapter_count + 1))
+    outline_file = config.bible_dir / "outline.md"
+    outline_text = outline_file.read_text(encoding="utf-8") if outline_file.exists() else ""
+    outline_numbers = [int(number) for number in re.findall(
+        r"(?m)^[-*]\s*\*?\*?第(\d+)章\s+", outline_text)]
+    outline_set = set(outline_numbers)
+    outline_ready = outline_set == expected and len(outline_numbers) == len(expected)
+
+    titles = {}
+    titles_file = config.bible_dir / "chapter_titles.json"
+    if titles_file.exists():
+        try:
+            data = json.loads(titles_file.read_text(encoding="utf-8"))
+            for volume in data.get("volumes", {}).values():
+                for raw_number, title in volume.get("chapters", {}).items():
+                    titles[int(raw_number)] = str(title).strip()
+        except (OSError, ValueError, TypeError, AttributeError):
+            titles = {}
+    placeholders = sorted(number for number, title in titles.items()
+                          if not title or re.fullmatch(r"第?\d+章", title))
+    title_numbers = set(titles)
+    titles_ready = title_numbers == expected and not placeholders
+    return {
+        "outline_ready": outline_ready,
+        "outline_numbers": outline_set,
+        "outline_entries": len(outline_numbers),
+        "titles_ready": titles_ready,
+        "titles": titles,
+        "placeholders": placeholders,
+        "missing_outline": sorted(expected - outline_set),
+        "missing_titles": sorted(expected - title_numbers),
+    }
+
+
+def cmd_generate(chapter_num: int, instruction: str = "", overwrite: bool = False,
+                 outline_override: bool = False):
+    """生成单章；默认要求完整大纲和非占位章名。"""
     from engine.agents.planner import PlannerAgent
     from engine.agents.researcher import ResearcherAgent
     from engine.agents.writer import WriterAgent
@@ -841,6 +992,18 @@ def cmd_generate(chapter_num: int, instruction: str = ""):
     from engine.agents.reader_proxy import ReaderProxy
 
     config = get_config()
+    if not outline_override:
+        readiness = planning_readiness(config)
+        if not readiness["outline_ready"]:
+            raise CommandError("写作门禁：全书大纲未按章号完整覆盖；如确需跳过请显式使用 --outline-override")
+        if not readiness["titles_ready"]:
+            raise CommandError("写作门禁：章名未完整生成或仍含“第N章”占位名；如确需跳过请显式使用 --outline-override")
+    chapter_file = config.generated_dir / f"chapter_{chapter_num:02d}.md"
+    replacing = chapter_file.exists()
+    if replacing and not overwrite:
+        raise FileExistsError(
+            f"第 {chapter_num} 章已存在；如需覆盖请显式传入 --overwrite"
+        )
     planner = PlannerAgent()
     researcher = ResearcherAgent()
     writer = WriterAgent()
@@ -980,11 +1143,17 @@ def cmd_generate(chapter_num: int, instruction: str = ""):
                 patched_scan.metrics.get("max_same_len_run", 0)
                 > final_scan.metrics.get("max_same_len_run", 0)
             )
-            if patched_scan.violations or after_weight > before_weight or metrics_worse:
-                log.warning("补丁引入硬违规或扫描结果更差，保留补丁前正文")
+            final_heavy = reviewers.heavy_check(patched, plan_json, chapter_num)
+            still_needs_patch = bool(final_heavy.get("patch_instructions"))
+            if (patched_scan.violations or after_weight > before_weight
+                    or metrics_worse or still_needs_patch):
+                log.warning("补丁未通过最终审阅或扫描结果更差，保留补丁前正文")
             else:
                 full_chapter = patched
                 final_scan = patched_scan
+                keeper_cache = keeper.reconcile_final_chapter(
+                    keeper_cache, full_chapter, chapter_num,
+                )
     else:
         heavy = {"score": None, "patch_instructions": []}
 
@@ -1001,12 +1170,7 @@ def cmd_generate(chapter_num: int, instruction: str = ""):
             f"第 {chapter_num} 章合并正文未通过最终风格扫描，失败稿已保存: {failed_path}"
         )
 
-    archivist.save_chapter(chapter_num, full_chapter)
-    if not archivist.update_bible(chapter_num, plan_json, keeper_cache, full_chapter):
-        raise RuntimeError(f"第 {chapter_num} 章正文已保存，但知识归档失败")
-    keeper.save_cache(chapter_num, keeper_cache)
-
-    # 读者代理人反馈
+    # 发布前完成所有外部审阅；任何异常都不会暴露 staging 正文。
     reader_result = reader.read(full_chapter)
     if reader_result.get("confusion_points"):
         log.warning(f"读者困惑点: {len(reader_result['confusion_points'])} 处")
@@ -1016,6 +1180,10 @@ def cmd_generate(chapter_num: int, instruction: str = ""):
           f"续读意愿: {'是' if reader_result.get('would_continue') else '否'}")
 
     word_count = len(full_chapter)
+
+    if not archivist.update_bible(chapter_num, plan_json, keeper_cache, full_chapter):
+        raise RuntimeError(f"第 {chapter_num} 章知识归档失败，正文未发布")
+    keeper.save_cache(chapter_num, keeper_cache)
 
     # DB 记账：章节成绩
     from engine.db import NovelDB
@@ -1036,9 +1204,20 @@ def cmd_generate(chapter_num: int, instruction: str = ""):
     except Exception as e:
         log.warning(f"DB 章节记账失败: {e}")
 
-    # 记录进度
+    if replacing:
+        stale_db = NovelDB(get_novel_dir())
+        try:
+            stale_db.invalidate_from(chapter_num + 1)
+        finally:
+            stale_db.close()
+        keeper.invalidate_from(chapter_num + 1)
+
+    # 最后一步才原子发布正文；归档或审阅失败不会改动正式章节。
+    archivist.save_chapter(chapter_num, full_chapter)
     pf = config.cache_dir / "pipeline_progress.json"
-    pf.write_text(json.dumps({"last_completed_chapter": chapter_num}, ensure_ascii=False), encoding="utf-8")
+    _atomic_write(
+        pf, json.dumps({"last_completed_chapter": chapter_num}, ensure_ascii=False),
+    )
 
     print(f"第 {chapter_num} 章 完成  |  {word_count:,} 字")
     log.info(f"=== 第 {chapter_num} 章 完成 ===")
@@ -1056,8 +1235,7 @@ def cmd_revise(chapter_num: int, feedback: str):
     config = get_config()
     cf = config.generated_dir / f"chapter_{chapter_num:02d}.md"
     if not cf.exists():
-        print(f"错误: 第 {chapter_num} 章尚未生成")
-        return
+        raise CommandError(f"第 {chapter_num} 章尚未生成，无法修订")
 
     original = cf.read_text(encoding="utf-8")
     print(f"修订第 {chapter_num} 章: {feedback}")
@@ -1082,7 +1260,7 @@ def cmd_revise(chapter_num: int, feedback: str):
         f"输出修订后的完整正文，不要任何说明或标注。"
     )
     revised = writer._call_llm(prompt, 0)
-    cf.write_text(revised, encoding="utf-8")
+    _atomic_write(cf, revised)
 
     # 记录教训（JSONL + SQLite 双写）+ 修订后复扫
     from engine.style_kit import scanner
@@ -1098,7 +1276,7 @@ def cmd_revise(chapter_num: int, feedback: str):
         _db.delete_style_hits(chapter_num)
         if rows:
             _db.add_style_hits(rows)
-        _db.clear_chapter_derivatives(chapter_num)
+        _db.invalidate_from(chapter_num)
         _db.log_chapter(chapter_num, words=len(revised), status="knowledge_stale")
         _db.close()
         from engine.agents.keeper import KeeperAgent
@@ -1119,8 +1297,7 @@ def cmd_summary(volume_num: int, prompt: str = ""):
     vol_key = f"volume_{volume_num}"
     vol = config.volume_config.get(vol_key)
     if not vol:
-        print(f"错误: 未找到第 {volume_num} 卷")
-        return
+        raise CommandError(f"未找到第 {volume_num} 卷")
     lo, hi = vol["chapters"]
 
     gen_dir = config.generated_dir
@@ -1143,8 +1320,7 @@ def cmd_summary(volume_num: int, prompt: str = ""):
             summaries.append(f"第{ch}章: {first_line}")
 
     if not summaries:
-        print(f"错误: 第{volume_num}卷尚未生成任何章节")
-        return
+        raise CommandError(f"第{volume_num}卷尚未生成任何章节")
 
     from engine.prompts_loader import get_prompt
     system, _ = get_prompt("volume_summary")
@@ -1159,8 +1335,10 @@ def cmd_summary(volume_num: int, prompt: str = ""):
     summary_file = gen_dir / f"volume_{volume_num}_summary.md"
     if "--revise" in sys.argv or "-r" in sys.argv or prompt:
         if not summary_file.exists():
-            print("错误: 卷末总结尚未生成，请先生成: python novel.py --novel {} summary {}".format(get_novel(), volume_num))
-            return
+            raise CommandError(
+                "卷末总结尚未生成，请先生成: python novel.py --novel {} summary {}".format(
+                    get_novel(), volume_num)
+            )
         original = summary_file.read_text(encoding="utf-8")
         system += f"\n\n【修改要求】{prompt}\n【原文】\n{original}"
         print(f"修订第{volume_num}卷总结: {prompt}")
@@ -1178,7 +1356,7 @@ def cmd_summary(volume_num: int, prompt: str = ""):
 # 主入口
 # ============================================================
 
-def main():
+def _main():
     args = _parse_args()
     cmd = args["command"]
     novel = args["novel"]
@@ -1190,8 +1368,7 @@ def main():
         return cmd_create(args)
 
     if not novel:
-        print("请先创建小说，或使用 --novel <id> 指定小说")
-        return
+        raise CommandError("请先创建小说，或使用 --novel <id> 指定小说")
 
     # 需要设置小说的命令
     set_novel(novel)
@@ -1206,7 +1383,7 @@ def main():
         return cmd_status()
 
     if cmd == "outline":
-        return cmd_outline(args["prompt"])
+        return cmd_outline(args["prompt"], args["force"])
 
     if cmd == "titles":
         return cmd_titles(args["prompt"])
@@ -1215,13 +1392,15 @@ def main():
         return cmd_view(args)
 
     if cmd == "generate":
-        return cmd_generate(args["chapter"], args["prompt"])
+        return cmd_generate(args["chapter"], args["prompt"], args["overwrite"],
+                            args["outline_override"])
 
     if cmd == "revise":
         feedback = args["content"] or args["prompt"]
         if not feedback:
-            print("请提供修改要求: python novel.py --novel {} revise <章号> <修改要求>".format(novel))
-            return
+            raise CommandError(
+                "请提供修改要求: python novel.py --novel {} revise <章号> <修改要求>".format(novel)
+            )
         return cmd_revise(args["chapter"], feedback)
 
     if cmd == "summary":
@@ -1256,6 +1435,17 @@ def main():
     print("    python novel.py --list                        列出所有小说")
     print("    python novel.py --novel <名> status           查看创作进度")
     print()
+    return 0
+
+
+def main():
+    try:
+        result = _main()
+        return result if isinstance(result, int) else 0
+    except CommandError as exc:
+        print(f"错误: {exc}", file=sys.stderr)
+        return 1
+
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

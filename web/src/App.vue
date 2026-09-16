@@ -23,6 +23,7 @@
           </el-button>
         </div>
         <el-button class="create-side-button" plain @click="openCreate"><el-icon><Plus /></el-icon>新建小说</el-button>
+        <el-button class="import-side-button" plain @click="openImport"><el-icon><Upload /></el-icon>导入工作区备份</el-button>
       </div>
 
       <el-menu :default-active="$route.name" router>
@@ -45,87 +46,128 @@
     </el-main>
   </el-container>
 
-  <el-dialog v-model="createVisible" title="新建小说" width="min(920px, calc(100vw - 32px))" destroy-on-close>
-    <section class="theme-generator">
-      <div class="theme-heading">
-        <div>
-          <strong>AI 主题构思</strong>
-          <span>生成三个建议，选中后仅填入表单</span>
-        </div>
-        <el-button type="primary" plain :loading="themeLoading" :disabled="!themeRequest.direction" @click="generateThemes">
-          <el-icon v-if="!themeLoading"><MagicStick /></el-icon>生成方案
-        </el-button>
-      </div>
-      <div class="direction-picker">
-        <span class="direction-label">先选创作方向（必选）</span>
-        <button v-for="direction in THEME_DIRECTIONS" :key="direction" type="button" class="direction-card" :class="{ selected: themeRequest.direction === direction }" @click="themeRequest.direction = direction">
-          {{ direction }}
-        </button>
-      </div>
-      <div class="theme-inputs">
-        <el-input v-model="themeRequest.inspiration" maxlength="1000" show-word-limit placeholder="可选：一句灵感、人物或场景" />
-        <el-input v-model="themeRequest.genre" maxlength="100" placeholder="可选：题材偏好" />
-      </div>
-      <div class="theme-inputs theme-selects">
-        <el-select v-model="themeRequest.channel" placeholder="频道">
-          <el-option v-for="channel in CHANNELS" :key="channel" :label="channel" :value="channel" />
-        </el-select>
-        <el-select v-model="themeRequest.protagonist_gender" placeholder="主角类型">
-          <el-option v-for="gender in PROTAGONIST_GENDERS" :key="gender" :label="gender" :value="gender" />
-        </el-select>
-        <el-select v-model="themeRequest.length" placeholder="篇幅">
-          <el-option v-for="preset in LENGTH_PRESETS" :key="preset" :label="preset" :value="preset" />
-        </el-select>
-      </div>
-      <el-alert v-if="themeError" class="theme-error" type="error" :title="themeError" :closable="false" show-icon />
-      <div v-if="themeOptions.length" class="theme-cards">
-        <button v-for="option in themeOptions" :key="option.id" type="button" class="theme-card" @click="applyTheme(option)">
-          <span class="theme-card-title">{{ option.title }}</span>
-          <span class="theme-card-meta">{{ option.genre }} · {{ option.chapter_count }} 章 · 每章 {{ option.words_per_chapter }} 字</span>
-          <span class="theme-card-line"><b>主角</b>{{ option.protagonist_name }}（{{ option.protagonist_gender }}）</span>
-          <span class="theme-card-copy">{{ option.description }}</span>
-          <span class="theme-card-line"><b>主题</b>{{ option.theme }}</span>
-          <span class="theme-card-line"><b>冲突</b>{{ option.conflict }}</span>
-          <span class="theme-card-action"><el-icon><EditPen /></el-icon>填入下方表单</span>
-        </button>
-      </div>
-    </section>
-    <el-divider />
-    <el-form ref="createFormRef" :model="form" :rules="rules" label-position="top" @submit.prevent="submitCreate">
-      <div class="form-grid">
-        <el-form-item label="小说 ID" prop="id">
-          <el-input v-model="form.id" placeholder="如：my-new-story" maxlength="64" />
-          <div class="field-tip">仅小写字母、数字和连字符，创建后不可修改</div>
-        </el-form-item>
-        <el-form-item label="书名" prop="title"><el-input v-model="form.title" placeholder="输入小说名称" /></el-form-item>
-        <el-form-item label="总章节数" prop="chapter_count"><el-input-number v-model="form.chapter_count" :min="1" :max="100000" controls-position="right" /></el-form-item>
-        <el-form-item label="每章目标字数" prop="words_per_chapter"><el-input-number v-model="form.words_per_chapter" :min="1" :max="1000000" :step="500" controls-position="right" /></el-form-item>
-      </div>
-      <el-form-item label="类型" prop="genre"><el-input v-model="form.genre" placeholder="如：都市悬疑、奇幻冒险" /></el-form-item>
-      <el-form-item label="故事简介" prop="description"><el-input v-model="form.description" type="textarea" :rows="4" placeholder="简要描述故事背景、人物与核心冲突" /></el-form-item>
-
-      <el-collapse v-model="createPanels" class="model-collapse">
-        <el-collapse-item name="model">
-          <template #title><span class="collapse-title"><el-icon><Cpu /></el-icon> 模型配置（可选）<span class="muted">　不填则用系统环境变量 / 默认 DeepSeek，创建后可在「模型配置」页修改</span></span></template>
-          <div class="model-grid">
-            <el-form-item label="API Key"><el-input v-model="modelForm.api_key" type="password" show-password placeholder="sk-…（仅存本书 .env，不进 git）" /></el-form-item>
-            <el-form-item label="Base URL"><el-input v-model="modelForm.base_url" placeholder="https://api.deepseek.com/v1" /></el-form-item>
-            <el-form-item label="创作/对话模型"><el-input v-model="modelForm.chat_model" placeholder="deepseek-chat" /></el-form-item>
-            <el-form-item label="推理/审阅模型"><el-input v-model="modelForm.reasoner_model" placeholder="deepseek-reasoner" /></el-form-item>
+  <el-dialog
+    v-model="createVisible"
+    title="新建小说"
+    width="min(920px, calc(100vw - 32px))"
+    destroy-on-close
+    :close-on-click-modal="!creating"
+    :close-on-press-escape="!creating"
+    :show-close="!creating"
+  >
+    <fieldset class="create-dialog-fields" :disabled="creating">
+      <section class="theme-generator">
+        <div class="theme-heading">
+          <div>
+            <strong>AI 主题构思</strong>
+            <span>生成三个建议，选中后仅填入表单</span>
           </div>
-          <details class="adv-models">
-            <summary>逐 Agent 精确覆盖（一般不用）</summary>
-            <div class="adv-grid">
-              <el-input v-for="role in AGENT_ROLES" :key="role.env" v-model="modelForm.models[role.env]" size="small" :placeholder="`${role.label} · ${role.default}`"><template #prepend>{{ role.env }}</template></el-input>
+          <el-button type="primary" plain :loading="themeLoading" :disabled="!themeRequest.direction || creating" @click="generateThemes">
+            <el-icon v-if="!themeLoading"><MagicStick /></el-icon>生成方案
+          </el-button>
+        </div>
+        <div class="direction-picker">
+          <span class="direction-label">先选创作方向（必选）</span>
+          <button v-for="direction in THEME_DIRECTIONS" :key="direction" type="button" class="direction-card" :class="{ selected: themeRequest.direction === direction }" @click="themeRequest.direction = direction">
+            {{ direction }}
+          </button>
+        </div>
+        <div class="theme-inputs">
+          <el-input v-model="themeRequest.inspiration" maxlength="1000" show-word-limit placeholder="可选：一句灵感、人物或场景" />
+          <el-input v-model="themeRequest.genre" maxlength="100" placeholder="可选：题材偏好" />
+        </div>
+        <div class="theme-inputs theme-selects">
+          <el-select v-model="themeRequest.channel" placeholder="频道">
+            <el-option v-for="channel in CHANNELS" :key="channel" :label="channel" :value="channel" />
+          </el-select>
+          <el-select v-model="themeRequest.protagonist_gender" placeholder="主角类型">
+            <el-option v-for="gender in PROTAGONIST_GENDERS" :key="gender" :label="gender" :value="gender" />
+          </el-select>
+          <el-select v-model="themeRequest.length" placeholder="篇幅">
+            <el-option v-for="preset in LENGTH_PRESETS" :key="preset" :label="preset" :value="preset" />
+          </el-select>
+        </div>
+        <el-alert v-if="themeError" class="theme-error" type="error" :title="themeError" :closable="false" show-icon />
+        <div v-if="themeOptions.length" class="theme-cards">
+          <button v-for="option in themeOptions" :key="option.id" type="button" class="theme-card" @click="applyTheme(option)">
+            <span class="theme-card-title">{{ option.title }}</span>
+            <span class="theme-card-meta">{{ option.genre }} · {{ option.chapter_count }} 章 · 每章 {{ option.words_per_chapter }} 字</span>
+            <span class="theme-card-line"><b>主角</b>{{ option.protagonist_name }}（{{ option.protagonist_gender }}）</span>
+            <span class="theme-card-copy">{{ option.description }}</span>
+            <span class="theme-card-line"><b>主题</b>{{ option.theme }}</span>
+            <span class="theme-card-line"><b>冲突</b>{{ option.conflict }}</span>
+            <span class="theme-card-action"><el-icon><EditPen /></el-icon>填入下方表单</span>
+          </button>
+        </div>
+      </section>
+      <el-divider />
+      <el-form ref="createFormRef" :model="form" :rules="rules" label-position="top" :disabled="creating" @submit.prevent="submitCreate">
+        <div class="form-grid">
+          <el-form-item label="小说 ID" prop="id">
+            <el-input v-model="form.id" placeholder="如：my-new-story" maxlength="64" />
+            <div class="field-tip">仅小写字母、数字和连字符，创建后不可修改</div>
+          </el-form-item>
+          <el-form-item label="书名" prop="title"><el-input v-model="form.title" placeholder="输入小说名称" /></el-form-item>
+          <el-form-item label="总章节数" prop="chapter_count"><el-input-number v-model="form.chapter_count" :min="1" :max="100000" controls-position="right" /></el-form-item>
+          <el-form-item label="每章目标字数" prop="words_per_chapter"><el-input-number v-model="form.words_per_chapter" :min="1" :max="1000000" :step="500" controls-position="right" /></el-form-item>
+        </div>
+        <el-form-item label="类型" prop="genre"><el-input v-model="form.genre" placeholder="如：都市悬疑、奇幻冒险" /></el-form-item>
+        <el-form-item label="故事简介" prop="description"><el-input v-model="form.description" type="textarea" :rows="4" placeholder="简要描述故事背景、人物与核心冲突" /></el-form-item>
+
+        <el-collapse v-model="createPanels" class="model-collapse">
+          <el-collapse-item name="model">
+            <template #title><span class="collapse-title"><el-icon><Cpu /></el-icon> 模型配置（可选）<span class="muted">　不填则用系统环境变量 / 默认 DeepSeek，创建后可在「模型配置」页修改</span></span></template>
+            <div class="model-grid">
+              <el-form-item label="API Key"><el-input v-model="modelForm.api_key" type="password" show-password placeholder="sk-…（仅存本书 .env，不进 git）" /></el-form-item>
+              <el-form-item label="Base URL"><el-input v-model="modelForm.base_url" placeholder="https://api.deepseek.com/v1" /></el-form-item>
+              <el-form-item label="创作/对话模型"><el-input v-model="modelForm.chat_model" placeholder="deepseek-chat" /></el-form-item>
+              <el-form-item label="推理/审阅模型"><el-input v-model="modelForm.reasoner_model" placeholder="deepseek-reasoner" /></el-form-item>
             </div>
-          </details>
-        </el-collapse-item>
-      </el-collapse>
+            <details class="adv-models">
+              <summary>逐 Agent 精确覆盖（一般不用）</summary>
+              <div class="adv-grid">
+                <el-input v-for="role in AGENT_ROLES" :key="role.env" v-model="modelForm.models[role.env]" size="small" :placeholder="`${role.label} · ${role.default}`"><template #prepend>{{ role.env }}</template></el-input>
+              </div>
+            </details>
+          </el-collapse-item>
+        </el-collapse>
+      </el-form>
+    </fieldset>
+    <template #footer>
+      <el-button type="danger" plain :disabled="creating" @click="clearCreateDraft">清空草稿</el-button>
+      <el-button :disabled="creating" @click="createVisible = false">取消</el-button>
+      <el-button type="primary" :loading="creating" :disabled="creating" @click="submitCreate">创建并进入</el-button>
+    </template>
+  </el-dialog>
+
+  <el-dialog
+    v-model="importVisible"
+    title="导入工作区备份"
+    width="min(520px, calc(100vw - 32px))"
+    destroy-on-close
+    :close-on-click-modal="!importing"
+    :close-on-press-escape="!importing"
+    :show-close="!importing"
+  >
+    <el-alert
+      title="仅支持由“备份工作区”下载的 ZIP；“导出稿件”ZIP 不能用于恢复。"
+      type="info"
+      :closable="false"
+      show-icon
+    />
+    <el-form class="import-form" label-position="top" :disabled="importing" @submit.prevent="submitImport">
+      <el-form-item label="新小说 ID" required>
+        <el-input v-model="importId" maxlength="64" placeholder="如：restored-story" />
+        <div class="field-tip">将创建新工作区；仅小写字母、数字和连字符，不能与现有小说重复</div>
+      </el-form-item>
+      <el-form-item label="工作区备份 ZIP" required>
+        <input ref="importFileInput" class="backup-file-input" type="file" accept=".zip,application/zip" :disabled="importing" @change="onImportFileChange" />
+        <div v-if="importFile" class="selected-backup">已选择：{{ importFile.name }}</div>
+      </el-form-item>
     </el-form>
     <template #footer>
-      <el-button type="danger" plain @click="clearCreateDraft">清空草稿</el-button>
-      <el-button @click="createVisible = false">取消</el-button>
-      <el-button type="primary" :loading="creating" @click="submitCreate">创建并进入</el-button>
+      <el-button :disabled="importing" @click="importVisible = false">取消</el-button>
+      <el-button type="primary" :loading="importing" :disabled="importing" @click="submitImport">导入并进入</el-button>
     </template>
   </el-dialog>
 </template>
@@ -141,6 +183,11 @@ const novelStore = useNovelStore()
 const router = useRouter()
 const createVisible = ref(false)
 const creating = ref(false)
+const importVisible = ref(false)
+const importing = ref(false)
+const importId = ref('')
+const importFile = ref(null)
+const importFileInput = ref(null)
 const exporting = ref(false)
 const backingUp = ref(false)
 const deleting = ref(false)
@@ -164,6 +211,8 @@ const CREATE_DRAFT_KEY = 'novel:create-draft'
 const FORM_FIELDS = ['id', 'title', 'chapter_count', 'words_per_chapter', 'genre', 'description']
 const THEME_REQUEST_FIELDS = ['inspiration', 'genre', 'direction', 'channel', 'protagonist_gender', 'length']
 let draftPaused = false
+let themeRequestPaused = false
+let themeRequestSequence = 0
 const AGENT_ROLES = [
   { env: 'PLANNER_MODEL', label: '规划', default: 'deepseek-reasoner' },
   { env: 'RESEARCHER_MODEL', label: '检索', default: 'deepseek-reasoner' },
@@ -187,8 +236,12 @@ function copyDraftFields(target, source, fields) {
 }
 
 function resetCreateDraftFields() {
+  themeRequestSequence += 1
+  themeLoading.value = false
+  themeRequestPaused = true
   Object.assign(form, defaultForm())
   Object.assign(themeRequest, defaultThemeRequest())
+  themeRequestPaused = false
   Object.assign(modelForm, emptyModelForm())
   themeOptions.value = []
   themeError.value = ''
@@ -212,7 +265,9 @@ function loadCreateDraft() {
 function restoreCreateDraft(draft) {
   if (!draft) return
   copyDraftFields(form, draft.form, FORM_FIELDS)
+  themeRequestPaused = true
   copyDraftFields(themeRequest, draft.themeRequest, THEME_REQUEST_FIELDS)
+  themeRequestPaused = false
   if (Array.isArray(draft.themeOptions)) themeOptions.value = draft.themeOptions
   copyDraftFields(modelForm, draft.modelForm, ['base_url', 'chat_model', 'reasoner_model'])
   if (draft.modelForm?.models && typeof draft.modelForm.models === 'object' && !Array.isArray(draft.modelForm.models)) {
@@ -232,6 +287,18 @@ function removeCreateDraft() {
     return
   }
 }
+
+watch(
+  () => ({ ...themeRequest }),
+  () => {
+    if (themeRequestPaused) return
+    themeRequestSequence += 1
+    themeLoading.value = false
+    themeOptions.value = []
+    themeError.value = ''
+  },
+  { deep: true, flush: 'sync' },
+)
 
 watch(
   () => ({
@@ -298,24 +365,29 @@ async function clearCreateDraft() {
 }
 
 async function generateThemes() {
-  if (themeLoading.value) return
+  if (themeLoading.value || creating.value) return
   if (!themeRequest.direction) {
     themeError.value = '请先选择创作方向'
     return
   }
+  const request = { ...themeRequest }
+  const requestSequence = ++themeRequestSequence
   themeLoading.value = true
   themeError.value = ''
   try {
-    const result = await api.generateNovelThemes({ ...themeRequest })
+    const result = await api.generateNovelThemes(request)
+    if (requestSequence !== themeRequestSequence) return
     themeOptions.value = result.options
   } catch (error) {
+    if (requestSequence !== themeRequestSequence) return
     themeError.value = error.response?.data?.detail || 'AI 构思失败，请稍后重试'
   } finally {
-    themeLoading.value = false
+    if (requestSequence === themeRequestSequence) themeLoading.value = false
   }
 }
 
 function applyTheme(option) {
+  if (creating.value || !themeOptions.value.includes(option)) return
   Object.assign(form, {
     id: option.id,
     title: option.title,
@@ -332,6 +404,55 @@ function onNovelChange(name) {
   const route = router.currentRoute.value
   if (route.meta?.requiresNovel !== false && route.params.name) router.replace({ name: route.name, params: { ...route.params, name } })
   else router.replace({ name: 'dashboard' })
+}
+
+function openImport() {
+  importId.value = ''
+  importFile.value = null
+  importVisible.value = true
+  nextTick(() => {
+    if (importFileInput.value) importFileInput.value.value = ''
+  })
+}
+
+function onImportFileChange(event) {
+  importFile.value = event.target.files?.[0] || null
+}
+
+async function submitImport() {
+  if (importing.value) return
+  const id = importId.value.trim()
+  const file = importFile.value
+  if (!/^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/.test(id)) {
+    ElMessage.warning('请输入有效的新小说 ID（仅小写字母、数字和连字符）')
+    return
+  }
+  if (!file) {
+    ElMessage.warning('请选择工作区备份 ZIP')
+    return
+  }
+  if (!/\.zip$/i.test(file.name)) {
+    ElMessage.warning('请选择 ZIP 格式的工作区备份')
+    return
+  }
+  if (file.size > 100 * 1024 * 1024) {
+    ElMessage.warning('工作区备份不能超过 100 MB')
+    return
+  }
+  importing.value = true
+  try {
+    const imported = await api.importNovelBackup(id, file)
+    const importedId = imported.id || id
+    await novelStore.reload(importedId)
+    importVisible.value = false
+    importFile.value = null
+    await router.push({ name: 'dashboard' })
+    ElMessage.success(`工作区备份已导入为“${importedId}”`)
+  } catch (error) {
+    ElMessage.error(error.response?.data?.detail || '工作区备份导入失败，请检查文件后重试')
+  } finally {
+    importing.value = false
+  }
 }
 
 async function exportCurrentNovel() {
@@ -410,17 +531,27 @@ async function submitCreate() {
   try {
     await createFormRef.value.validate()
     creating.value = true
+    themeRequestSequence += 1
+    themeLoading.value = false
+    const formSnapshot = { ...form }
+    const modelSnapshot = {
+      api_key: modelForm.api_key,
+      base_url: modelForm.base_url,
+      chat_model: modelForm.chat_model,
+      reasoner_model: modelForm.reasoner_model,
+      models: { ...modelForm.models },
+    }
     const quick = {}
-    if (modelForm.api_key) quick.api_key = modelForm.api_key
-    if (modelForm.base_url) quick.base_url = modelForm.base_url
-    if (modelForm.chat_model) quick.chat_model = modelForm.chat_model
-    if (modelForm.reasoner_model) quick.reasoner_model = modelForm.reasoner_model
+    if (modelSnapshot.api_key) quick.api_key = modelSnapshot.api_key
+    if (modelSnapshot.base_url) quick.base_url = modelSnapshot.base_url
+    if (modelSnapshot.chat_model) quick.chat_model = modelSnapshot.chat_model
+    if (modelSnapshot.reasoner_model) quick.reasoner_model = modelSnapshot.reasoner_model
     const models = {}
-    for (const [k, v] of Object.entries(modelForm.models)) if (v) models[k] = v
+    for (const [k, v] of Object.entries(modelSnapshot.models)) if (v) models[k] = v
     const model = (Object.keys(quick).length || Object.keys(models).length)
       ? { quick: Object.keys(quick).length ? quick : undefined, models: Object.keys(models).length ? models : undefined }
       : undefined
-    const created = await api.createNovel({ ...form, model })
+    const created = await api.createNovel({ ...formSnapshot, model })
     await novelStore.reload(created.id)
     removeCreateDraft()
     modelForm.api_key = ''
@@ -447,7 +578,7 @@ async function submitCreate() {
 .side-label { display: block; margin: 0 2px 7px; color: var(--muted); font-size: 12px; }
 .novel-actions { display: flex; gap: 8px; margin-top: 8px; }
 .novel-actions .el-button { flex: 1; margin-left: 0; }
-.create-side-button { width: 100%; margin-top: 8px; }
+.create-side-button, .import-side-button { width: 100%; margin-top: 8px; margin-left: 0; }
 .side :deep(.el-menu) { flex: 1; background: transparent; border-right: 0; padding: 4px 10px; }
 .side :deep(.el-menu-item) { height: 44px; margin: 3px 0; border-radius: 9px; color: #52606d; }
 .side :deep(.el-menu-item:hover) { background: #eef2f4; }
@@ -455,6 +586,10 @@ async function submitCreate() {
 .side-footer { padding: 16px 18px; color: #a0a9b2; font-size: 11px; border-top: 1px solid var(--border-light); }
 .workspace { min-width: 0; padding: 0; overflow-y: auto; background: var(--bg); }
 .app-alert { margin: 16px 24px 0; }
+.create-dialog-fields { min-width: 0; margin: 0; padding: 0; border: 0; }
+.import-form { margin-top: 18px; }
+.backup-file-input { display: block; width: 100%; color: var(--text); }
+.selected-backup { margin-top: 7px; color: var(--primary); font-size: 12px; overflow-wrap: anywhere; }
 .theme-generator { padding: 2px 0; }
 .theme-heading { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
 .theme-heading strong, .theme-heading span { display: block; }
@@ -495,7 +630,7 @@ async function submitCreate() {
   .novel-picker { display: grid; grid-template-columns: 1fr auto; gap: 8px; padding: 4px 12px 10px; }
   .novel-picker .side-label { grid-column: 1 / -1; margin-bottom: 0; }
   .novel-actions { grid-column: 1 / -1; margin-top: 0; }
-  .create-side-button { grid-column: 1 / -1; width: auto; margin-top: 0; }
+  .create-side-button, .import-side-button { grid-column: 1 / -1; width: auto; margin-top: 0; }
   .side :deep(.el-menu) { display: flex; overflow-x: auto; padding: 4px 8px 8px; }
   .side :deep(.el-menu-item) { flex: 0 0 auto; padding: 0 13px; }
   .side-footer { display: none; }

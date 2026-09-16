@@ -272,16 +272,18 @@ class NovelDB:
              violations, status))
         self.conn.commit()
 
-    def delete_style_hits(self, chapter):
+    def delete_style_hits(self, chapter, commit=True):
         self.conn.execute("DELETE FROM style_hits WHERE chapter=?", (chapter,))
-        self.conn.commit()
+        if commit:
+            self.conn.commit()
 
-    def add_style_hits(self, rows):
+    def add_style_hits(self, rows, commit=True):
         self.conn.executemany(
             "INSERT INTO style_hits(chapter,category,pattern,count) VALUES(?,?,?,?) "
             "ON CONFLICT(chapter,category,pattern) DO UPDATE SET count=excluded.count",
             rows)
-        self.conn.commit()
+        if commit:
+            self.conn.commit()
 
     def add_facts(self, chapter, facts: list, commit=True):
         n = 0
@@ -308,24 +310,37 @@ class NovelDB:
             self.conn.commit()
 
     def replace_chapter_derivatives(self, chapter: int, facts: list, states: dict,
-                                    summary: str, content_hash: str):
-        with self.conn:
-            self.conn.execute("DELETE FROM chapter_facts WHERE chapter=?", (chapter,))
-            self.conn.execute("DELETE FROM character_states WHERE chapter=?", (chapter,))
-            self.conn.execute("DELETE FROM chapter_summaries WHERE chapter=?", (chapter,))
-            self.add_facts(chapter, facts or [], commit=False)
-            for character, state in (states or {}).items():
-                self.add_character_state(chapter, character, state, commit=False)
-            self.conn.execute(
-                "INSERT INTO chapter_summaries(chapter,summary,content_hash) VALUES(?,?,?)",
-                (chapter, summary, content_hash),
-            )
+                                    summary: str, content_hash: str,
+                                    commit: bool = True):
+        self.conn.execute("DELETE FROM chapter_facts WHERE chapter=?", (chapter,))
+        self.conn.execute("DELETE FROM character_states WHERE chapter=?", (chapter,))
+        self.conn.execute("DELETE FROM chapter_summaries WHERE chapter=?", (chapter,))
+        self.add_facts(chapter, facts or [], commit=False)
+        for character, state in (states or {}).items():
+            self.add_character_state(chapter, character, state, commit=False)
+        self.conn.execute(
+            "INSERT INTO chapter_summaries(chapter,summary,content_hash) VALUES(?,?,?)",
+            (chapter, summary, content_hash),
+        )
+        if commit:
+            self.conn.commit()
 
-    def clear_chapter_derivatives(self, chapter: int):
+    def clear_chapter_derivatives(self, chapter: int, commit: bool = True):
+        self.conn.execute("DELETE FROM chapter_facts WHERE chapter=?", (chapter,))
+        self.conn.execute("DELETE FROM character_states WHERE chapter=?", (chapter,))
+        self.conn.execute("DELETE FROM chapter_summaries WHERE chapter=?", (chapter,))
+        if commit:
+            self.conn.commit()
+
+    def invalidate_from(self, chapter: int):
         with self.conn:
-            self.conn.execute("DELETE FROM chapter_facts WHERE chapter=?", (chapter,))
-            self.conn.execute("DELETE FROM character_states WHERE chapter=?", (chapter,))
-            self.conn.execute("DELETE FROM chapter_summaries WHERE chapter=?", (chapter,))
+            self.conn.execute("DELETE FROM chapter_facts WHERE chapter>=?", (chapter,))
+            self.conn.execute("DELETE FROM character_states WHERE chapter>=?", (chapter,))
+            self.conn.execute("DELETE FROM chapter_summaries WHERE chapter>=?", (chapter,))
+            self.conn.execute(
+                "UPDATE chapter_log SET status='knowledge_stale' WHERE chapter>=?",
+                (chapter,),
+            )
 
     def recent_summaries(self, before_chapter: int, limit: int = 10) -> list:
         rows = self.conn.execute(
@@ -335,21 +350,22 @@ class NovelDB:
         ).fetchall()
         return list(reversed(rows))
 
-    def upsert_character(self, name, profile: dict, chapter=None):
+    def upsert_character(self, name, profile: dict, chapter=None, commit=True):
         self.conn.execute(
             """INSERT INTO characters(name, role, voice_print, first_chapter, profile_json, updated_chapter)
                VALUES(?,?,?,?,?,?)
                ON CONFLICT(name) DO UPDATE SET
                  profile_json=excluded.profile_json,
-                 role=COALESCE(NULLIF(excluded.role,''), characters.role),
-                 voice_print=COALESCE(NULLIF(excluded.voice_print,''), characters.voice_print),
+                 role=excluded.role, voice_print=excluded.voice_print,
+                 first_chapter=excluded.first_chapter,
                  updated_chapter=COALESCE(excluded.updated_chapter, characters.updated_chapter)""",
             (name, profile.get("role", ""), profile.get("voice_print", ""),
              profile.get("first_appearance_chapter"),
              json.dumps(profile, ensure_ascii=False), chapter))
-        self.conn.commit()
+        if commit:
+            self.conn.commit()
 
-    def hint_foreshadow(self, fid, chapter, status=None):
+    def hint_foreshadow(self, fid, chapter, status=None, commit=True):
         row = self.conn.execute(
             "SELECT hinted_chs FROM foreshadowing WHERE id=?", (fid,)).fetchone()
         if not row:
@@ -361,24 +377,27 @@ class NovelDB:
             "UPDATE foreshadowing SET hinted_chs=?, status=COALESCE(?,status) WHERE id=?",
             (json.dumps(chs), status, fid),
         )
-        self.conn.commit()
+        if commit:
+            self.conn.commit()
         return cursor.rowcount
 
-    def resolve_foreshadow(self, fid, chapter):
+    def resolve_foreshadow(self, fid, chapter, commit=True):
         cursor = self.conn.execute(
             "UPDATE foreshadowing SET status='resolved', resolved_ch=? WHERE id=?",
             (chapter, fid))
-        self.conn.commit()
+        if commit:
+            self.conn.commit()
         return cursor.rowcount
 
-    def retire_foreshadow(self, fid, chapter):
+    def retire_foreshadow(self, fid, chapter, commit=True):
         cursor = self.conn.execute(
             "UPDATE foreshadowing SET status='retired', resolved_ch=? WHERE id=?",
             (chapter, fid))
-        self.conn.commit()
+        if commit:
+            self.conn.commit()
         return cursor.rowcount
 
-    def reschedule_foreshadow(self, fid, data: dict):
+    def reschedule_foreshadow(self, fid, data: dict, commit=True):
         cursor = self.conn.execute(
             """UPDATE foreshadowing SET payoff_ch=COALESCE(?,payoff_ch),
                    payoff_start_ch=COALESCE(?,payoff_start_ch),
@@ -387,10 +406,11 @@ class NovelDB:
             (data.get("intended_payoff_chapter"), data.get("payoff_start_chapter"),
              data.get("payoff_end_chapter"), data.get("touch_interval"), fid),
         )
-        self.conn.commit()
+        if commit:
+            self.conn.commit()
         return cursor.rowcount
 
-    def upsert_clue(self, cid, data: dict, chapter=None):
+    def upsert_clue(self, cid, data: dict, chapter=None, commit=True):
         state = data.get("state", data)
         self.conn.execute(
             """INSERT INTO clues(id,name,type,description,introduced_ch,
@@ -402,13 +422,14 @@ class NovelDB:
                  introduced_ch=excluded.introduced_ch,
                  intended_reveal_ch=excluded.intended_reveal_ch,
                  resolved=excluded.resolved, state_json=excluded.state_json,
-                 updated_ch=excluded.updated_ch""",
+                 updated_ch=COALESCE(excluded.updated_ch, clues.updated_ch)""",
             (cid, data.get("name", ""), data.get("type", ""),
              data.get("description", ""), data.get("introduced_chapter"),
              data.get("intended_reveal_chapter") or data.get("intended_resolution_chapter"),
              1 if data.get("resolved") else 0,
              json.dumps(state, ensure_ascii=False), chapter))
-        self.conn.commit()
+        if commit:
+            self.conn.commit()
 
     def update_clue(self, cid, state: dict, chapter):
         cursor = self.conn.execute(
@@ -418,7 +439,7 @@ class NovelDB:
         self.conn.commit()
         return cursor.rowcount
 
-    def upsert_foreshadow(self, fid, data: dict):
+    def upsert_foreshadow(self, fid, data: dict, commit=True):
         hinted = data.get("hinted_chapters")
         if hinted is None:
             introduced = data.get("introduced_chapter")
@@ -442,15 +463,16 @@ class NovelDB:
              json.dumps(hinted), data.get("scope"), data.get("importance"),
              data.get("touch_interval"), data.get("payoff_start_chapter"),
              data.get("payoff_end_chapter")))
-        self.conn.commit()
+        if commit:
+            self.conn.commit()
         return cursor.rowcount
 
-    def create_foreshadow(self, fid, data: dict):
+    def create_foreshadow(self, fid, data: dict, commit=True):
         if self.conn.execute(
             "SELECT 1 FROM foreshadowing WHERE id=?", (fid,)
         ).fetchone():
             return 0
-        return self.upsert_foreshadow(fid, data)
+        return self.upsert_foreshadow(fid, data, commit=commit)
 
     def add_lesson(self, chapter, issue, fix, source="user"):
         self.conn.execute(
