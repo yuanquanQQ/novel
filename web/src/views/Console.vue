@@ -183,6 +183,7 @@ let reconnectAttempts = 0
 let statusPollAttempts = 0
 const maxReconnectAttempts = 3
 const maxStatusPollAttempts = 10
+const LOG_TAIL_LIMIT = 200000  // 任务输出只保留尾部 200K 字符，防止长任务把页面渲染卡死
 const taskLabels = { outline: '生成大纲', titles: '提取章名', generate: '生成章节', summary: '卷末总结', revise: '修订章节', db: '知识库操作' }
 const terminalStatuses = new Set(['done', 'failed', 'error', 'orphaned', 'cancelled'])
 
@@ -334,10 +335,14 @@ function connectStream(id, name, seq, sessionSeq) {
       return
     }
     replayText += data
+    // 截断到尾部窗口：渲染成本与任务时长无关，避免长任务把主线程占满导致页面卡死
+    if (replayText.length > LOG_TAIL_LIMIT) replayText = replayText.slice(-LOG_TAIL_LIMIT)
     logText.value = replayText
     replayStarted = true
     if (data.startsWith('━━')) stepInfo.value.done = parseInt((data.match(/步骤 (\d+)\//) || [])[1] || '0', 10)
     nextTick(() => {
+      // 组件可能已卸载 / 任务已切换：必须再次核对会话，否则会在卸载后强制布局旧节点
+      if (source !== es || sessionSeq !== taskSessionSeq || !isCurrentContext(name, seq) || id !== currentTaskId.value) return
       const el = logBox.value
       if (!el) return
       const nearBottom = el.scrollTop + el.clientHeight >= el.scrollHeight - 40
