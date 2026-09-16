@@ -337,7 +337,12 @@ function connectStream(id, name, seq, sessionSeq) {
     logText.value = replayText
     replayStarted = true
     if (data.startsWith('━━')) stepInfo.value.done = parseInt((data.match(/步骤 (\d+)\//) || [])[1] || '0', 10)
-    nextTick(() => { if (logBox.value) logBox.value.scrollTop = logBox.value.scrollHeight })
+    nextTick(() => {
+      const el = logBox.value
+      if (!el) return
+      const nearBottom = el.scrollTop + el.clientHeight >= el.scrollHeight - 40
+      if (nearBottom) el.scrollTop = el.scrollHeight
+    })
   }
   source.onerror = () => {
     if (source !== es || sessionSeq !== taskSessionSeq || !isCurrentContext(name, seq)) return
