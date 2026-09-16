@@ -120,7 +120,7 @@ class ThemeGeneratorTests(unittest.TestCase):
         invalid_cases = []
         wrong_gender = _options()
         wrong_gender[0]["protagonist_gender"] = "女主角"
-        invalid_cases.append((wrong_gender, "第 1 个方案的主角类型与期望不符"))
+        invalid_cases.append((wrong_gender, "第 1 个方案的主角类型为“女主角”，期望“男主角”"))
         wrong_chapters = _options()
         wrong_chapters[0]["chapter_count"] = 199
         invalid_cases.append((wrong_chapters, "第 1 个方案的 chapter_count 必须是 200 到 400"))
@@ -196,8 +196,29 @@ class ThemeGeneratorTests(unittest.TestCase):
     def test_parser_rejects_mismatched_protagonist_gender(self):
         options = _options()
         options[0]["protagonist_gender"] = "女主角"
-        with self.assertRaisesRegex(ThemeGenerationError, "主角类型与期望不符"):
+        with self.assertRaisesRegex(ThemeGenerationError, "主角类型为.*期望"):
             parse_theme_response(json.dumps({"options": options}, ensure_ascii=False), "男主角", (200, 400))
+
+    def test_parser_normalizes_equivalent_gender_labels(self):
+        aliases = ["男主", "男性主角", "male", "Male Protagonist"]
+        for alias in aliases:
+            with self.subTest(alias=alias):
+                options = _options()
+                options[0]["protagonist_gender"] = alias
+                parsed = parse_theme_response(
+                    json.dumps({"options": options}, ensure_ascii=False),
+                    "男主角", (200, 400),
+                )
+                self.assertEqual(parsed[0]["protagonist_gender"], "男主角")
+
+    def test_unrestricted_gender_accepts_specific_valid_type(self):
+        options = _options()
+        options[0]["protagonist_gender"] = "女主"
+        parsed = parse_theme_response(
+            json.dumps({"options": options}, ensure_ascii=False),
+            "不限", (200, 400),
+        )
+        self.assertEqual(parsed[0]["protagonist_gender"], "女主角")
 
     def test_invalid_and_duplicate_ids_receive_unique_safe_fallbacks(self):
         options = _options()

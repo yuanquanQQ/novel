@@ -74,6 +74,20 @@ def _required_integer(option: dict, field: str, index: int, minimum: int, maximu
     return value
 
 
+def _normalize_gender(value: str) -> str:
+    compact = re.sub(r"[\s_\-（）()]+", "", value).casefold()
+    aliases = {
+        "男": "男主角", "男性": "男主角", "男主": "男主角", "男性主角": "男主角",
+        "male": "男主角", "malelead": "男主角", "maleprotagonist": "男主角",
+        "女": "女主角", "女性": "女主角", "女主": "女主角", "女性主角": "女主角",
+        "female": "女主角", "femaleprotagonist": "女主角",
+        "双主": "双主角", "双男主": "双主角", "双女主": "双主角", "双主人公": "双主角",
+        "dual": "双主角", "dualprotagonists": "双主角",
+        "不限": "不限", "任意": "不限", "不限制": "不限", "any": "不限",
+    }
+    return aliases.get(compact, value.strip())
+
+
 def _safe_id(raw_id: object, option: dict, index: int, used: set[str]) -> str:
     candidate = raw_id.strip() if isinstance(raw_id, str) else ""
     if _SLUG_RE.fullmatch(candidate) and candidate not in used:
@@ -125,11 +139,14 @@ def parse_theme_response(
             raise ThemeGenerationError(f"第 {index} 个方案字段不完整或包含未知字段")
         novel_id = _safe_id(option["id"], option, index, used_ids)
         used_ids.add(novel_id)
-        option_gender = _required_text(option, "protagonist_gender", index, 20)
+        raw_gender = _required_text(option, "protagonist_gender", index, 20)
+        option_gender = _normalize_gender(raw_gender)
         if expected_gender != "不限" and option_gender != expected_gender:
-            raise ThemeGenerationError(f"第 {index} 个方案的主角类型与期望不符，无法展示")
+            raise ThemeGenerationError(
+                f"第 {index} 个方案的主角类型为“{raw_gender}”，期望“{expected_gender}”"
+            )
         if option_gender not in PROTAGONIST_GENDERS:
-            raise ThemeGenerationError(f"第 {index} 个方案的主角类型无效，无法展示")
+            raise ThemeGenerationError(f"第 {index} 个方案的主角类型“{raw_gender}”无效")
         normalized.append({
             "title": _required_text(option, "title", index, 200),
             "id": novel_id,
@@ -140,7 +157,7 @@ def parse_theme_response(
             "theme": _required_text(option, "theme", index, 500),
             "conflict": _required_text(option, "conflict", index, 1000),
             "protagonist_name": _required_text(option, "protagonist_name", index, 100),
-            "protagonist_gender": _required_text(option, "protagonist_gender", index, 20),
+            "protagonist_gender": option_gender,
         })
     return normalized
 
@@ -165,6 +182,12 @@ def generate_themes(inspiration: str = "", genre: str = "", direction: str = "",
     api_key, base_url, model = _configuration(environ)
     inspiration = inspiration.strip()
     genre = genre.strip()
+    gender_instruction = (
+        f"三个方案的 protagonist_gender 都必须逐字填写“{protagonist_gender}”；"
+        "人物姓名、身份、经历和简介也必须与该主角类型一致。"
+        if protagonist_gender != "不限" else
+        "每个方案的 protagonist_gender 必须填写男主角、女主角或双主角之一，并与人物设定一致。"
+    )
     prompt = (
         "请为一部全新的中文长篇小说构思三个差异明显、可持续展开的方案。"
         "三个方案在主角目标、世界设定和核心矛盾上不得雷同。"
@@ -172,7 +195,8 @@ def generate_themes(inspiration: str = "", genre: str = "", direction: str = "",
         "每个对象必须且只能包含 title、id、genre、description、chapter_count、"
         "words_per_chapter、theme、conflict、protagonist_name、protagonist_gender。"
         "id 使用小写英文字母、数字和连字符，chapter_count 与 words_per_chapter 使用整数。"
-        f"\n频道：{channel}；目标主角类型：{protagonist_gender}"
+        f"\n频道：{channel}；目标主角类型：{protagonist_gender}。"
+        f"{gender_instruction}"
         f"\n篇幅：{length}，chapter_count 必须严格在 {chapter_range[0]} 到 {chapter_range[1]} 章之间。"
         "必须面向频道受众，围绕主角持续升级、明确爽点、势力成长与多卷结构设计，"
         "保证冲突和能力体系可持续推进，禁止只适合短篇或四十余章的收束。"
