@@ -303,6 +303,41 @@ class TestForeshadowProtocol(unittest.TestCase):
         self.assertEqual(plan["clue_operations"][0]["clue_id"], "F100")
         self.assertEqual(plan["clue_operations"][0]["introduced_chapter"], 4)
 
+    def test_planner_retries_with_contract_feedback_then_recovers(self):
+        """plant 缺 name/description 时重试，重试提示须携带伏笔操作契约。"""
+        planner = PlannerAgent.__new__(PlannerAgent)
+        broken = {"clue_operations": [{"clue_id": "F100", "action": "plant"}]}
+        good = {"clue_operations": [{
+            "clue_id": "F101", "action": "plant", "name": "空盒",
+            "description": "盒底有划痕", "method": "桌上",
+        }]}
+        prompts = []
+
+        def fake_llm(prompt):
+            prompts.append(prompt)
+            return broken if len(prompts) == 1 else good
+
+        with patch.object(planner, "_build_prompt", return_value="BASE"), patch.object(
+                planner, "_call_llm", side_effect=fake_llm):
+            plan = planner.run(2, "继续", {}, [])
+        self.assertEqual(len(prompts), 2)
+        self.assertIn("【伏笔操作契约】", prompts[1])
+        self.assertIn("plant F100 必须包含 name 和 description", prompts[1])
+        self.assertEqual(plan["clue_operations"][0]["clue_id"], "F101")
+        self.assertEqual(plan["clue_operations"][0]["introduced_chapter"], 2)
+
+    def test_planner_exhaustion_falls_back_to_lenient_and_survives(self):
+        """连续失败后降级宽容模式，丢弃非法伏笔操作而不整章崩溃。"""
+        planner = PlannerAgent.__new__(PlannerAgent)
+        broken = {"scene_outline": [{}],
+                  "clue_operations": [{"clue_id": "F100", "action": "plant"}]}
+        with patch.object(planner, "_build_prompt", return_value="BASE"), patch.object(
+                planner, "_call_llm", return_value=broken) as llm:
+            plan = planner.run(3, "继续", {}, [])
+        self.assertEqual(llm.call_count, 3)
+        self.assertEqual(plan["clue_operations"], [])
+        self.assertIn("scene_outline", plan)
+
     def test_archivist_plant_hint_reveal_keeps_json_and_db_aligned(self):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
