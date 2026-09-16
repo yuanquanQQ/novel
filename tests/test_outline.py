@@ -108,6 +108,44 @@ class TestOutlineValidator(unittest.TestCase):
         self.assertIn("缺失章号：1、2、3", calls[1])
         self.assertIn("上次输出", calls[1])
 
+    def test_retry_feedback_includes_corrective_example_for_missing_chapters(self):
+        """重试提示必须给出缺失章号的标准格式示范，而不只是错误清单。"""
+        bad = "\n".join([
+            "### 第1-3章：开端",
+            chapter_line(1),
+            "第2章 夜访：林夏进入仓库。",
+            "第3章 追踪：林夏循迹找到账册。",
+        ])
+        calls = []
+
+        def fake_chat(model, user_prompt):
+            calls.append(user_prompt)
+            return valid_part() if "上次输出" in user_prompt else bad
+
+        result = novel._generate_valid_outline_part(fake_chat, object(), "初始提示", 1, 3)
+        self.assertEqual(result, valid_part())
+        self.assertEqual(len(calls), 2)
+        retry_prompt = calls[1]
+        self.assertIn("缺失章节正确格式示范", retry_prompt)
+        self.assertIn("- **第2章 收束**", retry_prompt)
+        self.assertIn("- **第3章 收束**", retry_prompt)
+
+    def test_prompt_requires_exact_line_count_and_self_check(self):
+        volume = {
+            "name": "第二卷",
+            "chapters": (11, 20),
+            "core_emotion": "激荡",
+            "focus": "势力重组",
+        }
+        prompt = novel.build_outline_prompt(
+            "测试书", volume, {"master_bible": "世界观", "characters": {}, "clues": {}},
+            part_range=(11, 20), include_overview=False,
+        )
+        self.assertIn("恰好10行章节 bullet", prompt)
+        self.assertIn("禁止在末尾追加任何说明", prompt)
+        self.assertIn("【自检】逐行核对", prompt)
+        self.assertIn("第11至第20章必须全部出现", prompt)
+
     def test_invalid_final_result_does_not_overwrite_outline(self):
         with tempfile.TemporaryDirectory() as tmp:
             bible_dir = Path(tmp)
@@ -131,7 +169,7 @@ class TestOutlineValidator(unittest.TestCase):
             ) as chat:
                 with self.assertRaises(novel.OutlineValidationError):
                     novel.cmd_outline()
-            self.assertEqual(chat.call_count, 3)
+            self.assertEqual(chat.call_count, 5)
             self.assertEqual(outline_file.read_text(encoding="utf-8"), "原大纲")
 
     def test_1500_chapters_are_small_parts_and_resume(self):

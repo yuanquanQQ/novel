@@ -453,12 +453,13 @@ def build_outline_prompt(title: str, volume: dict, bible: dict, user_prompt: str
         "### 第N-M章：小节名\n"
         "- **第N章 章名**：核心剧情（明确谁做什么导致什么）。*功能：该章的结构功能；伏笔：引入 F001*\n\n"
         "【硬性规则】\n"
-        f"1. 必须且只能输出第{lo}章至第{hi}章，每个章号恰好出现一次，连续排列，禁止跳号、重复或越界。\n"
+        f"1. 必须且只能输出第{lo}章至第{hi}章，恰好{hi - lo + 1}行章节 bullet，每个章号恰好出现一次、连续升序，禁止跳号、重复或越界。\n"
         "2. 每章严格占一行，并严格使用模板中的顶层 bullet；章名2-6字；核心剧情必须明确谁做什么导致什么。\n"
         "3. 功能字段必填；伏笔字段只能写“引入 Fxxx”“推进 Fxxx”“回收 Fxxx”或“无”，Fxxx为三位数字编号。\n"
         "4. 小节标题范围必须与下方章节一致；当前分片通常就是一个8-12章小节。\n"
-        "5. 禁止在章节下添加二级 bullet 或任何补充行；禁止Markdown代码块；禁止额外标题。\n"
-        f"6. {overview_rule}{ending_rule}写完本片最后一章立即结束。"
+        "5. 禁止在章节下添加二级 bullet、Markdown代码块或额外标题；禁止在末尾追加任何说明、总结或未完待续文字，最后一行必须是第{hi}章。\n"
+        f"6. {overview_rule}{ending_rule}写完本片最后一章立即结束。\n"
+        f"【自检】逐行核对：每行只能是“### 第N-M章：小节名”或标准章节 bullet；第{lo}至第{hi}章必须全部出现、恰一次、按序连续；不得多出或缺少任何行。只要有一行不合规，本片即作废。"
     )
     if user_prompt:
         result += f"\n\n【用户要求】{user_prompt}"
@@ -583,29 +584,59 @@ def validate_outline_output(content: str, lo: int, hi: int,
     return list(dict.fromkeys(errors))
 
 
+def _outline_corrective_example(errors: list[str]) -> str:
+    """从校验错误中找出缺失章号，返回一个可直接照抄的格式示范。
+
+    模型常在长篇靠后的分片漏掉末尾章节，并把最后两行写成说明或残缺格式。
+    给出缺失章号的标准行模板，比只告诉它“缺失章号：149、150”更容易纠正。
+    """
+    missing: list[int] = []
+    for error in errors:
+        if error.startswith("缺失章号："):
+            missing = [int(number) for number in re.findall(r"\d+", error)]
+            break
+    if not missing:
+        return ""
+    sample_lines = []
+    for index, number in enumerate(missing[:2]):
+        if index == 0:
+            plot, function = "主角率盟友反攻并夺回关键物品，切断幕后势力退路。", "阶段收束并衔接下文"
+        else:
+            plot, function = "主角清点残局、收拢各方，为下一阶段冲突埋下引线。", "收束本阶段并为后续铺垫"
+        sample_lines.append(f"- **第{number}章 收束**：{plot}*功能：{function}；伏笔：无*")
+    sample = "\n".join(sample_lines)
+    return (
+        "\n\n【缺失章节正确格式示范】章名、剧情请换成贴合本片的2-6字与情节，"
+        "但行首“- **第X章 ”、行中“*功能：”与“；伏笔：无*”的标点格式必须完全一致：\n"
+        + sample
+    )
+
+
 def _generate_valid_outline_part(chat, model, initial_prompt: str, lo: int, hi: int,
                                  include_overview: bool = True,
                                  on_attempt=None) -> tuple[str, int] | str:
     prompt = initial_prompt
     last_errors = []
-    for attempt in range(1, 4):
+    for attempt in range(1, 6):
         if on_attempt:
             on_attempt(attempt)
         part = chat(model, user_prompt=prompt).strip()
         last_errors = validate_outline_output(part, lo, hi, include_overview)
         if not last_errors:
             return (part, attempt) if on_attempt else part
-        if attempt < 3:
+        if attempt < 5:
             feedback = "\n".join(f"- {error}" for error in last_errors)
             prompt = (
                 initial_prompt
                 + "\n\n【上次输出未通过格式校验】\n"
                 + feedback
+                + _outline_corrective_example(last_errors)
                 + "\n请修正全部问题并重新输出完整分片，不要解释。\n\n【上次输出】\n"
                 + part
             )
     raise OutlineValidationError(
-        f"第{lo}-{hi}章大纲连续3次格式不合格：" + "；".join(last_errors)
+        f"第{lo}-{hi}章大纲连续5次格式不合格：" + "；".join(last_errors)
+        + "。已完成的其他分片均已保存，重试本命令会自动跳过它们、只重新生成失败分片。"
     )
 
 
