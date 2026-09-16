@@ -86,12 +86,16 @@ class PlannerAgent:
 
         prompt = self._build_prompt(chapter_num, instruction, bible,
                                     lessons, locked_title)
+        known_clue_ids = set(
+            (bible.get("clues") or {}).get("active_foreshadowing", {}) or ()
+        )
         feedback = ""
         last_plan, last_error = {}, None
         for attempt in range(1, _PLANNER_MAX_ATTEMPTS + 1):
             plan_json = self._call_llm(prompt + feedback)
             try:
-                plan_json = self._validate_and_normalize(plan_json, chapter_num)
+                plan_json = self._validate_and_normalize(
+                    plan_json, chapter_num, known_clue_ids=known_clue_ids)
             except PlanValidationError as e:
                 last_plan, last_error = plan_json, e
                 log.warning(f"Planner — 第 {attempt} 次校验失败: {e}")
@@ -103,7 +107,8 @@ class PlannerAgent:
         # 重试耗尽：降级为宽容模式，丢弃非法伏笔操作而不是整章失败
         log.error(f"Planner — 连续 {_PLANNER_MAX_ATTEMPTS} 次校验不合格，"
                   f"降级宽容模式: {last_error}")
-        plan_json = self._validate_and_normalize(last_plan, chapter_num, lenient=True)
+        plan_json = self._validate_and_normalize(
+            last_plan, chapter_num, lenient=True, known_clue_ids=known_clue_ids)
         if locked_title:
             plan_json["chapter_title"] = locked_title
         return plan_json
@@ -121,6 +126,9 @@ class PlannerAgent:
             "或已存在的伏笔编号，并给出 method。\n"
             "- reschedule（调整回收计划）：clue_id 指向已有伏笔，并提供 intended_payoff_chapter "
             "或 payoff_start_chapter / payoff_end_chapter。\n"
+            "- 严禁虚构编号：hint / escalate / reveal / retire / reschedule 只能引用下方线索网络 "
+            "active_foreshadowing 中已列出的伏笔编号，或本章已 plant 的编号；"
+            "若线索网络中没有任何伏笔，则禁止这些操作，clue_operations 只能为空数组或仅含 plant。\n"
             "- 同一伏笔的同一 action 本章只能出现一次；action 只能是 "
             "plant|hint|escalate|reveal|reschedule|retire。"
         )
@@ -156,6 +164,9 @@ class PlannerAgent:
             "或已存在的伏笔编号，并给出 method。\n"
             "- reschedule（调整回收计划）：clue_id 指向已有伏笔，并提供 intended_payoff_chapter "
             "或 payoff_start_chapter / payoff_end_chapter。\n"
+            "- 严禁虚构编号：hint / escalate / reveal / retire / reschedule 只能引用下方线索网络 "
+            "active_foreshadowing 中已列出的伏笔编号，或本章已 plant 的编号；"
+            "若线索网络中没有任何伏笔，则禁止这些操作，clue_operations 只能为空数组或仅含 plant。\n"
             "- 同一伏笔的同一 action 本章只能出现一次；action 只能是 "
             "plant|hint|escalate|reveal|reschedule|retire。"
         )
@@ -237,7 +248,8 @@ class PlannerAgent:
         return ""
 
     def _validate_and_normalize(self, plan: dict, chapter_num: int,
-                                lenient: bool = False) -> dict:
+                                lenient: bool = False,
+                                known_clue_ids=None) -> dict:
         if not isinstance(plan, dict):
             plan = {}
         plan.setdefault("chapter_title", f"第 {chapter_num} 章")
@@ -250,6 +262,8 @@ class PlannerAgent:
                 raise PlanValidationError("clue_operations 必须是数组")
             log.warning("clue_operations 不是数组，宽容模式下忽略")
             raw_ops = []
+        known_clue_ids = set(known_clue_ids or ())
+        planted = set()
         normalized_ops = []
         seen = set()
         for index, raw in enumerate(raw_ops, 1):
@@ -262,6 +276,13 @@ class PlannerAgent:
             op = dict(raw)
             action = str(op.get("action", "")).strip().lower()
             fid = str(op.get("clue_id", op.get("id", ""))).strip()
+            # 语义校验：非 plant 操作必须引用已存在或本章已 plant 的伏笔，严禁虚构编号
+            if action != "plant" and fid not in known_clue_ids and fid not in planted:
+                message = f"{action} {fid} 指向未知伏笔（线索网络中没有该编号）"
+                if not lenient:
+                    raise PlanValidationError(message)
+                log.warning(f"第{index}个伏笔操作不合法，宽容模式下丢弃: {message}")
+                continue
             key = (action, fid)
             if key in seen:
                 if not lenient:
@@ -269,9 +290,16 @@ class PlannerAgent:
                 log.warning(f"重复伏笔操作，宽容模式下丢弃: {action} {fid}")
                 continue
             seen.add(key)
-            op["action"], op["clue_id"] = action, fid
             if action == "plant":
+                if fid in known_clue_ids or fid in planted:
+                    message = f"plant {fid} 重复：伏笔已存在"
+                    if not lenient:
+                        raise PlanValidationError(message)
+                    log.warning(f"第{index}个伏笔操作不合法，宽容模式下丢弃: {message}")
+                    continue
+                planted.add(fid)
                 op.setdefault("introduced_chapter", chapter_num)
+            op["action"], op["clue_id"] = action, fid
             normalized_ops.append(op)
         plan["clue_operations"] = normalized_ops
 

@@ -22,23 +22,32 @@ class ForeshadowingSteward:
         all_fs = bible.get("clues", {}).get("active_foreshadowing", {})
         known = set(all_fs)
         planted = set()
-        errors = []
-        for op in plan_json.get("clue_operations", []):
+        warnings = []
+        clean_ops = []
+        # 确定性协议检查：非法操作只丢弃并记警告，绝不中断整章生成。
+        # （plan 由模型生成，虚构伏笔编号/重复 plant 是常见的模型模糊，不该成为硬错误。）
+        for op in (plan_json.get("clue_operations") or []):
             fid = op.get("clue_id", "")
             action = op.get("action", "")
             if action == "plant":
                 if fid in known or fid in planted:
-                    errors.append(f"重复 plant 已存在伏笔 {fid}")
+                    warnings.append(f"重复 plant 已存在伏笔 {fid}，已忽略")
+                    continue
                 planted.add(fid)
             elif fid not in known and fid not in planted:
-                errors.append(f"{action} 指向未知伏笔 {fid}")
-        if errors:
-            raise ForeshadowingProtocolError("；".join(errors))
+                warnings.append(f"{action} 指向未知伏笔 {fid}，已忽略")
+                continue
+            clean_ops.append(op)
+        # 同步清掉非法操作，避免下游 archivist 再对虚构编号做伏笔归档
+        plan_json["clue_operations"] = clean_ops
 
         prompt = self._build_prompt(plan_json, chapter_num, bible)
         result = self._call_llm(prompt)
         if not isinstance(result, dict):
             result = {}
+        result["operation_warnings"] = warnings
+        if warnings:
+            log.warning(f"伏笔操作已清理: {warnings}")
         deterministic = {"overdue": [], "stale": []}
         for fid, item in all_fs.items():
             if item.get("status", "pending") in ("resolved", "retired"):

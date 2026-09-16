@@ -9,10 +9,7 @@ from unittest.mock import patch
 import novel
 from engine.agents.archivist import ArchivistAgent
 from engine.agents.dialogue_auditor import DialogueAuditor
-from engine.agents.foreshadowing_steward import (
-    ForeshadowingProtocolError,
-    ForeshadowingSteward,
-)
+from engine.agents.foreshadowing_steward import ForeshadowingSteward
 from engine.agents.keeper import KeeperAgent
 from engine.agents.planner import PlannerAgent
 from engine.agents.reader_proxy import ReaderProxy
@@ -262,19 +259,24 @@ class TestSceneQualityGate(unittest.TestCase):
 
 
 class TestForeshadowProtocol(unittest.TestCase):
-    def test_unknown_and_duplicate_plant_block_before_llm(self):
+    def test_invalid_operations_dropped_with_warnings_not_raising(self):
+        """未知伏笔引用与重复 plant 只丢弃并记警告，不再中断整章生成。"""
         steward = ForeshadowingSteward.__new__(ForeshadowingSteward)
         bible = {"clues": {"active_foreshadowing": {"F001": {}}}}
-        with patch.object(steward, "_call_llm") as call:
-            with self.assertRaises(ForeshadowingProtocolError):
-                steward.audit({"clue_operations": [
-                    {"clue_id": "F404", "action": "reveal"}
-                ]}, 3, bible)
-            with self.assertRaises(ForeshadowingProtocolError):
-                steward.audit({"clue_operations": [
-                    {"clue_id": "F001", "action": "plant"}
-                ]}, 3, bible)
-            call.assert_not_called()
+        with patch.object(steward, "_build_prompt", return_value="prompt"), \
+                patch.object(steward, "_call_llm", return_value={}) as call:
+            plan = {"clue_operations": [
+                {"clue_id": "F404", "action": "reveal"},
+                {"clue_id": "F001", "action": "plant"},
+                {"clue_id": "F001", "action": "hint", "method": "再次出现"},
+            ]}
+            result = steward.audit(plan, 3, bible)
+        self.assertEqual(call.call_count, 1)
+        # F404 reveal 指向未知伏笔、F001 重复 plant 都被丢弃；合法 hint 保留
+        self.assertEqual(plan["clue_operations"], [
+            {"clue_id": "F001", "action": "hint", "method": "再次出现"},
+        ])
+        self.assertEqual(len(result["operation_warnings"]), 2)
 
     def test_stale_reminder_uses_individual_interval(self):
         steward = ForeshadowingSteward.__new__(ForeshadowingSteward)
@@ -334,6 +336,38 @@ class TestForeshadowProtocol(unittest.TestCase):
         with patch.object(planner, "_build_prompt", return_value="BASE"), patch.object(
                 planner, "_call_llm", return_value=broken) as llm:
             plan = planner.run(3, "继续", {}, [])
+        self.assertEqual(llm.call_count, 3)
+        self.assertEqual(plan["clue_operations"], [])
+        self.assertIn("scene_outline", plan)
+
+    def test_planner_retries_when_hint_targets_unknown_clue(self):
+        """hint 指向线索网络中不存在的编号时重试，重试提示须携带该错误。"""
+        planner = PlannerAgent.__new__(PlannerAgent)
+        bible = {"clues": {"active_foreshadowing": {"F001": {}}}}
+        bad = {"clue_operations": [{"clue_id": "F002", "action": "hint", "method": "桌上"}]}
+        good = {"clue_operations": [{"clue_id": "F001", "action": "hint", "method": "桌上"}]}
+        prompts = []
+
+        def fake_llm(prompt):
+            prompts.append(prompt)
+            return bad if len(prompts) == 1 else good
+
+        with patch.object(planner, "_build_prompt", return_value="BASE"), patch.object(
+                planner, "_call_llm", side_effect=fake_llm):
+            plan = planner.run(1, "继续", bible, [])
+        self.assertEqual(len(prompts), 2)
+        self.assertIn("F002 指向未知伏笔", prompts[1])
+        self.assertEqual(plan["clue_operations"][0]["clue_id"], "F001")
+
+    def test_planner_lenient_drops_hint_to_unknown_clue_when_bible_empty(self):
+        """线索网络为空时，模型虚构 hint 编号连续失败后宽容丢弃，正文照常生成。"""
+        planner = PlannerAgent.__new__(PlannerAgent)
+        bible = {"clues": {"active_foreshadowing": {}}}
+        bad = {"scene_outline": [{}],
+               "clue_operations": [{"clue_id": "F002", "action": "hint", "method": "桌上"}]}
+        with patch.object(planner, "_build_prompt", return_value="BASE"), patch.object(
+                planner, "_call_llm", return_value=bad) as llm:
+            plan = planner.run(1, "继续", bible, [])
         self.assertEqual(llm.call_count, 3)
         self.assertEqual(plan["clue_operations"], [])
         self.assertIn("scene_outline", plan)
