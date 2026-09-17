@@ -101,6 +101,21 @@ class TestExpandAndSanitize(ModelConfigTestCase):
         self.assertEqual(out["THEME_MODEL"], "gpt-lite")
         self.assertEqual(out["HEAVY_REVIEWER_MODEL"], "r1")
 
+    def test_story_keeper_model_is_globally_wired(self):
+        # 白名单接受 story_keeper_model（attr 名与 env 名均可）
+        out = model_config.sanitize_input({"story_keeper_model": "m-keeper"})
+        self.assertEqual(out, {"STORY_KEEPER_MODEL": "m-keeper"})
+        self.assertEqual(
+            model_config.sanitize_input({"STORY_KEEPER_MODEL": "m-keeper"}),
+            {"STORY_KEEPER_MODEL": "m-keeper"},
+        )
+        # 快速配置「chat 模型」一键覆盖包含 story_keeper（它默认走 deepseek-chat 档）
+        quick = model_config.expand_quick({"chat_model": "gpt-lite"})
+        self.assertEqual(quick["STORY_KEEPER_MODEL"], "gpt-lite")
+        # AGENT_ROLES 暴露给前端页面
+        attrs = [r["attr"] for r in model_config.AGENT_ROLES]
+        self.assertIn("story_keeper_model", attrs)
+
     def test_sanitize_accepts_attr_and_env_keys_rejects_unknown(self):
         out = model_config.sanitize_input({"writer_model": "a", "PLANNER_MODEL": "b"})
         self.assertEqual(out, {"WRITER_MODEL": "a", "PLANNER_MODEL": "b"})

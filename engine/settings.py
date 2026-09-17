@@ -63,6 +63,7 @@ def load_config(name: str):
     for attr in (
         "planner_model", "researcher_model", "writer_model", "immediate_reviewer_model",
         "heavy_reviewer_model", "keeper_model", "archivist_model",
+        "story_keeper_model",
         "foreshadowing_steward_model", "reader_proxy_model", "marketer_model",
     ):
         key = attr.upper()

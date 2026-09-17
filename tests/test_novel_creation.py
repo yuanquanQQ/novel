@@ -234,5 +234,51 @@ class TestNovelCreationAPI(unittest.TestCase):
         self.assertEqual(novel_creator._volume_config(3)["volume_1"]["chapters"], (1, 3))
 
 
+class TestPromptsFactoryFallback(unittest.TestCase):
+    """出厂模板兜底：老书的 novel_prompts.json 缺新 Agent 提示词时自动补齐，不覆盖定制内容。"""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.novels_dir = Path(self._tmp.name) / "novels"
+        self.novels_dir.mkdir()
+        self._settings_dir = settings.NOVELS_DIR
+        settings.NOVELS_DIR = self.novels_dir
+        self._current = settings._current_novel
+        settings._current_novel = None
+        import engine.prompts_loader as prompts_loader
+        self.pl = prompts_loader
+        prompts_loader.reload()
+
+    def tearDown(self):
+        settings.NOVELS_DIR = self._settings_dir
+        settings._current_novel = self._current
+        self.pl.reload()
+        self._tmp.cleanup()
+
+    def _make_old_novel(self):
+        d = self.novels_dir / "old-book"
+        d.mkdir()
+        (d / "novel_prompts.json").write_text(json.dumps({
+            "_meta": {"novel": "旧书", "genre": "都市", "description": "老书"},
+            "writer": {"system": "CUSTOM_WRITER_SYSTEM", "chapter_template": ""},
+        }, ensure_ascii=False), encoding="utf-8")
+        (d / "config.py").write_text("# stub", encoding="utf-8")
+        return d
+
+    def test_missing_agent_prompts_filled_from_factory_without_overwriting(self):
+        self._make_old_novel()
+        settings.set_novel("old-book")
+        # 老书没有 story_keeper / story_check → 出厂模板自动补齐
+        system, _ = self.pl.get_prompt("story_keeper")
+        self.assertIn("故事管理员", system)
+        sys2, _ = self.pl.get_prompt("story_check")
+        self.assertIn("故事逻辑审稿人", sys2)
+        # 已定制的 writer 提示词不被覆盖
+        wsys, _ = self.pl.get_prompt("writer")
+        self.assertEqual(wsys, "CUSTOM_WRITER_SYSTEM")
+        # 常规 key 不受影响
+        self.assertTrue(self.pl.get_prompt("planner")[0])
+
+
 if __name__ == "__main__":
     unittest.main()

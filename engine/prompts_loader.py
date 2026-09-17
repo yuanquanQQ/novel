@@ -17,8 +17,31 @@ def _init():
         _novel_dir = get_novel_dir()
     if _cache is None:
         fp = _novel_dir / "novel_prompts.json"
-        _cache = json.loads(fp.read_text(encoding="utf-8"))
+        loaded = json.loads(fp.read_text(encoding="utf-8"))
+        _cache = _fill_factory_missing(loaded)
     return _cache
+
+
+def _fill_factory_missing(loaded: dict) -> dict:
+    """出厂模板兜底：把本小说 novel_prompts.json 缺失的 prompt key 补上。
+
+    只补「缺失」的 key，绝不覆盖小说已定制的内容——这样老书也能自动获得
+    新增 Agent（如 story_keeper / story_check）的提示词，全局一致。
+    """
+    meta = loaded.get("_meta") or {}
+    if not isinstance(meta, dict) or not meta:
+        return loaded
+    try:
+        from engine.novel_creator import _prompts
+        factory = _prompts(meta.get("novel", ""), meta.get("genre", ""),
+                           meta.get("description", ""))
+    except Exception:
+        return loaded
+    merged = dict(loaded)
+    for key, value in factory.items():
+        if key not in merged:
+            merged[key] = value
+    return merged
 
 
 def _style_file(fname: str) -> str:

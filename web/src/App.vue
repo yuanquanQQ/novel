@@ -222,6 +222,7 @@ const AGENT_ROLES = [
   { env: 'HEAVY_REVIEWER_MODEL', label: '重审', default: 'deepseek-reasoner' },
   { env: 'KEEPER_MODEL', label: '记忆', default: 'deepseek-chat' },
   { env: 'ARCHIVIST_MODEL', label: '归档', default: 'deepseek-chat' },
+  { env: 'STORY_KEEPER_MODEL', label: '故事', default: 'deepseek-chat' },
   { env: 'FORESHADOWING_STEWARD_MODEL', label: '伏笔', default: 'deepseek-reasoner' },
   { env: 'READER_PROXY_MODEL', label: '读者', default: 'deepseek-chat' },
   { env: 'MARKETER_MODEL', label: '宣传', default: 'deepseek-chat' },

@@ -27,6 +27,7 @@ AGENT_ROLES = [
     {"attr": "heavy_reviewer_model", "env": "HEAVY_REVIEWER_MODEL", "label": "Reviewer · 重型审阅", "default": "deepseek-reasoner"},
     {"attr": "keeper_model", "env": "KEEPER_MODEL", "label": "Keeper · 记忆压缩", "default": "deepseek-chat"},
     {"attr": "archivist_model", "env": "ARCHIVIST_MODEL", "label": "Archivist · 归档提取", "default": "deepseek-chat"},
+    {"attr": "story_keeper_model", "env": "STORY_KEEPER_MODEL", "label": "Story Keeper · 故事状态", "default": "deepseek-chat"},
     {"attr": "foreshadowing_steward_model", "env": "FORESHADOWING_STEWARD_MODEL", "label": "Steward · 伏笔管家", "default": "deepseek-reasoner"},
     {"attr": "reader_proxy_model", "env": "READER_PROXY_MODEL", "label": "Reader · 读者模拟", "default": "deepseek-chat"},
     {"attr": "marketer_model", "env": "MARKETER_MODEL", "label": "Marketer · 宣传文案", "default": "deepseek-chat"},
@@ -42,7 +43,7 @@ MODEL_CONFIG_DEFAULTS = {
 }
 QUICK_CHAT_TARGETS = [
     ENV_THEME_MODEL, "WRITER_MODEL", "IMMEDIATE_REVIEWER_MODEL", "KEEPER_MODEL",
-    "ARCHIVIST_MODEL", "READER_PROXY_MODEL", "MARKETER_MODEL",
+    "ARCHIVIST_MODEL", "STORY_KEEPER_MODEL", "READER_PROXY_MODEL", "MARKETER_MODEL",
 ]
 QUICK_REASONER_TARGETS = [
     "PLANNER_MODEL", "RESEARCHER_MODEL", "HEAVY_REVIEWER_MODEL",
