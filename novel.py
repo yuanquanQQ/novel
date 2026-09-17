@@ -1111,6 +1111,7 @@ def cmd_generate(chapter_num: int, instruction: str = "", overwrite: bool = Fals
         story_state = load_bare_state(config.bible_dir)
         context_pack["story_state_text"] = planner_context(story_state, chapter_num)
         context_pack["story_continuity_warnings"] = writer_warnings(story_state, chapter_num)
+        context_pack["_story_state"] = story_state  # 供 story_check 故事逻辑闸门做结构化对账
         if context_pack["story_continuity_warnings"]:
             log.info(f"StoryKeeper 注入本章 {len(context_pack['story_continuity_warnings'])} 字故事状态约束")
     except Exception as e:
@@ -1139,10 +1140,18 @@ def cmd_generate(chapter_num: int, instruction: str = "", overwrite: bool = Fals
             audit = auditor.audit(
                 draft, context_pack, scene.get("type", "high_conflict"),
             )
+            # 故事逻辑闸门：草稿是否与既有跨章事实矛盾、是否无视承诺/钩子/开放问题
+            from engine.agents.story_keeper import story_check
+            story_result = story_check(
+                context_pack.get("_story_state") or {},
+                chapter_num, scene, draft, keeper_cache,
+            )
+            story_passed = story_result.get("passed", False) is True
             accepted = (
                 scan_result.passed
                 and review.get("passed", False) is True
                 and audit.get("passed", False) is True
+                and story_passed
             )
             diagnostics = {
                 "attempt": attempt + 1,
@@ -1152,6 +1161,8 @@ def cmd_generate(chapter_num: int, instruction: str = "", overwrite: bool = Fals
                 "review": review,
                 "dialogue_passed": audit.get("passed", False) is True,
                 "dialogue_audit": audit,
+                "story_passed": story_passed,
+                "story_check": story_result,
             }
             # 记录闸门总分最接近通过的一稿，供重试耗尽时降级接受
             score = (
@@ -1161,6 +1172,8 @@ def cmd_generate(chapter_num: int, instruction: str = "", overwrite: bool = Fals
                 + len(review.get("errors", []) or [])
                 + (10 if audit.get("passed", False) is not True else 0)
                 + len(audit.get("violations", []) or [])
+                + (10 if not story_passed else 0)
+                + len(story_result.get("errors", []) or [])
             )
             if best_score is None or score <= best_score:
                 best_score = score
@@ -1172,6 +1185,7 @@ def cmd_generate(chapter_num: int, instruction: str = "", overwrite: bool = Fals
                 scan_result.to_suggestions(),
                 review.get("suggestions", ""),
                 audit.get("suggestions", ""),
+                story_result.get("suggestions", ""),
             ]
             feedback_map[sid] = "；".join(item for item in suggestions if item)
             log.warning(
@@ -1255,6 +1269,15 @@ def cmd_generate(chapter_num: int, instruction: str = "", overwrite: bool = Fals
         log.info(f"StoryKeeper 已更新第 {chapter_num} 章故事状态")
     except Exception as e:
         log.warning(f"StoryKeeper 状态更新失败: {e}")
+
+    # 章节级大纲追认（非致命）：实际写出的摘要写进 actual_timeline.md，planner 以实际为准
+    try:
+        from engine.agents.story_keeper import record_actual_events
+        entry = record_actual_events(config, chapter_num, plan_json, keeper_cache)
+        if entry:
+            log.info(f"实际轨迹已记录: {entry[:60]}...")
+    except Exception as e:
+        log.warning(f"实际轨迹记录失败: {e}")
 
     keeper.save_cache(chapter_num, keeper_cache)
 

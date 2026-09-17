@@ -17,7 +17,7 @@ from engine.agents.researcher import ResearcherAgent
 from engine.agents.reviewers import ReviewerAgent
 from engine.agents.story_keeper import (
     StoryKeeperAgent, _empty_state, append_volume_revisions, planner_context,
-    writer_warnings,
+    record_actual_events, story_check, writer_warnings,
 )
 from engine.agents.writer import WriterAgent
 from engine.db import NovelDB
@@ -38,7 +38,7 @@ class TestSceneQualityGate(unittest.TestCase):
     def tearDown(self):
         self._tmp.cleanup()
 
-    def _patches(self, drafts, scans, reviews, audits):
+    def _patches(self, drafts, scans, reviews, audits, story_checks=None):
         plan = {
             "chapter_title": "测试章",
             "scene_outline": [{"scene_id": 1, "type": "breathable"}],
@@ -90,6 +90,17 @@ class TestSceneQualityGate(unittest.TestCase):
             patch.object(StoryKeeperAgent, "load_state", return_value=_empty_state()),
             patch.object(StoryKeeperAgent, "update_state", return_value=_empty_state()),
         ])
+        # 故事逻辑闸门：默认全程放行；传入 side_effect 可测“故事逻辑不过→重试”
+        if story_checks is None:
+            patches.append(patch(
+                "engine.agents.story_keeper.story_check",
+                return_value={"passed": True, "errors": [], "suggestions": ""},
+            ))
+        else:
+            patches.append(patch(
+                "engine.agents.story_keeper.story_check",
+                side_effect=story_checks,
+            ))
         return patches
 
     def test_gate_accepts_only_when_all_three_pass_and_styles_are_final_only(self):
@@ -138,6 +149,31 @@ class TestSceneQualityGate(unittest.TestCase):
         failed_file = self.config.cache_dir / "failed_drafts" / "chapter_01_scene_1.md"
         self.assertEqual(failed_file.read_text(encoding="utf-8"), "失败二")
         self.assertTrue(failed_file.with_suffix(".json").exists())
+
+    def test_gate_retries_when_story_logic_fails(self):
+        # 风格/语义/声纹全过，但故事逻辑闸门第一轮判违规（事实矛盾）→ 携建议重试，二轮通过
+        passed = ScanResult()
+        story_fail = {
+            "passed": False,
+            "errors": [{"type": "事实矛盾", "paragraph": "他在星港", "suggestion": "补过渡"}],
+            "suggestions": "事实矛盾：角色位置与前文冲突，补充转移过渡。",
+        }
+        story_ok = {"passed": True, "errors": [], "suggestions": ""}
+        patches = self._patches(
+            ["矛盾稿", "修订稿"], [passed, passed, passed],
+            [{"passed": True}, {"passed": True}],
+            [{"passed": True}, {"passed": True}],
+            story_checks=[story_fail, story_ok],
+        )
+        with ExitStack() as stack:
+            for item in patches:
+                stack.enter_context(item)
+            novel.cmd_generate(1)
+        # 二轮通过 → 正文是修订稿
+        self.assertEqual(
+            (self.config.generated_dir / "chapter_01.md").read_text(encoding="utf-8"),
+            "修订稿",
+        )
 
     def test_merged_chapter_failure_does_not_publish(self):
         passed = ScanResult()
@@ -615,6 +651,75 @@ class TestStoryKeeper(unittest.TestCase):
         (self.bible / "clues.json").write_text("{bad json", encoding="utf-8")
         state2 = sk.update_state(self.bible, 2, plan, {}, "正文")
         self.assertEqual(state2["unresolved_promises"], {})
+
+    def test_record_actual_events_appends_and_dedupes(self):
+        sk_config = SimpleNamespace(bible_dir=self.bible)
+        fake = SimpleNamespace(close=lambda: None)
+        fake.conn = SimpleNamespace(execute=lambda *_: SimpleNamespace(fetchone=lambda: {"summary": "沈渊启动奇点炉"}))
+        with patch("engine.settings.get_novel_dir", return_value=self.root), \
+             patch("engine.db.NovelDB", return_value=fake):
+            entry = record_actual_events(sk_config, 1, {"chapter_title": "废铁场"}, {})
+        self.assertIn("第1章", entry)
+        fp = self.bible / "actual_timeline.md"
+        self.assertIn("沈渊启动奇点炉", fp.read_text(encoding="utf-8"))
+        # 同章重写原位替换，不产生重复条目
+        fake2 = SimpleNamespace(close=lambda: None)
+        fake2.conn = SimpleNamespace(execute=lambda *_: SimpleNamespace(fetchone=lambda: {"summary": "改写版摘要"}))
+        with patch("engine.settings.get_novel_dir", return_value=self.root), \
+             patch("engine.db.NovelDB", return_value=fake2):
+            record_actual_events(sk_config, 1, {"chapter_title": "废铁场"}, {})
+        text = fp.read_text(encoding="utf-8")
+        self.assertEqual(text.count("- 第1章"), 1)
+        self.assertIn("改写版摘要", text)
+        # DB 不可用 → 仍写占位，不抛异常
+        with patch("engine.db.NovelDB", side_effect=RuntimeError("no novel")), \
+             patch("engine.settings.get_novel_dir", side_effect=RuntimeError("no novel")):
+            record_actual_events(sk_config, 2, {"chapter_title": "第二章"}, {})
+        self.assertIn("第2章", fp.read_text(encoding="utf-8"))
+
+    def test_story_check_passes_on_valid_draft_and_builds_prompt(self):
+        state = {
+            "facts": {"沈渊": {"位置": {"value": "零号废墟", "chapters": [1]}}},
+            "open_questions": [{"id": "Q00201", "text": "奇点炉为何认主", "status": "open"}],
+            "unresolved_promises": {"F001": {"name": "联邦密探", "status": "pending"}},
+            "continuity_warnings": [],
+            "hook_log": [{"chapter": 2, "light": "红色警报亮起", "dark": "", "carried_into": 3}],
+        }
+        calls = {}
+        def fake_chat(mc, **kw):
+            calls["prompt"] = kw["user_prompt"]
+            return {"passed": True, "errors": [], "suggestions": ""}
+        with patch("engine.agents.story_keeper.config",
+                   SimpleNamespace(story_keeper_model=object(), writer_model=object())), \
+             patch("engine.prompts_loader.get_prompt", return_value=("sys {facts} {open_questions} {promises} {hook} {draft}", "")), \
+             patch("engine.llm_client.chat_json", side_effect=fake_chat):
+            result = story_check(state, 3, {"scene_id": 1}, "沈渊修理零件", {})
+        self.assertTrue(result["passed"])
+        p = calls["prompt"]
+        self.assertIn("零号废墟", p)
+        self.assertIn("奇点炉为何认主", p)
+        self.assertIn("联邦密探", p)
+        self.assertIn("红色警报亮起", p)
+        self.assertIn("沈渊修理零件", p)
+        # 草稿与前文事实矛盾 → 模型判违规，闸门不通过
+        with patch("engine.agents.story_keeper.config",
+                   SimpleNamespace(story_keeper_model=object(), writer_model=object())), \
+             patch("engine.prompts_loader.get_prompt", return_value=("sys", "")), \
+             patch("engine.llm_client.chat_json", return_value={
+                 "passed": False,
+                 "errors": [{"type": "事实矛盾", "paragraph": "沈渊在星港", "suggestion": "补过渡"}],
+                 "suggestions": "位置矛盾，补充转移过渡。",
+             }):
+            bad = story_check(state, 3, {"scene_id": 1}, "沈渊在星港码头谈生意", {})
+        self.assertFalse(bad["passed"])
+        self.assertEqual(bad["errors"][0]["type"], "事实矛盾")
+
+    def test_story_check_fails_open_on_any_error(self):
+        # 无小说上下文（get_prompt 抛错）→ 放行，绝不阻断
+        with patch("engine.prompts_loader.get_prompt", side_effect=RuntimeError("未设置小说")):
+            result = story_check({}, 1, {"scene_id": 1}, "草稿", {})
+        self.assertTrue(result["passed"])
+        self.assertEqual(result["errors"], [])
 
     def test_append_volume_revisions_writes_and_returns_block(self):
         sk_config = SimpleNamespace(

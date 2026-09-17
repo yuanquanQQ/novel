@@ -316,6 +316,101 @@ def writer_warnings(state: dict, chapter_num: int) -> str:
     return "\n".join(parts)
 
 
+def story_check(state: dict, chapter_num: int, scene: dict,
+                draft: str, keeper_cache: dict) -> dict:
+    """故事逻辑闸门：草稿是否与既有跨章事实矛盾、是否无视必须响应的承诺/钩子/开放问题。
+
+    与风格扫描、语义审、声纹审计并列的一道 LLM 闸门。fail-open：
+    任何异常（无小说上下文、无模型、网络失败）都放行，绝不阻断生成。
+    """
+    state = state or {}
+    try:
+        from engine.llm_client import chat_json
+        from engine.prompts_loader import get_prompt
+        system, _ = get_prompt("story_check")
+        facts = state.get("facts", {})
+        fact_lines = []
+        for entity, attrs in list(facts.items())[:30]:
+            for attr, v in list(attrs.items())[:5]:
+                chapters = v.get("chapters", [])
+                fact_lines.append(
+                    f"- {entity}·{attr}：{v.get('value', '')}（第{','.join(map(str, chapters))}章）"
+                )
+        open_qs = [q.get("text", "") for q in state.get("open_questions", [])
+                   if q.get("status") == "open"][-5:]
+        pending = [p.get("name", "") for p in state.get("unresolved_promises", {}).values()
+                   if p.get("status") != "resolved"][-5:]
+        hook = ""
+        if state.get("hook_log"):
+            last = state["hook_log"][-1]
+            if last.get("chapter") == chapter_num - 1:
+                hook = f"{last.get('light') or ''}；{last.get('dark') or ''}".strip("；")
+        running = (keeper_cache or {}).get("running_context", "")
+        model = getattr(config, "story_keeper_model", None) or getattr(config, "writer_model", None)
+        # 提示词含 JSON 示例字面花括号，用占位符替换而非 str.format
+        prompt = (
+            system
+            .replace("{chapter_num}", str(chapter_num))
+            .replace("{facts}", "\n".join(fact_lines) or "（暂无跨章事实）")
+            .replace("{open_questions}", "\n".join(f"- {q}" for q in open_qs) or "（无）")
+            .replace("{promises}", "\n".join(f"- {p}" for p in pending) or "（无）")
+            .replace("{hook}", hook or "（无）")
+            .replace("{running_context}", running or "（无）")
+            .replace("{scene_plan}", json.dumps(scene, ensure_ascii=False, indent=2))
+            .replace("{draft}", draft)
+        )
+        result = chat_json(model, user_prompt=prompt)
+        if isinstance(result, dict):
+            return {
+                "passed": result.get("passed", False) is True,
+                "errors": result.get("errors", []) or [],
+                "suggestions": result.get("suggestions", ""),
+            }
+        return {"passed": True, "errors": [], "suggestions": ""}
+    except Exception as exc:
+        log.warning(f"StoryKeeper 故事逻辑闸门不可用，放行: {exc}")
+        return {"passed": True, "errors": [], "suggestions": ""}
+
+
+def record_actual_events(config, chapter_num: int, plan_json: dict,
+                         keeper_cache: dict) -> str:
+    """章节级大纲追认：把 archivist 已归档的本章摘要追加进 bible/actual_timeline.md。
+
+    planner 每章读取该轨迹，「已写章节以实际为准，大纲为原计划」——大纲随实际演化。
+    非致命：DB 不可用或无摘要时跳过。
+    """
+    try:
+        from engine.db import NovelDB
+        from engine.settings import get_novel_dir
+        db = NovelDB(get_novel_dir())
+        try:
+            row = db.conn.execute(
+                "SELECT summary FROM chapter_summaries WHERE chapter=?",
+                (chapter_num,),
+            ).fetchone()
+        finally:
+            db.close()
+        summary = (row["summary"] if row else "").strip() or "（无归档摘要）"
+    except Exception as exc:
+        log.warning(f"实际轨迹摘要读取失败: {exc}")
+        summary = "（无归档摘要）"
+    title = (plan_json or {}).get("chapter_title") or f"第{chapter_num}章"
+    entry = f"- 第{chapter_num}章《{title}》：{summary}"
+    fp = Path(config.bible_dir) / "actual_timeline.md"
+    try:
+        fp.parent.mkdir(parents=True, exist_ok=True)
+        lines = fp.read_text(encoding="utf-8").splitlines() if fp.exists() else []
+        # 同章重写时原位替换，保持时间线稳定
+        lines = [ln for ln in lines if not ln.startswith(f"- 第{chapter_num}章")]
+        lines.append(entry)
+        body = "## 已实际发生的叙事轨迹\n" + "\n".join(lines) + "\n"
+        fp.write_text(body, encoding="utf-8")
+    except OSError as exc:
+        log.warning(f"实际轨迹写入失败: {exc}")
+        return ""
+    return entry
+
+
 def append_volume_revisions(config, volume_num: int, summary_text: str) -> str:
     """卷末总结后：产出修订建议回流传给下一卷规划，追加到 bible/volume_revisions.md。"""
     vol = getattr(config, "volume_config", {}).get(f"volume_{volume_num}")
@@ -323,13 +418,14 @@ def append_volume_revisions(config, volume_num: int, summary_text: str) -> str:
         return ""
     lo, hi = vol["chapters"]
     from engine.llm_client import chat
+    total = getattr(config, "chapter_count", 0) or max(hi, 100)
     prompt = (
         "你是长篇小说的主编。下面是第{n}卷（第{lo}-{hi}章）的卷末总结。"
-        "请站在全书 600 章的宏观结构上，给出对下一卷规划的修订建议："
+        "请站在全书 {total} 章的宏观结构上，给出对下一卷规划的修订建议："
         "节奏问题、该收的线、该埋的钩子、人物关系该往哪走、避免重复的情节套路。"
         "输出 3-6 条简洁的修订要点，每行一条，直接给内容不要解释。\n\n"
         "【第{n}卷总结】\n{summary}"
-    ).format(n=volume_num, lo=lo, hi=hi, summary=summary_text)
+    ).format(n=volume_num, lo=lo, hi=hi, total=total, summary=summary_text)
     try:
         model = getattr(config, "story_keeper_model", None) or config.writer_model
         revisions = chat(model, user_prompt=prompt).strip()

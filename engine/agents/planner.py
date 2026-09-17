@@ -205,6 +205,19 @@ class PlannerAgent:
         except Exception as exc:
             log.warning(f"卷修订建议注入失败: {exc}")
 
+        # 实际叙事轨迹（大纲随实际演化）：已写章节以实际为准，大纲为原计划
+        try:
+            tl_fp = config.bible_dir / "actual_timeline.md"
+            if tl_fp.exists():
+                timeline = tl_fp.read_text(encoding="utf-8").strip()
+                if timeline:
+                    user += (
+                        f"\n\n## 已实际发生的叙事轨迹（写出来的才算数——"
+                        f"规划必须与已写内容衔接，大纲仅作原计划参考）\n{timeline}"
+                    )
+        except Exception as exc:
+            log.warning(f"实际轨迹注入失败: {exc}")
+
         return system_filled + entities_contract + clue_contract + "\n\n" + user + title_hint
 
     def _get_volume_info(self, chapter_num: int) -> dict:
