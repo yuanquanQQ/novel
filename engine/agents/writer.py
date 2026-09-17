@@ -58,6 +58,10 @@ class WriterAgent:
             special_condition=special,
             style_watch=context_pack.get("style_watch", "（无）"),
         )
+        # 故事状态块：连续性警告 / 读者开放问题 / 未回收承诺 / 上一章钩子
+        story_block = context_pack.get("story_continuity_warnings", "")
+        if story_block:
+            base_prompt = base_prompt + "\n\n" + story_block
         # feedback_block 追加在末尾——模型对 prompt 末尾注意力最高
         return base_prompt + feedback_block
 

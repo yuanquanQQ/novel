@@ -96,6 +96,7 @@ class Config:
     heavy_reviewer_model: ModelConfig = field(default_factory=lambda: ModelConfig(model_name=_env("HEAVY_REVIEWER_MODEL", "deepseek-reasoner"), temperature=0.6))
     keeper_model: ModelConfig = field(default_factory=lambda: ModelConfig(model_name=_env("KEEPER_MODEL", "deepseek-chat"), temperature=0.15))
     archivist_model: ModelConfig = field(default_factory=lambda: ModelConfig(model_name=_env("ARCHIVIST_MODEL", "deepseek-chat"), temperature=0.15))
+    story_keeper_model: ModelConfig = field(default_factory=lambda: ModelConfig(model_name=_env("STORY_KEEPER_MODEL", "deepseek-chat"), temperature=0.15))
     foreshadowing_steward_model: ModelConfig = field(default_factory=lambda: ModelConfig(model_name=_env("FORESHADOWING_STEWARD_MODEL", "deepseek-reasoner"), temperature=0.6))
     reader_proxy_model: ModelConfig = field(default_factory=lambda: ModelConfig(model_name=_env("READER_PROXY_MODEL", "deepseek-chat"), temperature=0.15))
     marketer_model: ModelConfig = field(default_factory=lambda: ModelConfig(model_name=_env("MARKETER_MODEL", "deepseek-chat"), temperature=0.9, max_tokens=8192))
@@ -138,6 +139,7 @@ IMMEDIATE_REVIEWER_MODEL=deepseek-chat
 HEAVY_REVIEWER_MODEL=deepseek-reasoner
 KEEPER_MODEL=deepseek-chat
 ARCHIVIST_MODEL=deepseek-chat
+STORY_KEEPER_MODEL=deepseek-chat
 FORESHADOWING_STEWARD_MODEL=deepseek-reasoner
 READER_PROXY_MODEL=deepseek-chat
 MARKETER_MODEL=deepseek-chat
@@ -251,11 +253,13 @@ def _prompts(title: str, genre: str, description: str) -> dict:
             "【人物声纹档案】\n{voice_print}\n\n【当前场景正文】\n{draft}\n\n"
             "审计规则：\n"
             "1. 声纹匹配：句式长度、用词习惯是否与档案一致？\n"
-            "2. AI对话特征（任一命中即违规）：每句完整有逻辑有句号；对话像陈述解释而非争论/求助/威胁/回避；"
+            "2. AI对话特征（任一命中即违规）：对话连续3句以上全部完整有逻辑、以句号收尾且无口语打断；"
+            "对话像陈述解释而非争论/求助/威胁/回避；"
             "从不改口犹豫说错话；每句都直接回答问题（真人常答非所问）；对话携带过多设定信息。\n"
             "3. 区分度：抹掉所有引号前人名，能认出谁在说话吗？不能=违规。\n"
             "4. 对话占比：是否在30-45%之间？\n"
-            "5. 格式：对话必须是中文直角引号「」，半角引号或叙述式转述即违规；全部完整句号收尾=违规。\n\n"
+            "5. 格式：对话必须是中文直角引号「」，半角引号或叙述式转述即违规；"
+            "对话连续3句以上全部完整句号收尾=违规（个别1-2句完整收尾属自然，不判违规）。\n\n"
             "输出 JSON（不要其他文本）：\n"
             "{{\"passed\": true, \"violations\": [{{\"character\": \"人物名或整体\", "
             "\"issue\": \"声纹违规|AI对话|无法区分|占比异常\", \"location\": \"第几段或关键词前8字\", "
@@ -278,6 +282,22 @@ def _prompts(title: str, genre: str, description: str) -> dict:
             "  \"facts\": [{\"kind\": \"plot|object|location|injury|info|relationship\", \"subject\": \"人物或物品名\", \"content\": \"一句话原子事实25字内\", \"scene_id\": 1}],\n"
             "  \"chapter_summary\": \"两句话不超过80字\"\n"
             "}\nfacts 是跨章一致性的长期记忆：谁拿到了什么/谁看见了什么/谁去了哪/什么东西被破坏/谁对谁说了什么关键信息。排除情绪描写，5-12条。"
+        )},
+        "story_keeper": {"system": (
+            "你是长篇小说的故事管理员。输入为刚写完的章节正文与本章大纲，任务是抽取"
+            "「可跨章验证的硬事实」，供下一章写作做连续性对账。只提取正文里明确写出的信息，"
+            "禁止脑补推断。\n\n"
+            "【上一章的读者开放问题】\n{prior_questions}\n\n"
+            "【本章大纲】\n{plan_json}\n\n"
+            "【本章正文】\n{full_chapter}\n\n"
+            "输出 JSON（不要其他文本）：\n"
+            "{\n"
+            "  \"facts\": [{\"entity\": \"人物/地点/物品/势力名\", \"attribute\": \"位置|生死|身份|关系|能力|伤势|拥有|状态|目的 等\", \"value\": \"一句话原子事实\"}],\n"
+            "  \"arc_updates\": [{\"character\": \"人物名\", \"goal\": \"当前目标(无则省略)\", \"fear\": \"恐惧(无则省略)\", \"secret\": \"隐藏的秘密(无则省略)\", \"conflict\": \"当下矛盾(无则省略)\", \"change\": \"本章关键变化(无则省略)\"}],\n"
+            "  \"new_questions\": [\"本章新勾起的读者悬念（最多3条）\"],\n"
+            "  \"resolved_question_ids\": [\"已在本章回答的开放问题 id\"]\n"
+            "}\n"
+            "facts 5-10 条，attribute 用有限集合里的短词。"
         )},
         "foreshadowing_steward": {"system": (
             "你是伏笔管家，负责让伏笔在章节间有序运行。\n\n"

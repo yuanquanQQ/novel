@@ -186,6 +186,25 @@ class PlannerAgent:
             volume_focus=volume.get("focus", ""),
         )
         user += f"\n\n## outline.md 当前章上下文（必须遵循）\n{outline_context}"
+
+        # 故事状态（开放问题/未回收承诺/角色弧线/连续性警告）——写作→规划的回路之一
+        try:
+            from engine.agents.story_keeper import planner_context, load_bare_state
+            story_text = planner_context(load_bare_state(config.bible_dir), chapter_num)
+            user += f"\n\n## 故事状态（新章节必须顺应，禁止空降矛盾）\n{story_text}"
+        except Exception as exc:
+            log.warning(f"故事状态上下文注入失败: {exc}")
+
+        # 卷修订建议（上一卷总结 → 下一卷规划）
+        try:
+            rev_fp = config.bible_dir / "volume_revisions.md"
+            if rev_fp.exists():
+                revisions = rev_fp.read_text(encoding="utf-8").strip()
+                if revisions:
+                    user += f"\n\n## 卷修订建议（本卷规划必须响应）\n{revisions}"
+        except Exception as exc:
+            log.warning(f"卷修订建议注入失败: {exc}")
+
         return system_filled + entities_contract + clue_contract + "\n\n" + user + title_hint
 
     def _get_volume_info(self, chapter_num: int) -> dict:

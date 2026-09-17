@@ -1021,6 +1021,7 @@ def cmd_generate(chapter_num: int, instruction: str = "", overwrite: bool = Fals
     from engine.agents.dialogue_auditor import DialogueAuditor
     from engine.agents.foreshadowing_steward import ForeshadowingSteward
     from engine.agents.reader_proxy import ReaderProxy
+    from engine.agents.story_keeper import StoryKeeperAgent
 
     config = get_config()
     if not outline_override:
@@ -1044,6 +1045,7 @@ def cmd_generate(chapter_num: int, instruction: str = "", overwrite: bool = Fals
     auditor = DialogueAuditor()
     steward = ForeshadowingSteward()
     reader = ReaderProxy()
+    story_keeper = StoryKeeperAgent()
 
     for d in [config.bible_dir, config.generated_dir, config.cache_dir]:
         d.mkdir(parents=True, exist_ok=True)
@@ -1103,6 +1105,17 @@ def cmd_generate(chapter_num: int, instruction: str = "", overwrite: bool = Fals
 
     keeper_cache = keeper.init_cache(chapter_num)
 
+    # 故事全局状态：把开放问题/未回收承诺/角色弧线/连续性警告注入本次生成上下文
+    try:
+        from engine.agents.story_keeper import load_bare_state, planner_context, writer_warnings
+        story_state = load_bare_state(config.bible_dir)
+        context_pack["story_state_text"] = planner_context(story_state, chapter_num)
+        context_pack["story_continuity_warnings"] = writer_warnings(story_state, chapter_num)
+        if context_pack["story_continuity_warnings"]:
+            log.info(f"StoryKeeper 注入本章 {len(context_pack['story_continuity_warnings'])} 字故事状态约束")
+    except Exception as e:
+        log.warning(f"StoryKeeper 状态注入失败: {e}")
+
     from engine.style_kit import scanner
     feedback_map = {}
     for scene in plan_json.get("scene_outline", []):
@@ -1110,6 +1123,9 @@ def cmd_generate(chapter_num: int, instruction: str = "", overwrite: bool = Fals
         max_retries = config.immediate_review_max_retries
         accepted = False
         draft = ""
+        best_draft = ""
+        best_diagnostics = {}
+        best_score = None
         diagnostics = {}
         for attempt in range(max_retries + 1):
             draft = writer.run(
@@ -1137,6 +1153,19 @@ def cmd_generate(chapter_num: int, instruction: str = "", overwrite: bool = Fals
                 "dialogue_passed": audit.get("passed", False) is True,
                 "dialogue_audit": audit,
             }
+            # 记录闸门总分最接近通过的一稿，供重试耗尽时降级接受
+            score = (
+                len(scan_result.violations) * 100
+                + (10 if not scan_result.passed else 0)
+                + (10 if review.get("passed", False) is not True else 0)
+                + len(review.get("errors", []) or [])
+                + (10 if audit.get("passed", False) is not True else 0)
+                + len(audit.get("violations", []) or [])
+            )
+            if best_score is None or score <= best_score:
+                best_score = score
+                best_draft = draft
+                best_diagnostics = dict(diagnostics)
             if accepted:
                 break
             suggestions = [
@@ -1150,12 +1179,15 @@ def cmd_generate(chapter_num: int, instruction: str = "", overwrite: bool = Fals
             )
 
         if not accepted:
+            # 重试耗尽：不整章失败。保存最佳稿诊断供事后审阅，接受最佳稿继续。
             failed_path = _save_failed_draft(
-                config, chapter_num, sid, draft, diagnostics,
+                config, chapter_num, sid, best_draft, best_diagnostics,
             )
-            raise SceneQualityError(
-                f"第 {chapter_num} 章场景 {sid} 重试耗尽，失败稿已保存: {failed_path}"
+            log.warning(
+                f"  场景 {sid} 重试 {max_retries + 1} 轮未过全部质量闸门，"
+                f"按最佳稿继续（诊断已存: {failed_path}）"
             )
+            draft = best_draft
         keeper_cache = keeper.update(keeper_cache, draft, chapter_num, sid)
 
     all_scenes = keeper_cache.get("all_scenes", [])
@@ -1214,6 +1246,16 @@ def cmd_generate(chapter_num: int, instruction: str = "", overwrite: bool = Fals
 
     if not archivist.update_bible(chapter_num, plan_json, keeper_cache, full_chapter):
         raise RuntimeError(f"第 {chapter_num} 章知识归档失败，正文未发布")
+
+    # 故事状态对账（非致命）：抽事实、查矛盾、维护弧线/问题/承诺/钩子
+    try:
+        story_keeper.update_state(
+            config.bible_dir, chapter_num, plan_json, keeper_cache, full_chapter,
+        )
+        log.info(f"StoryKeeper 已更新第 {chapter_num} 章故事状态")
+    except Exception as e:
+        log.warning(f"StoryKeeper 状态更新失败: {e}")
+
     keeper.save_cache(chapter_num, keeper_cache)
 
     # DB 记账：章节成绩
@@ -1381,6 +1423,15 @@ def cmd_summary(volume_num: int, prompt: str = ""):
     text = chat(config.writer_model, user_prompt=system)
     summary_file.write_text(text, encoding="utf-8")
     print(f"卷末总结已保存: {summary_file}")
+
+    # 写作→规划闭环：产出修订建议，供下一卷规划遵循（非致命）
+    try:
+        from engine.agents.story_keeper import append_volume_revisions
+        block = append_volume_revisions(config, volume_num, text)
+        if block:
+            print(f"卷修订建议已写入 bible/volume_revisions.md（供第{volume_num + 1}卷规划）")
+    except Exception as e:
+        log.warning(f"卷修订建议生成失败: {e}")
 
 
 # ============================================================

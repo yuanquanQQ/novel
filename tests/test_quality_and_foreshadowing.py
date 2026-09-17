@@ -15,6 +15,10 @@ from engine.agents.planner import PlannerAgent
 from engine.agents.reader_proxy import ReaderProxy
 from engine.agents.researcher import ResearcherAgent
 from engine.agents.reviewers import ReviewerAgent
+from engine.agents.story_keeper import (
+    StoryKeeperAgent, _empty_state, append_volume_revisions, planner_context,
+    writer_warnings,
+)
 from engine.agents.writer import WriterAgent
 from engine.db import NovelDB
 from engine.style_kit.scanner import ScanResult
@@ -61,6 +65,7 @@ class TestSceneQualityGate(unittest.TestCase):
         constructors = [
             PlannerAgent, ResearcherAgent, WriterAgent, ReviewerAgent, KeeperAgent,
             ArchivistAgent, DialogueAuditor, ForeshadowingSteward, ReaderProxy,
+            StoryKeeperAgent,
         ]
         patches = [patch.object(cls, "__init__", return_value=None) for cls in constructors]
         patches.extend([
@@ -82,6 +87,8 @@ class TestSceneQualityGate(unittest.TestCase):
                 "overall_score": 8, "would_continue": True,
             }),
             patch("engine.style_kit.scanner.scan", side_effect=scans),
+            patch.object(StoryKeeperAgent, "load_state", return_value=_empty_state()),
+            patch.object(StoryKeeperAgent, "update_state", return_value=_empty_state()),
         ])
         return patches
 
@@ -111,25 +118,23 @@ class TestSceneQualityGate(unittest.TestCase):
             (1, "节奏", "最终", 2),
         ])
 
-    def test_exhaustion_does_not_publish_and_saves_failed_draft(self):
+    def test_exhaustion_accepts_best_draft_and_publishes(self):
         failed = ScanResult(violations=[{
             "category": "禁用词", "pattern": "坏", "count": 1,
             "where": "全文", "hint": "删",
         }])
+        passed = ScanResult()
         patches = self._patches(
-            ["失败一", "失败二"], [failed, failed],
+            ["失败一", "失败二"], [failed, failed, passed],
             [{"passed": True}, {"passed": True}],
             [{"passed": True}, {"passed": True}],
         )
-        for item in patches:
-            item.start()
-        try:
-            with self.assertRaises(novel.SceneQualityError):
-                novel.cmd_generate(1)
-        finally:
-            for item in reversed(patches):
-                item.stop()
-        self.assertFalse((self.config.generated_dir / "chapter_01.md").exists())
+        with ExitStack() as stack:
+            for item in patches:
+                stack.enter_context(item)
+            novel.cmd_generate(1)
+        # 闸门重试耗尽不再整章失败：接受最佳稿继续发布，诊断留存 failed_drafts 供事后审阅
+        self.assertTrue((self.config.generated_dir / "chapter_01.md").exists())
         failed_file = self.config.cache_dir / "failed_drafts" / "chapter_01_scene_1.md"
         self.assertEqual(failed_file.read_text(encoding="utf-8"), "失败二")
         self.assertTrue(failed_file.with_suffix(".json").exists())
@@ -464,6 +469,172 @@ class TestForeshadowProtocol(unittest.TestCase):
                 ).fetchone()[0], 0)
             finally:
                 db.close()
+
+
+class TestStoryKeeper(unittest.TestCase):
+    """StoryKeeper：故事状态、连续性对账、问题台账、承诺同步、卷修订闭环。"""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.bible = self.root / "bible"
+        self.bible.mkdir()
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _agent(self):
+        sk = StoryKeeperAgent()
+        # __init__ 的 model_config 只影响真实 LLM 抽取；确定性测试不需要
+        sk.model_config = None
+        return sk
+
+    def test_fact_contradiction_detection_major_and_minor(self):
+        sk = self._agent()
+        state = _empty_state()
+        sk._merge_facts(state, 1, [
+            {"entity": "沈渊", "attribute": "位置", "value": "零号废墟"},
+            {"entity": "沈渊", "attribute": "习惯", "value": "常去一号车间"},
+        ])
+        sk._merge_facts(state, 2, [
+            {"entity": "沈渊", "attribute": "位置", "value": "星港码头"},
+            {"entity": "沈渊", "attribute": "习惯", "value": "常去三号仓库"},
+        ])
+        self.assertEqual(len(state["continuity_warnings"]), 2)
+        by_attr = {w["attribute"]: w for w in state["continuity_warnings"]}
+        self.assertEqual(by_attr["位置"]["severity"], "major")
+        self.assertEqual(by_attr["习惯"]["severity"], "minor")
+        self.assertEqual(by_attr["位置"]["prior"], "零号废墟")
+        self.assertEqual(by_attr["位置"]["now"], "星港码头")
+        # 同一值重复出现不产生新警告
+        sk._merge_facts(state, 3, [
+            {"entity": "沈渊", "attribute": "位置", "value": "星港码头"},
+        ])
+        self.assertEqual(len(state["continuity_warnings"]), 2)
+
+    def test_questions_add_and_resolve(self):
+        sk = self._agent()
+        state = _empty_state()
+        sk._merge_questions(state, 5, ["奇点吞噬体为何认主"], [])
+        sk._merge_questions(state, 6, ["联邦舰队何时到"], ["Q00501"])
+        ids = [q["id"] for q in state["open_questions"]]
+        # id = Q{章}{全局递增序号}：第二个问题序号按当前台账长度递增
+        self.assertEqual(ids, ["Q00501", "Q00602"])
+        self.assertEqual(state["open_questions"][0]["status"], "resolved")
+        self.assertEqual(state["open_questions"][0]["resolved_chapter"], 6)
+        self.assertEqual(state["open_questions"][1]["status"], "open")
+
+    def test_sync_promises_from_clues(self):
+        sk = self._agent()
+        clues = {
+            "active_foreshadowing": {
+                "F001": {"name": "奇点吞噬体", "status": "pending",
+                         "introduced_chapter": 1, "last_hinted_chapter": 3},
+                "F002": {"name": "联邦密探", "status": "resolved",
+                         "introduced_chapter": 2},
+                "F003": {"name": "泰坦信标", "status": "escalated",
+                         "introduced_chapter": 5},
+            }
+        }
+        (self.bible / "clues.json").write_text(
+            json.dumps(clues), encoding="utf-8")
+        state = _empty_state()
+        sk._sync_promises(state, self.bible)
+        self.assertEqual(set(state["unresolved_promises"]), {"F001", "F003"})
+        self.assertEqual(state["unresolved_promises"]["F001"]["name"], "奇点吞噬体")
+        self.assertEqual(state["unresolved_promises"]["F001"]["planted_chapter"], 1)
+
+    def test_planner_context_lists_promises_questions_arcs(self):
+        state = {
+            "unresolved_promises": {
+                "F001": {"name": "奇点吞噬体", "planted_chapter": 1, "status": "pending"},
+            },
+            "open_questions": [
+                {"id": "Q00501", "text": "联邦舰队何时到", "status": "open"},
+            ],
+            "character_arcs": {
+                "沈渊": {"goal": "建立庇护所", "fear": "暴露", "secret": "", "conflict": "",
+                         "change": "获得星核", "last_chapter": 3},
+            },
+            "continuity_warnings": [
+                {"chapter": 2, "entity": "沈渊", "attribute": "位置",
+                 "prior": "零号废墟", "now": "星港码头", "severity": "major"},
+            ],
+            "hook_log": [],
+        }
+        text = planner_context(state, 4)
+        self.assertIn("奇点吞噬体", text)
+        self.assertIn("联邦舰队何时到", text)
+        self.assertIn("建立庇护所", text)
+        self.assertIn("星港码头", text)
+
+    def test_writer_warnings_includes_previous_hook(self):
+        state = {
+            "unresolved_promises": {},
+            "open_questions": [
+                {"id": "Q00301", "text": "空港里的女人是谁", "status": "open"},
+            ],
+            "continuity_warnings": [],
+            "hook_log": [
+                {"chapter": 3, "light": "窗外亮起红色警报", "dark": "",
+                 "carried_into": 4},
+            ],
+        }
+        text = writer_warnings(state, 4)
+        self.assertIn("空港里的女人是谁", text)
+        self.assertIn("窗外亮起红色警报", text)
+        # 钩子只对下一章生效：第 5 章不再要求响应第 3 章钩子
+        self.assertNotIn("窗外亮起红色警报", writer_warnings(state, 5))
+
+    def test_update_state_roundtrip_with_synced_promises(self):
+        sk = self._agent()
+        (self.bible / "clues.json").write_text(json.dumps({
+            "active_foreshadowing": {
+                "F001": {"name": "奇点吞噬体", "status": "pending",
+                         "introduced_chapter": 1},
+            }
+        }), encoding="utf-8")
+        plan = {"chapter_title": "第一章", "chapter_hooks": {
+            "light_hook": "门被推开", "dark_hook": ""}}
+        with patch.object(sk, "_extract", return_value={
+            "facts": [{"entity": "沈渊", "attribute": "位置", "value": "零号废墟"}],
+            "arc_updates": [{"character": "沈渊", "goal": "活下去"}],
+            "new_questions": ["废墟里还有什么"],
+            "resolved_question_ids": [],
+        }):
+            state = sk.update_state(self.bible, 1, plan, {}, "正文")
+        self.assertEqual(state["last_updated"], 1)
+        self.assertEqual(state["facts"]["沈渊"]["位置"]["value"], "零号废墟")
+        self.assertEqual(state["character_arcs"]["沈渊"]["goal"], "活下去")
+        self.assertEqual(state["unresolved_promises"]["F001"]["name"], "奇点吞噬体")
+        # 落盘后可读回
+        reloaded = sk.load_state(self.bible)
+        self.assertEqual(reloaded["facts"]["沈渊"]["位置"]["value"], "零号废墟")
+        self.assertEqual(reloaded["hook_log"][0]["light"], "门被推开")
+        # 坏 clues.json 不炸
+        (self.bible / "clues.json").write_text("{bad json", encoding="utf-8")
+        state2 = sk.update_state(self.bible, 2, plan, {}, "正文")
+        self.assertEqual(state2["unresolved_promises"], {})
+
+    def test_append_volume_revisions_writes_and_returns_block(self):
+        sk_config = SimpleNamespace(
+            bible_dir=self.bible,
+            writer_model=None,
+            story_keeper_model=None,
+            volume_config={
+                "volume_1": {"name": "第1卷", "chapters": (1, 60)},
+                "volume_2": {"name": "第2卷", "chapters": (61, 120)},
+            },
+        )
+        with patch("engine.llm_client.chat", return_value="- 加快第2卷冲突节奏\n- 回收 F001"):
+            block = append_volume_revisions(sk_config, 1, "第1卷总结……")
+        self.assertIn("第1卷", block)
+        rev = (self.bible / "volume_revisions.md").read_text(encoding="utf-8")
+        self.assertIn("回收 F001", rev)
+        # 无卷配置 → 跳过
+        with patch("engine.llm_client.chat", return_value="x"):
+            self.assertEqual(append_volume_revisions(
+                SimpleNamespace(bible_dir=self.bible, volume_config={}), 9, "总结"), "")
 
 
 if __name__ == "__main__":
