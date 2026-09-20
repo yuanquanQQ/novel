@@ -266,16 +266,19 @@ class TestPromptsFactoryFallback(unittest.TestCase):
         return d
 
     def test_missing_agent_prompts_filled_from_factory_without_overwriting(self):
-        self._make_old_novel()
+        root = self._make_old_novel()
+        original = (root / "novel_prompts.json").read_bytes()
         settings.set_novel("old-book")
         # 老书没有 story_keeper / story_check → 出厂模板自动补齐
         system, _ = self.pl.get_prompt("story_keeper")
         self.assertIn("故事管理员", system)
         sys2, _ = self.pl.get_prompt("story_check")
         self.assertIn("故事逻辑审稿人", sys2)
-        # 已定制的 writer 提示词不被覆盖
+        # 已定制内容保留；加载时追加共享规则，不重写原文件。
         wsys, _ = self.pl.get_prompt("writer")
-        self.assertEqual(wsys, "CUSTOM_WRITER_SYSTEM")
+        self.assertTrue(wsys.startswith("CUSTOM_WRITER_SYSTEM\n\n"))
+        self.assertIn("项目级连载创作与编辑契约", wsys)
+        self.assertEqual((root / "novel_prompts.json").read_bytes(), original)
         # 常规 key 不受影响
         self.assertTrue(self.pl.get_prompt("planner")[0])
 

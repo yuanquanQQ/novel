@@ -4,6 +4,7 @@
     "source": "engine/style_kit — 源自 novel-live-writing skill（banned-words.md）+ 引擎原有黑名单",
     "usage": "scanner.py 确定性扫描；prompts_loader 格式化注入 writer/reviewer 提示词；前端风格工坊可编辑"
   },
+  "word_policy": "contextual",
   "hard_words": [
     "然而",
     "因此",
@@ -96,7 +97,8 @@
     {
       "id": "bushi_ershi",
       "regex": "不是[^，。；！？]{1,15}[，,]\\s*(而)?是",
-      "severity": "hard",
+      "severity": "soft",
+      "limit": 1,
       "why": "AI最爱的对比句式，出现即拆成两句或只留后半"
     },
     {
@@ -128,8 +130,8 @@
     {
       "id": "pofihao",
       "regex": "——",
-      "severity": "hard",
-      "limit": 0,
+      "severity": "soft",
+      "limit": 2,
       "why": "破折号清零，用逗号或句号"
     },
     {

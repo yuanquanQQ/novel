@@ -73,7 +73,8 @@ def scan(text: str, rules: dict = None) -> ScanResult:
     for w in rules.get("hard_words", []):
         c = text.count(w)
         if c:
-            res.violations.append(
+            target = res.warnings if rules.get("word_policy") == "contextual" else res.violations
+            target.append(
                 {"category": "禁用词", "pattern": w, "count": c,
                  "where": _locations(paragraphs, w),
                  "hint": rules.get("replacements", {}).get(w, "")})
@@ -95,14 +96,14 @@ def scan(text: str, rules: dict = None) -> ScanResult:
                     "where": "全文" if n > 3 else _locations(
                         paragraphs, str(found[0])[:6] if found else ""),
                     "hint": pat.get("why", "")}
-            (res.violations if pat["severity"] == "hard"
+            (res.violations if pat["severity"] == "hard" and rules.get("word_policy") != "contextual"
              else res.warnings).append(item)
 
     ellip = m.get("ellipsis_per_paragraph_max", 1)
     for i, p in enumerate(paragraphs, 1):
         c = len(re.findall(r"…{1,2}", p))
         if c > ellip:
-            res.violations.append(
+            res.warnings.append(
                 {"category": "句式", "pattern": "省略号堆砌", "count": c,
                  "where": f"第{i}段", "hint": "一段最多用一次"})
 
@@ -119,7 +120,7 @@ def scan(text: str, rules: dict = None) -> ScanResult:
             cur = 1
         i += 1
     if best > opener_max:
-        res.violations.append(
+        res.warnings.append(
             {"category": "句式", "pattern": "连续段同名开头",
              "count": best, "where": "全文", "hint": "换视角/用动作或环境起笔"})
 
@@ -147,7 +148,7 @@ def scan(text: str, rules: dict = None) -> ScanResult:
              "where": "全文", "hint": "打断节奏：接一句极短句或改标点"})
 
     dmin, dmax = m.get("dialogue_ratio_min", 0.25), m.get("dialogue_ratio_max", 0.5)
-    if "「" in text or '"' in text or "\"" in text:
+    if rules.get("enforce_dialogue_ratio", False) and any(q in text for q in ('“', '「', '"')):
         if res.metrics["dialogue_ratio"] < dmin:
             res.warnings.append(
                 {"category": "对话占比", "pattern": "dialogue_low",
@@ -157,7 +158,13 @@ def scan(text: str, rules: dict = None) -> ScanResult:
     if res.metrics["has_halfwidth_quote"]:
         res.violations.append(
             {"category": "排版", "pattern": "半角引号", "count": 1,
-             "where": "全文", "hint": "对话强制中文直角「」"})
+             "where": "全文", "hint": "对白使用中文双引号“”，嵌套引用用‘’"})
+
+    corner_quotes = re.findall(r"[「」『』]", text)
+    if corner_quotes:
+        res.violations.append(
+            {"category": "排版", "pattern": "直角引号", "count": len(corner_quotes),
+             "where": "全文", "hint": "将「」改为“”，将『』改为‘’"})
 
     return res
 

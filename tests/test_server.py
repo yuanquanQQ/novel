@@ -17,6 +17,7 @@ from fastapi.testclient import TestClient
 
 import engine.novel_creator as novel_creator
 import engine.settings as settings
+from engine import pending
 from engine.db import NovelDB
 from engine.style_kit import scanner
 import server.app as server_app
@@ -53,7 +54,7 @@ class TestServerAPI(unittest.TestCase):
         )
         novel_dir = cls.novels_dir / "my-story"
         (novel_dir / "generated" / "chapter_01.md").write_text(
-            "「门外是谁？」\n林一握紧钥匙，没敢开门。", encoding="utf-8"
+            "“门外是谁？”\n林一握紧钥匙，没敢开门。", encoding="utf-8"
         )
         (novel_dir / "generated" / "chapter_02.md").write_text(
             '然而门开了。\n他说："别动。"', encoding="utf-8"
@@ -433,6 +434,124 @@ class TestServerAPI(unittest.TestCase):
             ).fetchone()[0], old_role)
         finally:
             db.close()
+
+
+    def _clear_pending(self):
+        cfg = server_app.load_config("my-story")
+        for fp in pending.revision_dir(cfg).glob("chapter_*"):
+            try:
+                fp.unlink()
+            except OSError:
+                pass
+
+    def _write_pending(self, num, content="待修订正文。"):
+        cfg = server_app.load_config("my-story")
+        pending.save_pending(cfg, num, content, {
+            "chapter": num, "title": f"待修订{num}", "created_at": "2026-09-17T00:00:00",
+            "words": len(content), "plan_json": {}, "keeper_cache": {},
+            "reasons": {"scene_failures": [], "final_scan": []},
+            "scan_metrics": {}, "style_hits": [],
+        })
+
+    def test_22_pending_list_and_detail(self):
+        self._clear_pending()
+        self.assertEqual(self.c.get("/api/novels/my-story/pending").json(), [])
+        self._write_pending(3)
+        data = self.c.get("/api/novels/my-story/pending").json()
+        self.assertEqual([item["num"] for item in data], [3])
+        self.assertEqual(data[0]["title"], "待修订3")
+        detail = self.c.get("/api/novels/my-story/pending/3")
+        self.assertEqual(detail.status_code, 200, detail.text)
+        body = detail.json()
+        self.assertEqual(body["num"], 3)
+        self.assertEqual(body["content"], "待修订正文。")
+        self.assertEqual(body["diagnostics"]["reasons"]["final_scan"], [])
+        self.assertEqual(self.c.get("/api/novels/my-story/pending/99").status_code, 404)
+        self.assertEqual(self.c.get("/api/novels/my-story/pending/0").status_code, 400)
+
+    def test_23_pending_save_rescans(self):
+        self._clear_pending()
+        self._write_pending(3)
+        response = self.c.put(
+            "/api/novels/my-story/pending/3",
+            json={"content": '然而门开了。他说"别动。"'},
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        body = response.json()
+        self.assertTrue(body["ok"])
+        self.assertEqual(body["words"], len('然而门开了。他说"别动。"'))
+        self.assertFalse(body["scan"]["passed"])
+        reloaded = self.c.get("/api/novels/my-story/pending/3").json()
+        self.assertEqual(reloaded["content"], '然而门开了。他说"别动。"')
+        self.assertEqual(reloaded["diagnostics"]["words"], len('然而门开了。他说"别动。"'))
+        self.assertTrue(reloaded["diagnostics"]["reasons"]["final_scan"])
+        self.assertEqual(self.c.put(
+            "/api/novels/my-story/pending/99", json={"content": "x"}).status_code, 404)
+
+    def test_24_pending_delete(self):
+        self._clear_pending()
+        self._write_pending(3)
+        response = self.c.delete("/api/novels/my-story/pending/3")
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertTrue(response.json()["ok"])
+        self.assertEqual(self.c.delete("/api/novels/my-story/pending/3").status_code, 404)
+
+    def test_25_chapters_page_merges_pending(self):
+        self._clear_pending()
+        # 无待修订：status=pending 为空，status=generated 只有已发布章
+        self.assertEqual(self.c.get(
+            "/api/novels/my-story/chapters-page?status=pending").json()["total"], 0)
+        generated = self.c.get(
+            "/api/novels/my-story/chapters-page?status=generated").json()
+        self.assertEqual(generated["total"], 2)
+        # 独立待修订章（无 generated）：出现在无筛选与 status=pending 中
+        self._write_pending(3)
+        merged = self.c.get("/api/novels/my-story/chapters-page").json()
+        self.assertEqual(merged["total"], 3)
+        num3 = next(item for item in merged["items"] if item["num"] == 3)
+        self.assertTrue(num3["pending"])
+        self.assertEqual(num3["status"], "pending")
+        self.assertEqual(self.c.get(
+            "/api/novels/my-story/chapters-page?status=pending").json()["total"], 1)
+        # 同号待修订覆盖旧发布稿：列表中显示为待修订，status=generated 不再暴露旧稿
+        # （与第 3 章独立待修订并存 → status=pending 总数 = 2）
+        self._write_pending(1)
+        merged = self.c.get("/api/novels/my-story/chapters-page").json()
+        num1 = next(item for item in merged["items"] if item["num"] == 1)
+        self.assertTrue(num1["pending"])
+        self.assertEqual(num1["status"], "pending")
+        self.assertEqual(self.c.get(
+            "/api/novels/my-story/chapters-page?status=pending").json()["total"], 2)
+        self.assertEqual(self.c.get(
+            "/api/novels/my-story/chapters-page?status=generated").json()["total"], 1)
+        # 丢弃后旧稿重新可见
+        cfg = server_app.load_config("my-story")
+        pending.remove_pending(cfg, 1)
+        merged = self.c.get("/api/novels/my-story/chapters-page").json()
+        num1 = next(item for item in merged["items"] if item["num"] == 1)
+        self.assertFalse(num1["pending"])
+
+    def test_26_publish_task_validates_and_forwards_chapter(self):
+        self._clear_pending()
+        # revision 文件不存在 → 404
+        self.assertEqual(self.c.post(
+            "/api/novels/my-story/tasks/publish",
+            json={"chapter": 3}).status_code, 404)
+        self._write_pending(3)
+        with patch.object(server_app.T, "running_task", return_value=None), patch.object(
+            server_app.T, "submit", return_value="publish-task"
+        ) as submit:
+            response = self.c.post(
+                "/api/novels/my-story/tasks/publish", json={"chapter": 3})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["task_id"], "publish-task")
+        submit.assert_called_once_with("my-story", "publish", ["3"])
+        # chapter 非正数被 pydantic ge=1 以 422 拦下；缺省 → handler 400
+        self.assertEqual(self.c.post(
+            "/api/novels/my-story/tasks/publish",
+            json={"chapter": 0}).status_code, 422)
+        self.assertEqual(self.c.post(
+            "/api/novels/my-story/tasks/publish", json={}).status_code, 400)
 
 
 if __name__ == "__main__":

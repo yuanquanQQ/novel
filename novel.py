@@ -27,6 +27,7 @@ sys.path.insert(0, str(ENGINE_ROOT))
 
 from engine.chapter_files import chapter_files, parse_chapter_number
 from engine.settings import set_novel, get_novel, get_novel_dir, get_config, NOVELS_DIR
+from engine import pending
 
 logging.basicConfig(
     level=logging.INFO,
@@ -81,7 +82,7 @@ def _parse_args():
             parsed["force"] = True
         elif a == "--outline-override":
             parsed["outline_override"] = True
-        elif a in ("outline", "titles", "status"):
+        elif a in ("outline", "titles", "status", "rebuild", "recover", "prepare"):
             parsed["command"] = a
         elif a == "db":
             parsed["command"] = "db"
@@ -130,6 +131,11 @@ def _parse_args():
             i += 1; parsed["prompt"] = args[i]
         elif not a.startswith("-") and parsed["command"] in ("revise",):
             parsed["content"] += (" " if parsed["content"] else "") + a
+        elif a == "pending":
+            parsed["command"] = "pending"
+        elif a in ("publish", "discard") and i + 1 < len(args):
+            parsed["command"] = a
+            i += 1; parsed["chapter"] = int(args[i])
         i += 1
     return parsed
 
@@ -140,10 +146,13 @@ def _parse_args():
 
 def cmd_create(args):
     """创建独立的新小说工作区。"""
-    from engine.novel_creator import create_novel
-    path = create_novel(
-        args["id"], args["title"], args["chapter_count"],
-        args["words_per_chapter"], args["genre"], args["description"])
+    from engine.novel_creator import create_novel, validate_slug, NOVELS_DIR as creation_root
+    from engine.locking import novel_lock
+    validate_slug(args["id"])
+    with novel_lock(creation_root / args["id"]):
+        path = create_novel(
+            args["id"], args["title"], args["chapter_count"],
+            args["words_per_chapter"], args["genre"], args["description"])
     print(f"小说已创建: {path}")
 
 
@@ -151,7 +160,7 @@ def cmd_list():
     """列出所有可用小说"""
     print("可用小说:")
     for d in sorted(NOVELS_DIR.iterdir()):
-        if d.is_dir():
+        if d.is_dir() and not d.name.startswith("."):
             title = d.name
             pf = d / "novel_prompts.json"
             if pf.exists():
@@ -240,9 +249,38 @@ def cmd_status():
     if clues_file.exists():
         clues = json.loads(clues_file.read_text(encoding="utf-8"))
         active = clues.get("active_foreshadowing", {})
-        pending = sum(1 for f in active.values() if f.get("status") == "pending")
+        pending_count = sum(1 for f in active.values() if f.get("status") == "pending")
         resolved = sum(1 for f in active.values() if f.get("status") == "resolved")
-        print(f"\n伏笔: {resolved} 已回收 / {pending} 待回收 / {len(active)} 总计")
+        print(f"\n伏笔: {resolved} 已回收 / {pending_count} 待回收 / {len(active)} 总计")
+
+    # 待人工修订队列
+    queue = pending.list_pending(config)
+    if queue:
+        latest = queue[-1]
+        print(f"\n待人工修订: {len(queue)} 章 (revision/)")
+        print(f"  最新: 第 {latest['num']} 章 | {latest.get('title') or '(未命名)'} | "
+              f"{latest.get('words', 0):,} 字 | {latest.get('created_at', '')}")
+        print(f"  处理: python novel.py --novel {get_novel()} publish/discard <章号>")
+    else:
+        print("\n待人工修订: 0 章")
+
+    # 种子数据覆盖提醒：人物/线索/母题为空时，规划与写作缺少依据
+    seeds = []
+    for fname in ("characters.json", "clues.json", "motif_bank.json"):
+        sf = novel_dir / "bible" / fname
+        try:
+            data = json.loads(sf.read_text(encoding="utf-8")) if sf.exists() else {}
+            empty = (
+                (fname == "characters.json" and not (data or {}).get("characters"))
+                or (fname == "clues.json" and not (data or {}).get("active_foreshadowing"))
+                or (fname == "motif_bank.json" and not (data or {}).get("motifs"))
+            )
+        except Exception:
+            empty = True
+        if empty:
+            seeds.append(fname.replace(".json", ""))
+    if seeds:
+        print(f"[提示] 种子数据待补充: {', '.join(seeds)} 为空——建议先在 Web 设置页完善")
 
 
 def cmd_view(args):
@@ -1030,12 +1068,20 @@ def cmd_generate(chapter_num: int, instruction: str = "", overwrite: bool = Fals
             raise CommandError("写作门禁：全书大纲未按章号完整覆盖；如确需跳过请显式使用 --outline-override")
         if not readiness["titles_ready"]:
             raise CommandError("写作门禁：章名未完整生成或仍含“第N章”占位名；如确需跳过请显式使用 --outline-override")
+    from engine.knowledge import check_ready
+    try:
+        check_ready(config, chapter_num)
+    except ValueError as exc:
+        raise CommandError(str(exc)) from exc
     chapter_file = config.generated_dir / f"chapter_{chapter_num:02d}.md"
     replacing = chapter_file.exists()
     if replacing and not overwrite:
         raise FileExistsError(
             f"第 {chapter_num} 章已存在；如需覆盖请显式传入 --overwrite"
         )
+    if replacing:
+        # Replanning an old chapter from the latest Bible would leak future state.
+        return cmd_revise(chapter_num, instruction or "优化本章目标、因果、节奏与回报，保留已发生的核心事件。")
     planner = PlannerAgent()
     researcher = ResearcherAgent()
     writer = WriterAgent()
@@ -1047,7 +1093,8 @@ def cmd_generate(chapter_num: int, instruction: str = "", overwrite: bool = Fals
     reader = ReaderProxy()
     story_keeper = StoryKeeperAgent()
 
-    for d in [config.bible_dir, config.generated_dir, config.cache_dir]:
+    for d in [config.bible_dir, config.generated_dir, config.cache_dir,
+              pending.revision_dir(config)]:
         d.mkdir(parents=True, exist_ok=True)
 
     # Bible + lessons
@@ -1081,7 +1128,11 @@ def cmd_generate(chapter_num: int, instruction: str = "", overwrite: bool = Fals
     print(f"当前小说: {config.story_title}  第 {chapter_num} 章: {locked_title}")
     log.info(f"=== 第 {chapter_num} 章 开始 ===")
 
-    plan_json = planner.run(chapter_num, instruction or f"继续推进第{chapter_num}章剧情", bible, lessons, locked_title)
+    from engine import checkpoint
+    checkpoint_file = checkpoint.checkpoint_path(config, chapter_num, instruction, locked_title)
+    resumed = checkpoint.load(checkpoint_file)
+    plan_json = (resumed["plan"] if resumed else planner.run(
+        chapter_num, instruction or f"继续推进第{chapter_num}章剧情", bible, lessons, locked_title))
     log.info(f"大纲: {plan_json.get('chapter_title','')} ({len(plan_json.get('scene_outline',[]))} 场景)")
 
     # 伏笔管家审计大纲；确定性严重错误会在任何正文生成前抛出。
@@ -1095,6 +1146,9 @@ def cmd_generate(chapter_num: int, instruction: str = "", overwrite: bool = Fals
 
     context_pack = researcher.run(plan_json, chapter_num, bible)
     context_pack["_plan"] = plan_json
+    previous_file = config.generated_dir / f"chapter_{chapter_num - 1:02d}.md"
+    if previous_file.exists():
+        context_pack["previous_chapter_tail"] = previous_file.read_text(encoding="utf-8")[-1600:]
     if reminders:
         context_pack["foreshadowing_reminders"] = reminders
         context_pack["research_notes"] = (
@@ -1103,14 +1157,14 @@ def cmd_generate(chapter_num: int, instruction: str = "", overwrite: bool = Fals
             + "\n".join(f"- {item}" for item in reminders)
         ).strip()
 
-    keeper_cache = keeper.init_cache(chapter_num)
+    keeper_cache = resumed["keeper_cache"] if resumed else keeper.init_cache(chapter_num)
 
     # 故事全局状态：把开放问题/未回收承诺/角色弧线/连续性警告注入本次生成上下文
     try:
         from engine.agents.story_keeper import load_bare_state, planner_context, writer_warnings
         story_state = load_bare_state(config.bible_dir)
-        context_pack["story_state_text"] = planner_context(story_state, chapter_num)
-        context_pack["story_continuity_warnings"] = writer_warnings(story_state, chapter_num)
+        context_pack["story_state_text"] = planner_context(story_state, chapter_num, plan_json)
+        context_pack["story_continuity_warnings"] = writer_warnings(story_state, chapter_num, plan_json)
         context_pack["_story_state"] = story_state  # 供 story_check 故事逻辑闸门做结构化对账
         if context_pack["story_continuity_warnings"]:
             log.info(f"StoryKeeper 注入本章 {len(context_pack['story_continuity_warnings'])} 字故事状态约束")
@@ -1119,7 +1173,16 @@ def cmd_generate(chapter_num: int, instruction: str = "", overwrite: bool = Fals
 
     from engine.style_kit import scanner
     feedback_map = {}
-    for scene in plan_json.get("scene_outline", []):
+    scene_failures = resumed["scene_failures"] if resumed else []
+    completed = resumed["completed"] if resumed else 0
+    if completed > len(plan_json.get("scene_outline", [])):
+        raise CommandError("写作检查点的场景进度无效")
+    if resumed:
+        print(f"从检查点恢复：已有 {completed} 个完整场景，输入版本一致")
+    checkpoint.save(checkpoint_file, plan_json, keeper_cache, completed, scene_failures)
+    for index, scene in enumerate(plan_json.get("scene_outline", [])):
+        if index < completed:
+            continue
         sid = scene.get("scene_id", "?")
         max_retries = config.immediate_review_max_retries
         accepted = False
@@ -1129,6 +1192,7 @@ def cmd_generate(chapter_num: int, instruction: str = "", overwrite: bool = Fals
         best_score = None
         diagnostics = {}
         for attempt in range(max_retries + 1):
+            context_pack["revision_draft"] = draft
             draft = writer.run(
                 scene, keeper_cache, context_pack, chapter_num,
                 feedback_map.get(sid, ""),
@@ -1193,16 +1257,29 @@ def cmd_generate(chapter_num: int, instruction: str = "", overwrite: bool = Fals
             )
 
         if not accepted:
-            # 重试耗尽：不整章失败。保存最佳稿诊断供事后审阅，接受最佳稿继续。
+            # 重试耗尽：保存最佳稿诊断供事后审阅（attempt 级审计），继续按最佳稿合并。
+            # 若最终仍不过闸门，整章转入待人工修订队列，由作家定稿。
             failed_path = _save_failed_draft(
                 config, chapter_num, sid, best_draft, best_diagnostics,
             )
+            scene_failures.append({
+                "scene_id": sid,
+                "attempts": max_retries + 1,
+                "gates": {
+                    "scan_passed": bool(best_diagnostics.get("scan_passed", False)),
+                    "review_passed": bool(best_diagnostics.get("review_passed", False)),
+                    "dialogue_passed": bool(best_diagnostics.get("dialogue_passed", False)),
+                    "story_passed": bool(best_diagnostics.get("story_passed", False)),
+                },
+                "best_score": best_score,
+            })
             log.warning(
-                f"  场景 {sid} 重试 {max_retries + 1} 轮未过全部质量闸门，"
-                f"按最佳稿继续（诊断已存: {failed_path}）"
+                f"  场景 {sid} 重试 {max_retries + 1} 轮未过全部质量闸门"
+                f"（将转入待人工修订，诊断已存: {failed_path}）"
             )
             draft = best_draft
         keeper_cache = keeper.update(keeper_cache, draft, chapter_num, sid)
+        checkpoint.save(checkpoint_file, plan_json, keeper_cache, index + 1, scene_failures)
 
     all_scenes = keeper_cache.get("all_scenes", [])
     full_chapter = writer.merge_scenes(all_scenes, plan_json, chapter_num)
@@ -1234,11 +1311,38 @@ def cmd_generate(chapter_num: int, instruction: str = "", overwrite: bool = Fals
     else:
         heavy = {"score": None, "patch_instructions": []}
 
+    from engine.quality import edit_chapter
+    full_chapter, final_scan, reader_result, chapter_reviews, chapter_passed = edit_chapter(
+        full_chapter, plan_json, chapter_num, context_pack, config,
+        writer, reviewers, reader, auditor,
+    )
+    if chapter_passed:
+        keeper_cache = keeper.reconcile_final_chapter(keeper_cache, full_chapter, chapter_num)
+        keeper_cache["_reader_result"] = reader_result
+
     style_hits = final_scan.to_rows(chapter_num)
     keeper_cache["_style_hits"] = style_hits
     if style_hits:
         print(f"  [风格扫描] 最终正文命中风格问题 {len(style_hits)} 条")
-    if not final_scan.passed:
+
+    # 全部闸门通过 → 正常发布；否则按 GATE_FAIL_MODE 转入待修订队列或硬失败。
+    if chapter_passed and final_scan.passed:
+        # Keep the final draft recoverable if archival or publication fails.
+        diag = pending.build_diagnostics(
+            chapter_num, plan_json.get("chapter_title") or locked_title,
+            len(full_chapter), plan_json, keeper_cache,
+            scene_failures, final_scan, style_hits,
+        )
+        diag["reasons"]["chapter_review"] = chapter_reviews
+        pending.save_pending(config, chapter_num, full_chapter, diag)
+        _publish_chapter(config, chapter_num, full_chapter, plan_json,
+                         keeper_cache, replacing=replacing,
+                         locked_title=locked_title)
+        checkpoint_file.unlink(missing_ok=True)
+        return
+
+    mode = getattr(config, "gate_fail_mode", "pending")
+    if mode == "abort":
         failed_path = _save_failed_draft(
             config, chapter_num, "merged", full_chapter,
             {"stage": "final_scan", "scan_violations": final_scan.violations},
@@ -1247,8 +1351,62 @@ def cmd_generate(chapter_num: int, instruction: str = "", overwrite: bool = Fals
             f"第 {chapter_num} 章合并正文未通过最终风格扫描，失败稿已保存: {failed_path}"
         )
 
+    # pending 模式：草案 + 诊断落 revision/，不进 generated/ 与知识库，等作家定稿。
+    diag = pending.build_diagnostics(
+        chapter_num, plan_json.get("chapter_title") or locked_title,
+        len(full_chapter), plan_json, keeper_cache,
+        scene_failures, final_scan, style_hits,
+    )
+    diag["reasons"]["chapter_review"] = chapter_reviews
+    pending.save_pending(config, chapter_num, full_chapter, diag)
+    pf = config.cache_dir / "pipeline_progress.json"
+    _atomic_write(
+        pf, json.dumps({"last_completed_chapter": chapter_num,
+                        "last_status": "pending"}, ensure_ascii=False),
+    )
+    print(f"第 {chapter_num} 章未通过全部质量闸门，已转入「待人工修订」队列"
+          f"（revision/chapter_{chapter_num:02d}.md）")
+    log.warning(f"第 {chapter_num} 章转入待人工修订队列: "
+                f"{len(scene_failures)} 个场景失败, 最终扫描违规 "
+                f"{len(final_scan.violations)} 条")
+    return 2
+
+
+def _publish_chapter(config, chapter_num: int, full_chapter: str, plan_json: dict,
+                     keeper_cache: dict, *, replacing: bool, locked_title: str = ""):
+    from engine.knowledge import transaction, ensure_seed, rebuild
+    if replacing:
+        rebuild(config, replacement=(chapter_num, full_chapter, plan_json))
+    else:
+        with transaction(config.bible_dir.parent):
+            ensure_seed(config)
+            _commit_chapter(config, chapter_num, full_chapter, plan_json, keeper_cache,
+                            replacing=False, locked_title=locked_title)
+    try:
+        pending.remove_pending(config, chapter_num)
+    except Exception as exc:
+        log.warning("正文已发布，但待修订队列清理失败: %s", exc)
+
+
+def _commit_chapter(config, chapter_num: int, full_chapter: str, plan_json: dict,
+                    keeper_cache: dict, *, replacing: bool, locked_title: str = ""):
+    """把一章正式定稿：读者信号 → 知识归档硬闸门 → 故事状态/缓存/DB 记账 → 原子发布。
+
+    generate 与 publish N 共用。风格扫描结果走 keeper_cache["_style_hits"] 缓存，
+    不再重扫，避免重复计费与测试里 scanner patch 副作用。
+    """
+    from engine.agents.reader_proxy import ReaderProxy
+    from engine.agents.archivist import ArchivistAgent
+    from engine.agents.story_keeper import StoryKeeperAgent
+    from engine.agents.keeper import KeeperAgent
+
+    reader = ReaderProxy()
+    archivist = ArchivistAgent()
+    story_keeper = StoryKeeperAgent()
+    keeper = KeeperAgent()
+
     # 发布前完成所有外部审阅；任何异常都不会暴露 staging 正文。
-    reader_result = reader.read(full_chapter)
+    reader_result = keeper_cache.get("_reader_result") or reader.read(full_chapter)
     if reader_result.get("confusion_points"):
         log.warning(f"读者困惑点: {len(reader_result['confusion_points'])} 处")
     if reader_result.get("fatigue_points"):
@@ -1261,14 +1419,8 @@ def cmd_generate(chapter_num: int, instruction: str = "", overwrite: bool = Fals
     if not archivist.update_bible(chapter_num, plan_json, keeper_cache, full_chapter):
         raise RuntimeError(f"第 {chapter_num} 章知识归档失败，正文未发布")
 
-    # 故事状态对账（非致命）：抽事实、查矛盾、维护弧线/问题/承诺/钩子
-    try:
-        story_keeper.update_state(
-            config.bible_dir, chapter_num, plan_json, keeper_cache, full_chapter,
-        )
-        log.info(f"StoryKeeper 已更新第 {chapter_num} 章故事状态")
-    except Exception as e:
-        log.warning(f"StoryKeeper 状态更新失败: {e}")
+    # 故事状态对账：提取失败时回滚发布，避免正文和知识脱节。
+    story_keeper.update_state(config.bible_dir, chapter_num, plan_json, keeper_cache, full_chapter)
 
     # 章节级大纲追认（非致命）：实际写出的摘要写进 actual_timeline.md，planner 以实际为准
     try:
@@ -1280,9 +1432,12 @@ def cmd_generate(chapter_num: int, instruction: str = "", overwrite: bool = Fals
         log.warning(f"实际轨迹记录失败: {e}")
 
     keeper.save_cache(chapter_num, keeper_cache)
+    _atomic_write(config.cache_dir / f"archive_plan_{chapter_num:02d}.json",
+                  json.dumps(plan_json, ensure_ascii=False, indent=2))
 
     # DB 记账：章节成绩
     from engine.db import NovelDB
+    style_hits = keeper_cache.get("_style_hits", [])
     try:
         _db = NovelDB(get_novel_dir())
         hard_cats = ("禁用词", "句式", "排版")
@@ -1326,8 +1481,72 @@ def cmd_generate(chapter_num: int, instruction: str = "", overwrite: bool = Fals
             print(f"  [{op.get('action','')}] {op.get('clue_id','')}: {op.get('method','')}")
 
 
+def _revision_bible(config, chapter_num: int, source_text: str) -> dict:
+    """Load only canon that was available to the chapter being revised."""
+    bible = {}
+    master = config.bible_dir / "master_bible.md"
+    if master.exists():
+        bible["master_bible"] = master.read_text(encoding="utf-8")
+
+    foundations = config.bible_dir / "character_foundations.json"
+    characters_path = foundations if foundations.exists() else config.bible_dir / "characters.json"
+    characters = {"characters": {}}
+    if characters_path.exists():
+        raw = json.loads(characters_path.read_text(encoding="utf-8"))
+        profiles = raw.get("characters", {}) if isinstance(raw, dict) else {}
+        selected = {}
+        for name, profile in profiles.items():
+            if not isinstance(profile, dict):
+                continue
+            first = profile.get("first_appearance_chapter")
+            if isinstance(first, int) and first > chapter_num:
+                continue
+            if name in source_text:
+                selected[name] = profile
+        characters["characters"] = selected
+    bible["characters"] = characters
+
+    clue_path = config.bible_dir / "clues.json"
+    clues = {"clues": {}, "active_foreshadowing": {}}
+    if clue_path.exists():
+        raw = json.loads(clue_path.read_text(encoding="utf-8"))
+        for key in clues:
+            for clue_id, item in (raw.get(key, {}) or {}).items():
+                if clue_id in source_text:
+                    clues[key][clue_id] = item
+    bible["clues"] = clues
+    bible["motif_bank"] = {"motifs": []}
+    return bible
+
+
+def _build_revision_context(config, chapter_num: int, plan: dict,
+                            original: str, feedback: str) -> dict:
+    """Build chronological context for an old chapter without replanning it."""
+    from engine.agents.researcher import ResearcherAgent
+    from engine.agents.story_keeper import load_bare_state, writer_warnings
+
+    source_text = original + "\n" + feedback + "\n" + json.dumps(plan, ensure_ascii=False)
+    bible = _revision_bible(config, chapter_num, source_text)
+    context = ResearcherAgent().run(plan, chapter_num, bible)
+    context["_plan"] = plan
+
+    previous = config.generated_dir / f"chapter_{chapter_num - 1:02d}.md"
+    if previous.exists():
+        context["previous_chapter_tail"] = previous.read_text(encoding="utf-8")[-1600:]
+    following = config.generated_dir / f"chapter_{chapter_num + 1:02d}.md"
+    if following.exists():
+        context["next_chapter_head"] = following.read_text(encoding="utf-8")[:1600]
+
+    state = load_bare_state(config.bible_dir)
+    context["_story_state"] = state
+    context["story_continuity_warnings"] = writer_warnings(
+        state, chapter_num, dict(plan, draft=original),
+    )
+    return context
+
+
 def cmd_revise(chapter_num: int, feedback: str):
-    """修订已生成章节"""
+    """修订已生成章节，并跑与新章一致的整章质量闸门。"""
     config = get_config()
     cf = config.generated_dir / f"chapter_{chapter_num:02d}.md"
     if not cf.exists():
@@ -1337,8 +1556,24 @@ def cmd_revise(chapter_num: int, feedback: str):
     print(f"修订第 {chapter_num} 章: {feedback}")
 
     from engine.agents.writer import WriterAgent
+    from engine.agents.reviewers import ReviewerAgent
+    from engine.agents.reader_proxy import ReaderProxy
+    from engine.agents.dialogue_auditor import DialogueAuditor
     from engine.prompts_loader import get_prompt
     writer = WriterAgent()
+
+    plan_file = config.cache_dir / f"archive_plan_{chapter_num:02d}.json"
+    plan = json.loads(plan_file.read_text(encoding="utf-8")) if plan_file.exists() else {}
+    context_pack = _build_revision_context(config, chapter_num, plan, original, feedback)
+    review_context = {
+        "plan": plan,
+        "previous_chapter_tail": context_pack.get("previous_chapter_tail", ""),
+        "next_chapter_head": context_pack.get("next_chapter_head", ""),
+        "characters": context_pack.get("relevant_characters", {}),
+        "memory_notes": context_pack.get("memory_notes", ""),
+        "story_continuity_warnings": context_pack.get("story_continuity_warnings", ""),
+        "recent_chapters_summary": context_pack.get("recent_chapters_summary", ""),
+    }
 
     # 取 writer prompt 中的写作规则部分，确保修订时规则不丢失
     writer_system, _ = get_prompt("writer")
@@ -1348,42 +1583,95 @@ def cmd_revise(chapter_num: int, feedback: str):
         f"{rule_section}\n\n"
         f"【任务】根据用户要求修订章节正文。保持人物性格、剧情走向不变。\n\n"
         f"【修改要求】\n{feedback}\n\n"
+        f"【连续性上下文】\n{json.dumps(review_context, ensure_ascii=False, indent=2)}\n\n"
         f"【执行要求】\n"
         f"- 只改与修改要求相关的部分，其余保留原文\n"
-        f"- 修改后全文不能出现任何禁用词\n"
-        f"- 对话依然要像真人说话：有打断、有废话、有口癖\n\n"
+        f"- 遵守本书格式；普通词语按语境判断，不为避词损害意思\n"
+        f"- 对话符合人物利益与声口，不强加口癖、废话或打断\n"
+        f"- 下一章片段只用于避免矛盾，不得把后续事件提前写进本章\n"
+        f"- 不凭空加入后续经历、能力或关系，不重复已经完成的动作\n\n"
         f"【原文】\n{original}\n\n"
         f"输出修订后的完整正文，不要任何说明或标注。"
     )
     revised = writer._call_llm(prompt, 0)
-    _atomic_write(cf, revised)
+    from engine.quality import edit_chapter
+    revised, scan, reader_result, chapter_reviews, chapter_passed = edit_chapter(
+        revised, plan, chapter_num, context_pack, config, writer,
+        ReviewerAgent(), ReaderProxy(), DialogueAuditor(),
+    )
+    diag = pending.build_diagnostics(chapter_num, plan.get("chapter_title", ""), len(revised),
+                                     plan, {}, [], scan, scan.to_rows(chapter_num))
+    diag["revision_request"] = feedback
+    diag["quality_passed"] = bool(chapter_passed and scan.passed)
+    diag["reader_result"] = reader_result
+    diag["reasons"]["chapter_review"] = chapter_reviews
+    pending.save_pending(config, chapter_num, revised, diag)
+    quality = "已通过完整质量闸门" if diag["quality_passed"] else "仍需人工修订"
+    print(f"第 {chapter_num} 章修订稿已进入待修订队列（{quality}），原定稿未覆盖。")
+    return 2
 
-    # 记录教训（JSONL + SQLite 双写）+ 修订后复扫
-    from engine.style_kit import scanner
-    from engine.db import NovelDB
-    lp = config.bible_dir / "lessons_learned.jsonl"
-    entry = json.dumps({"chapter": chapter_num, "issue": feedback, "fix": "用户手动修订"}, ensure_ascii=False)
-    with open(lp, "a", encoding="utf-8") as f:
-        f.write(entry + "\n")
+
+def cmd_pending():
+    """列出待人工修订队列（未通过全部质量闸门的章节）。"""
+    config = get_config()
+    items = pending.list_pending(config)
+    if not items:
+        print("待修订队列为空")
+        return
+    print(f"待人工修订 {len(items)} 章:")
+    for item in items:
+        reasons = item.get("reasons") or {}
+        scenes = len(reasons.get("scene_failures") or [])
+        final_scan = len(reasons.get("final_scan") or [])
+        detail = ""
+        if scenes or final_scan:
+            detail = f"（场景失败 {scenes} 个, 最终扫描 {final_scan} 条）"
+        print(f"  第 {item['num']} 章: {item.get('title') or '(未命名)'} | "
+              f"{item.get('words', 0):,} 字 | {item.get('created_at', '')}{detail}")
+    print(f"\n定稿: python novel.py --novel {get_novel()} publish <章号>")
+    print(f"丢弃: python novel.py --novel {get_novel()} discard <章号>")
+
+
+def cmd_publish(chapter_num: int):
+    """把待修订队列中的一章正式定稿：跑完整归档管线，正文进 generated/ 与知识库。"""
+    config = get_config()
+    entry = pending.load_pending(config, chapter_num)
+    if entry is None:
+        raise CommandError(f"第 {chapter_num} 章不在待修订队列")
+    content = entry["content"]
+    if not content.strip():
+        raise CommandError("正文为空，不能发布")
+    from engine.knowledge import check_ready
     try:
-        _db = NovelDB(get_novel_dir())
-        _db.add_lesson(chapter_num, feedback, "用户手动修订", "user")
-        rows = scanner.scan(revised).to_rows(chapter_num)
-        _db.delete_style_hits(chapter_num)
-        if rows:
-            _db.add_style_hits(rows)
-        _db.invalidate_from(chapter_num)
-        _db.log_chapter(chapter_num, words=len(revised), status="knowledge_stale")
-        _db.close()
-        from engine.agents.keeper import KeeperAgent
-        KeeperAgent().invalidate_from(chapter_num)
-    except Exception as e:
-        log.warning(f"修订后知识失效标记失败: {e}")
-    post = scanner.scan(revised)
-    if not post.passed:
-        print(f"  ⚠ 修订稿仍含机械违规 {len(post.violations)} 条（已记入风格档案）")
+        check_ready(config, chapter_num, publishing=True)
+    except ValueError as exc:
+        raise CommandError(str(exc)) from exc
+    diag = entry["diagnostics"] or {}
+    plan_json = diag.get("plan_json") or {}
+    if not plan_json.get("scene_outline"):
+        plan_json["scene_outline"] = [{
+            "scene_id": 1, "type": "high_conflict",
+            "target_emotion": 0.8, "description": "待修订章节",
+        }]
 
-    print(f"第 {chapter_num} 章已修订 | {len(revised):,} 字")
+    from engine.agents.keeper import KeeperAgent
+    from engine.style_kit import scanner
+    keeper = KeeperAgent()
+    keeper_cache = keeper.reconcile_final_chapter(keeper.init_cache(chapter_num), content, chapter_num)
+    keeper_cache["_style_hits"] = scanner.scan(content).to_rows(chapter_num)
+    title = diag.get("title") or plan_json.get("chapter_title") or ""
+    replacing = (config.generated_dir / f"chapter_{chapter_num:02d}.md").exists()
+    _publish_chapter(config, chapter_num, content, plan_json, keeper_cache,
+                     replacing=replacing, locked_title=title)
+    print(f"第 {chapter_num} 章已发布（来源：待人工修订队列）")
+
+
+def cmd_discard(chapter_num: int):
+    """丢弃待修订队列中的一章（不发布、不入知识库）。"""
+    config = get_config()
+    if not pending.remove_pending(config, chapter_num):
+        raise CommandError(f"第 {chapter_num} 章不在待修订队列")
+    print(f"第 {chapter_num} 章待修订稿已丢弃")
 
 
 def cmd_summary(volume_num: int, prompt: str = ""):
@@ -1477,6 +1765,15 @@ def _main():
 
     # 需要设置小说的命令
     set_novel(novel)
+    from engine.locking import novel_lock
+    from engine.usage import usage_run, task_limit
+    with novel_lock(get_novel_dir()), usage_run(
+            get_novel_dir(), cmd, task_limit(get_config(), cmd)):
+        return _dispatch(args)
+
+
+def _dispatch(args):
+    cmd, novel = args["command"], args["novel"]
 
     if cmd == "scan":
         return cmd_scan(args["chapter"])
@@ -1508,6 +1805,30 @@ def _main():
             )
         return cmd_revise(args["chapter"], feedback)
 
+    if cmd == "pending":
+        return cmd_pending()
+
+    if cmd == "rebuild":
+        from engine.knowledge import rebuild
+        print(f"已从定稿正文重建 {rebuild(get_config())} 章知识；旧知识备份保留在 .history")
+        return
+
+    if cmd == "prepare":
+        from engine.foundation import prepare
+        print(f"已补全 {prepare(get_config())} 位人物的动机、边界与声口")
+        return
+
+    if cmd == "recover":
+        from engine.knowledge import recover
+        print("已恢复中断前的知识与正文" if recover(get_novel_dir()) else "没有中断的归档事务")
+        return
+
+    if cmd == "publish":
+        return cmd_publish(args["chapter"])
+
+    if cmd == "discard":
+        return cmd_discard(args["chapter"])
+
     if cmd == "summary":
         return cmd_summary(args["volume"], args["prompt"])
 
@@ -1527,6 +1848,11 @@ def _main():
     print("    python novel.py --novel <名> generate <章号>       生成指定章节")
     print("    python novel.py --novel <名> generate <章号> -p \"指令\" 带创作指令")
     print("    python novel.py --novel <名> revise <章号> <修改要求>  修订章节")
+    print("    python novel.py --novel <名> pending            列出待人工修订队列")
+    print("    python novel.py --novel <名> rebuild            从定稿正文重建全部知识")
+    print("    python novel.py --novel <名> recover            恢复中断的归档事务")
+    print("    python novel.py --novel <名> publish <章号>     待修订章节定稿发布")
+    print("    python novel.py --novel <名> discard <章号>     丢弃待修订章节")
     print()
     print("  收尾:")
     print("    python novel.py --novel <名> summary <卷号>        生成卷末总结")
@@ -1544,10 +1870,12 @@ def _main():
 
 
 def main():
+    from engine.locking import NovelBusyError
+    from engine.usage import CallBudgetExceeded
     try:
         result = _main()
         return result if isinstance(result, int) else 0
-    except CommandError as exc:
+    except (CommandError, SceneQualityError, NovelBusyError, CallBudgetExceeded) as exc:
         print(f"错误: {exc}", file=sys.stderr)
         return 1
 

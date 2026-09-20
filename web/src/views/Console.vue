@@ -9,12 +9,20 @@
       <div class="page-actions">
         <el-tag v-if="pipe" effect="plain" size="large" :type="pipe.stage === 'publish' ? 'success' : 'warning'">{{ stageHint }}</el-tag>
         <el-button :loading="historyLoading || pipeLoading" @click="refreshAll"><el-icon><Refresh /></el-icon>刷新</el-button>
+        <el-button :disabled="busy || !novelName" @click="run('prepare', {})"><el-icon><EditPen /></el-icon>补全人物档案</el-button>
       </div>
     </header>
 
     <div v-if="!novelName" class="empty-panel"><el-empty description="请先选择小说" /></div>
     <template v-else>
       <el-alert v-if="error" type="error" :title="error" show-icon :closable="false" class="section-gap" />
+      <el-alert v-if="pipe?.interrupted_archive || pipe?.stale_chapters?.length" type="warning" show-icon :closable="false" class="section-gap" title="正文与知识尚未同步">
+        <el-button :disabled="busy" @click="run(pipe.interrupted_archive ? 'recover' : 'rebuild', {})"><el-icon><Refresh /></el-icon>{{ pipe.interrupted_archive ? '恢复归档' : '重建知识' }}</el-button>
+      </el-alert>
+      <el-alert v-if="pipe?.pending_count" type="warning" show-icon :closable="false" class="section-gap"
+                :title="`有 ${pipe.pending_count} 章待人工修订（未通过全部质量闸门，已转待修订队列）`">
+        <template #default><el-button link type="primary" @click="goto('chapters')">去处理 →</el-button></template>
+      </el-alert>
 
       <div class="pipeline" v-loading="pipeLoading">
         <!-- ① 大纲 -->
@@ -184,8 +192,8 @@ let statusPollAttempts = 0
 const maxReconnectAttempts = 3
 const maxStatusPollAttempts = 10
 const LOG_TAIL_LIMIT = 200000  // 任务输出只保留尾部 200K 字符，防止长任务把页面渲染卡死
-const taskLabels = { outline: '生成大纲', titles: '提取章名', generate: '生成章节', summary: '卷末总结', revise: '修订章节', db: '知识库操作' }
-const terminalStatuses = new Set(['done', 'failed', 'error', 'orphaned', 'cancelled'])
+const taskLabels = { outline: '生成大纲', titles: '提取章名', generate: '生成章节', summary: '卷末总结', revise: '修订章节', db: '知识库操作', publish: '发布章节' }
+const terminalStatuses = new Set(['done', 'failed', 'error', 'orphaned', 'cancelled', 'needs_revision'])
 
 const s0 = computed(() => step('outline'))
 const s1 = computed(() => step('titles'))
@@ -198,6 +206,9 @@ const s2done = computed(() => s2.value?.done)
 const maxEnd = computed(() => Math.min((pipe.value?.chapter_count || 1), ((pipe.value?.next_chapter || 1) + 19)))
 const batchCount = computed(() => Math.max(1, (batchEnd.value || pipe.value?.next_chapter || 1) - (pipe.value?.next_chapter || 1) + 1))
 const stageHint = computed(() => ({
+  rebuild: '知识待同步',
+  recover: '归档中断待恢复',
+  revision: '先处理待修订章节',
   outline: '第一步：先生成全书大纲',
   titles: '第二步：从大纲提取章名',
   fill_gaps: '有缺章，建议先补齐再续写',

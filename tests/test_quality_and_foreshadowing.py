@@ -1,4 +1,5 @@
 import json
+import itertools
 import tempfile
 import unittest
 from contextlib import ExitStack
@@ -69,6 +70,10 @@ class TestSceneQualityGate(unittest.TestCase):
         ]
         patches = [patch.object(cls, "__init__", return_value=None) for cls in constructors]
         patches.extend([
+            patch("engine.quality.edit_chapter", side_effect=lambda text, plan, chapter, context, config, *agents: (
+                text, scans[-1], {"overall_score": 8, "would_continue": True}, [],
+                scans[-1].passed and scans[len(drafts)-1].passed and reviews[-1].get("passed", False) and audits[-1].get("passed", False))),
+            patch.object(KeeperAgent, "_compress_scene", return_value={"plot_progress": "定稿摘要", "chapter_num": 1}),
             patch.object(novel, "get_config", return_value=self.config),
             patch.object(novel, "get_novel_dir", return_value=self.root),
             patch.object(PlannerAgent, "run", return_value=plan),
@@ -86,7 +91,7 @@ class TestSceneQualityGate(unittest.TestCase):
             patch.object(ReaderProxy, "read", return_value={
                 "overall_score": 8, "would_continue": True,
             }),
-            patch("engine.style_kit.scanner.scan", side_effect=scans),
+            patch("engine.style_kit.scanner.scan", side_effect=itertools.chain(scans, itertools.repeat(scans[-1] if scans else ScanResult()))),
             patch.object(StoryKeeperAgent, "load_state", return_value=_empty_state()),
             patch.object(StoryKeeperAgent, "update_state", return_value=_empty_state()),
         ])
@@ -129,7 +134,36 @@ class TestSceneQualityGate(unittest.TestCase):
             (1, "节奏", "最终", 2),
         ])
 
-    def test_exhaustion_accepts_best_draft_and_publishes(self):
+    def test_interrupted_generation_resumes_completed_scenes(self):
+        from engine import checkpoint
+        passed = ScanResult()
+        patches = self._patches(["第一场"], [passed, passed], [{"passed": True}], [{"passed": True}])
+        plan = {"chapter_title": "测试章", "scene_outline": [
+            {"scene_id": 1, "type": "breathable"}, {"scene_id": 2, "type": "high_conflict"}],
+            "clue_operations": []}
+        with ExitStack() as stack:
+            for item in patches:
+                stack.enter_context(item)
+            planner = stack.enter_context(patch.object(PlannerAgent, "run", return_value=plan))
+            writer = stack.enter_context(patch.object(WriterAgent, "run", side_effect=["第一场", OSError("interrupted")]))
+            stack.enter_context(patch.object(ReviewerAgent, "immediate_check", return_value={"passed": True}))
+            stack.enter_context(patch.object(DialogueAuditor, "audit", return_value={"passed": True}))
+            with self.assertRaisesRegex(OSError, "interrupted"):
+                novel.cmd_generate(1)
+            checkpoints = list(self.config.cache_dir.glob("draft_checkpoint_*.json"))
+            self.assertEqual(len(checkpoints), 1)
+            self.assertEqual(checkpoint.load(checkpoints[0])["completed"], 1)
+            self.assertFalse((self.config.generated_dir / "chapter_01.md").exists())
+            writer.reset_mock()
+            writer.side_effect = ["第二场"]
+            novel.cmd_generate(1)
+            self.assertEqual(planner.call_count, 1)
+            self.assertEqual(writer.call_count, 1)
+            self.assertEqual(writer.call_args.args[0]["scene_id"], 2)
+        self.assertEqual((self.config.generated_dir / "chapter_01.md").read_text(encoding="utf-8"), "第一场\n第二场")
+        self.assertFalse(checkpoints[0].exists())
+
+    def test_exhaustion_routes_to_pending(self):
         failed = ScanResult(violations=[{
             "category": "禁用词", "pattern": "坏", "count": 1,
             "where": "全文", "hint": "删",
@@ -144,11 +178,48 @@ class TestSceneQualityGate(unittest.TestCase):
             for item in patches:
                 stack.enter_context(item)
             novel.cmd_generate(1)
-        # 闸门重试耗尽不再整章失败：接受最佳稿继续发布，诊断留存 failed_drafts 供事后审阅
-        self.assertTrue((self.config.generated_dir / "chapter_01.md").exists())
+        # 重试耗尽 → 整章转入待人工修订队列：不进 generated/、不发布、不进知识库
+        self.assertFalse((self.config.generated_dir / "chapter_01.md").exists())
+        revision = self.root / "revision" / "chapter_01.md"
+        self.assertEqual(revision.read_text(encoding="utf-8"), "失败二")
+        diag = json.loads((self.root / "revision" / "chapter_01.json")
+                          .read_text(encoding="utf-8"))
+        failures = diag["reasons"]["scene_failures"]
+        self.assertEqual(failures[0]["scene_id"], 1)
+        self.assertFalse(failures[0]["gates"]["scan_passed"])
+        # attempt 级审计仍留存 failed_drafts
         failed_file = self.config.cache_dir / "failed_drafts" / "chapter_01_scene_1.md"
         self.assertEqual(failed_file.read_text(encoding="utf-8"), "失败二")
         self.assertTrue(failed_file.with_suffix(".json").exists())
+
+    def test_pending_chapter_not_logged_in_knowledge_base(self):
+        failed = ScanResult(violations=[{
+            "category": "禁用词", "pattern": "坏", "count": 1,
+            "where": "全文", "hint": "删",
+        }])
+        passed = ScanResult()
+        patches = self._patches(
+            ["失败一", "失败二"], [failed, failed, passed],
+            [{"passed": True}, {"passed": True}],
+            [{"passed": True}, {"passed": True}],
+        )
+        with ExitStack() as stack:
+            for item in patches:
+                stack.enter_context(item)
+            novel.cmd_generate(1)
+        # 转待修订的章节不写任何知识库：chapter_log/facts/summaries 无行，keeper_cache 不落盘
+        db = NovelDB(self.root)
+        try:
+            log_rows = db.conn.execute(
+                "SELECT COUNT(*) AS n FROM chapter_log WHERE chapter=1").fetchone()["n"]
+            facts = db.conn.execute(
+                "SELECT COUNT(*) AS n FROM chapter_facts WHERE chapter=1").fetchone()["n"]
+            summaries = db.conn.execute(
+                "SELECT COUNT(*) AS n FROM chapter_summaries WHERE chapter=1").fetchone()["n"]
+        finally:
+            db.close()
+        self.assertEqual((log_rows, facts, summaries), (0, 0, 0))
+        self.assertFalse((self.config.cache_dir / "keeper_cache_01.json").exists())
 
     def test_gate_retries_when_story_logic_fails(self):
         # 风格/语义/声纹全过，但故事逻辑闸门第一轮判违规（事实矛盾）→ 携建议重试，二轮通过
@@ -175,7 +246,29 @@ class TestSceneQualityGate(unittest.TestCase):
             "修订稿",
         )
 
-    def test_merged_chapter_failure_does_not_publish(self):
+    def test_merged_chapter_failure_routes_to_pending(self):
+        passed = ScanResult()
+        failed = ScanResult(violations=[{
+            "category": "排版", "pattern": "合并违规", "count": 1,
+            "where": "全文", "hint": "修复",
+        }])
+        patches = self._patches(
+            ["场景正文"], [passed, failed], [{"passed": True}], [{"passed": True}],
+        )
+        with ExitStack() as stack:
+            for item in patches:
+                stack.enter_context(item)
+            novel.cmd_generate(1)  # 不再抛 SceneQualityError，改转待修订队列
+        self.assertFalse((self.config.generated_dir / "chapter_01.md").exists())
+        revision = self.root / "revision" / "chapter_01.md"
+        self.assertEqual(revision.read_text(encoding="utf-8"), "场景正文")
+        diag = json.loads((self.root / "revision" / "chapter_01.json")
+                          .read_text(encoding="utf-8"))
+        self.assertTrue(diag["reasons"]["final_scan"])
+        self.assertEqual(diag["reasons"]["final_scan"][0]["pattern"], "合并违规")
+
+    def test_gate_fail_mode_abort_raises(self):
+        self.config.gate_fail_mode = "abort"
         passed = ScanResult()
         failed = ScanResult(violations=[{
             "category": "排版", "pattern": "合并违规", "count": 1,
@@ -189,9 +282,90 @@ class TestSceneQualityGate(unittest.TestCase):
                 stack.enter_context(item)
             with self.assertRaises(novel.SceneQualityError):
                 novel.cmd_generate(1)
+        # abort 模式恢复旧行为：硬失败，不进待修订队列
         self.assertFalse((self.config.generated_dir / "chapter_01.md").exists())
-        failed_file = self.config.cache_dir / "failed_drafts" / "chapter_01_scene_merged.md"
-        self.assertEqual(failed_file.read_text(encoding="utf-8"), "场景正文")
+        self.assertFalse((self.root / "revision" / "chapter_01.md").exists())
+
+    def test_cmd_publish_finalizes_pending(self):
+        revision_dir = self.root / "revision"
+        revision_dir.mkdir(parents=True, exist_ok=True)
+        (revision_dir / "chapter_01.md").write_text("修订定稿", encoding="utf-8")
+        style_hits = [(1, "节奏", "最终", 2)]
+        keeper_cache = {
+            "current_chapter_snapshots": [{"chapter_num": 1, "scene_id": 1}],
+            "_style_hits": style_hits,
+        }
+        diag = {
+            "chapter": 1, "title": "测试章", "created_at": "2026-09-17T00:00:00",
+            "words": 4, "plan_json": {
+                "chapter_title": "测试章",
+                "scene_outline": [{"scene_id": 1, "type": "breathable"}],
+                "clue_operations": [],
+            },
+            "keeper_cache": keeper_cache,
+            "reasons": {"scene_failures": [], "final_scan": []},
+            "scan_metrics": {}, "style_hits": style_hits,
+        }
+        (revision_dir / "chapter_01.json").write_text(
+            json.dumps(diag, ensure_ascii=False), encoding="utf-8")
+
+        def save_chapter(_self, chapter, text):
+            self.config.generated_dir.mkdir(parents=True, exist_ok=True)
+            (self.config.generated_dir / f"chapter_{chapter:02d}.md").write_text(
+                text, encoding="utf-8"
+            )
+
+        patches = [
+            patch.object(novel, "get_config", return_value=self.config),
+            patch.object(KeeperAgent, "init_cache", return_value={}),
+            patch.object(KeeperAgent, "_compress_scene", return_value={"plot_progress": "修订定稿", "chapter_num": 1}),
+            patch.object(novel, "get_novel_dir", return_value=self.root),
+            # 跳过真实 __init__（依赖全局 proxy config），只测发布逻辑
+            patch.object(ReaderProxy, "__init__", return_value=None),
+            patch.object(ArchivistAgent, "__init__", return_value=None),
+            patch.object(StoryKeeperAgent, "__init__", return_value=None),
+            patch.object(KeeperAgent, "__init__", return_value=None),
+            patch.object(ReaderProxy, "read", return_value={
+                "overall_score": 8, "would_continue": True,
+            }),
+            patch.object(ArchivistAgent, "update_bible", return_value=True),
+            patch.object(ArchivistAgent, "save_chapter", new=save_chapter),
+            patch.object(StoryKeeperAgent, "update_state", return_value=_empty_state()),
+            patch.object(KeeperAgent, "save_cache", return_value=None),
+        ]
+        with ExitStack() as stack:
+            for item in patches:
+                stack.enter_context(item)
+            novel.cmd_publish(1)
+        # 定稿：正文进 generated/，revision/ 清空，chapter_log 记 generated
+        self.assertEqual(
+            (self.config.generated_dir / "chapter_01.md").read_text(encoding="utf-8"),
+            "修订定稿",
+        )
+        self.assertFalse((revision_dir / "chapter_01.md").exists())
+        self.assertFalse((revision_dir / "chapter_01.json").exists())
+        db = NovelDB(self.root)
+        try:
+            row = db.conn.execute(
+                "SELECT status FROM chapter_log WHERE chapter=1").fetchone()
+        finally:
+            db.close()
+        self.assertEqual(row["status"], "generated")
+
+    def test_cmd_discard_removes_pending(self):
+        revision_dir = self.root / "revision"
+        revision_dir.mkdir(parents=True, exist_ok=True)
+        (revision_dir / "chapter_01.md").write_text("草稿", encoding="utf-8")
+        (revision_dir / "chapter_01.json").write_text("{}", encoding="utf-8")
+        patches = [patch.object(novel, "get_config", return_value=self.config)]
+        with ExitStack() as stack:
+            for item in patches:
+                stack.enter_context(item)
+            novel.cmd_discard(1)
+            with self.assertRaises(novel.CommandError):
+                novel.cmd_discard(2)
+        self.assertFalse((revision_dir / "chapter_01.md").exists())
+        self.assertFalse((revision_dir / "chapter_01.json").exists())
 
     def test_archivist_failure_does_not_publish_staged_chapter(self):
         passed = ScanResult()
@@ -205,6 +379,7 @@ class TestSceneQualityGate(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "正文未发布"):
                 novel.cmd_generate(1)
         self.assertFalse((self.config.generated_dir / "chapter_01.md").exists())
+        self.assertEqual((self.root / "revision/chapter_01.md").read_text(encoding="utf-8"), "场景正文")
 
     def test_existing_chapter_requires_explicit_overwrite(self):
         self.config.generated_dir.mkdir()
@@ -218,7 +393,7 @@ class TestSceneQualityGate(unittest.TestCase):
                 novel.cmd_generate(1)
         self.assertEqual(chapter.read_text(encoding="utf-8"), "旧正文")
 
-    def test_overwrite_marks_following_knowledge_stale(self):
+    def test_overwrite_enters_revision_without_replanning_from_future_state(self):
         self.config.generated_dir.mkdir()
         chapter = self.config.generated_dir / "chapter_01.md"
         chapter.write_text("旧正文", encoding="utf-8")
@@ -230,27 +405,14 @@ class TestSceneQualityGate(unittest.TestCase):
         patches = self._patches(
             ["新正文"], [passed, passed], [{"passed": True}], [{"passed": True}],
         )
-        invalidated = []
         with ExitStack() as stack:
             for item in patches:
                 stack.enter_context(item)
-            stack.enter_context(patch.object(
-                KeeperAgent, "invalidate_from",
-                side_effect=lambda chapter_num: invalidated.append(chapter_num),
-            ))
-            novel.cmd_generate(1, overwrite=True)
-        self.assertEqual(chapter.read_text(encoding="utf-8"), "新正文")
-        self.assertEqual(invalidated, [2])
-        db = NovelDB(self.root)
-        try:
-            self.assertEqual(db.conn.execute(
-                "SELECT status FROM chapter_log WHERE chapter=2"
-            ).fetchone()[0], "knowledge_stale")
-            self.assertIsNone(db.conn.execute(
-                "SELECT 1 FROM chapter_summaries WHERE chapter=2"
-            ).fetchone())
-        finally:
-            db.close()
+            revise = stack.enter_context(patch.object(novel, "cmd_revise", return_value=2))
+            self.assertEqual(novel.cmd_generate(1, overwrite=True), 2)
+            PlannerAgent.run.assert_not_called()
+            revise.assert_called_once()
+        self.assertEqual(chapter.read_text(encoding="utf-8"), "旧正文")
 
     def test_heavy_patch_is_reviewed_again_and_reconciles_snapshot(self):
         self.config.heavy_review_interval = 1
@@ -481,6 +643,7 @@ class TestForeshadowProtocol(unittest.TestCase):
 
             extracted = {
                 "chapter_summary": "摘要",
+                "confirmed_clue_operations": [],
                 "character_updates": {"林一": {"location": "车站"}},
                 "clue_updates": {"C1": {"status": "new"}},
                 "facts": [{"kind": "plot", "subject": "林一", "content": "抵达"}],
@@ -529,19 +692,19 @@ class TestStoryKeeper(unittest.TestCase):
         sk = self._agent()
         state = _empty_state()
         sk._merge_facts(state, 1, [
-            {"entity": "沈渊", "attribute": "位置", "value": "零号废墟"},
-            {"entity": "沈渊", "attribute": "习惯", "value": "常去一号车间"},
+            {"entity": "沈渊", "attribute": "出生地", "value": "零号废墟"},
+            {"entity": "沈渊", "attribute": "习惯", "value": "常去一号车间", "immutable": True},
         ])
         sk._merge_facts(state, 2, [
-            {"entity": "沈渊", "attribute": "位置", "value": "星港码头"},
-            {"entity": "沈渊", "attribute": "习惯", "value": "常去三号仓库"},
+            {"entity": "沈渊", "attribute": "出生地", "value": "星港码头"},
+            {"entity": "沈渊", "attribute": "习惯", "value": "常去三号仓库", "immutable": True},
         ])
         self.assertEqual(len(state["continuity_warnings"]), 2)
         by_attr = {w["attribute"]: w for w in state["continuity_warnings"]}
-        self.assertEqual(by_attr["位置"]["severity"], "major")
+        self.assertEqual(by_attr["出生地"]["severity"], "major")
         self.assertEqual(by_attr["习惯"]["severity"], "minor")
-        self.assertEqual(by_attr["位置"]["prior"], "零号废墟")
-        self.assertEqual(by_attr["位置"]["now"], "星港码头")
+        self.assertEqual(by_attr["出生地"]["prior"], "零号废墟")
+        self.assertEqual(by_attr["出生地"]["now"], "星港码头")
         # 同一值重复出现不产生新警告
         sk._merge_facts(state, 3, [
             {"entity": "沈渊", "attribute": "位置", "value": "星港码头"},
@@ -637,6 +800,7 @@ class TestStoryKeeper(unittest.TestCase):
             "arc_updates": [{"character": "沈渊", "goal": "活下去"}],
             "new_questions": ["废墟里还有什么"],
             "resolved_question_ids": [],
+            "chapter_hooks": {"light_hook": "门被推开", "dark_hook": ""},
         }):
             state = sk.update_state(self.bible, 1, plan, {}, "正文")
         self.assertEqual(state["last_updated"], 1)
@@ -649,7 +813,7 @@ class TestStoryKeeper(unittest.TestCase):
         self.assertEqual(reloaded["hook_log"][0]["light"], "门被推开")
         # 坏 clues.json 不炸
         (self.bible / "clues.json").write_text("{bad json", encoding="utf-8")
-        state2 = sk.update_state(self.bible, 2, plan, {}, "正文")
+        state2 = sk.update_state(self.bible, 2, plan, {}, "正文", extraction={"facts": []})
         self.assertEqual(state2["unresolved_promises"], {})
 
     def test_record_actual_events_appends_and_dedupes(self):
@@ -714,11 +878,11 @@ class TestStoryKeeper(unittest.TestCase):
         self.assertFalse(bad["passed"])
         self.assertEqual(bad["errors"][0]["type"], "事实矛盾")
 
-    def test_story_check_fails_open_on_any_error(self):
-        # 无小说上下文（get_prompt 抛错）→ 放行，绝不阻断
+    def test_story_check_fails_closed_on_any_error(self):
         with patch("engine.prompts_loader.get_prompt", side_effect=RuntimeError("未设置小说")):
             result = story_check({}, 1, {"scene_id": 1}, "草稿", {})
-        self.assertTrue(result["passed"])
+        self.assertFalse(result["passed"])
+        self.assertTrue(result["unavailable"])
         self.assertEqual(result["errors"], [])
 
     def test_append_volume_revisions_writes_and_returns_block(self):

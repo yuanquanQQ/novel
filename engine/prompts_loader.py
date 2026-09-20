@@ -63,9 +63,10 @@ def _banned_words_inline() -> str:
         sw = "、".join(f"{k}(≤{v})" for k, v in rules.get("soft_words", {}).items())
         pat_ids = [pp.get("id", "") for pp in rules.get("patterns", [])
                    if pp.get("severity") == "hard"]
-        _style_cache["_banned"] = (f"硬禁用词（命中即打回）：{hw}\n"
-                                   f"软禁用词（超频次打回）：{sw}\n"
-                                   f"高危句式ID：{ '、'.join(pat_ids) }（不是而是/破折号/反问式解说腔等）")
+        policy = "用词观察（按语境判断，不要求清零）" if rules.get("word_policy") == "contextual" else "硬禁用词（命中即打回）"
+        _style_cache["_banned"] = (f"{policy}：{hw}\n"
+                                   f"用词提示（仅检查重复与语境，不硬拦）：{sw}\n"
+                                   f"句式观察：{ '、'.join(pat_ids) }（结合语境检查）")
     return _style_cache["_banned"]
 
 
@@ -82,7 +83,10 @@ def get_prompt(name: str):
     prompts = _init()
     entry = prompts.get(name, {})
     if "system" in entry or "chapter_template" in entry:
-        return (_apply_style_tokens(entry.get("system", "")),
+        system = _apply_style_tokens(entry.get("system", ""))
+        if name in {"planner", "writer", "reviewer_immediate", "reviewer_heavy", "chapter_editor", "story_check"}:
+            system += "\n\n" + _style_file("story_rules.md")
+        return (system,
                 _apply_style_tokens(entry.get("chapter_template", "")))
     if isinstance(entry, dict):
         return {k: _apply_style_tokens(str(v)) for k, v in entry.items()}, ""

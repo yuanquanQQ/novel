@@ -18,7 +18,7 @@ def get_client() -> OpenAI:
     base_url = getattr(config, 'base_url', None) or getattr(config, 'deepseek_base_url', '')
     identity = (api_key, base_url)
     if _client is None or _client_identity != identity:
-        _client = OpenAI(api_key=api_key, base_url=base_url)
+        _client = OpenAI(api_key=api_key, base_url=base_url, max_retries=0)
         _client_identity = identity
     return _client
 
@@ -64,14 +64,23 @@ def chat(model_cfg, system_prompt: str = "", user_prompt: str = "",
 
     last_error = None
     for attempt in range(max_retries):
+        from engine.usage import reserve_call, record_call
+        reserve_call()
+        started, response = time.monotonic(), None
         try:
             log.info(f"LLM 调用: {model_cfg.model_name} "
                      f"(attempt {attempt + 1}/{max_retries})")
             response = client.chat.completions.create(**kwargs)
             content = response.choices[0].message.content
+            if not isinstance(content, str) or not content.strip():
+                raise ValueError("模型返回空正文")
+            if getattr(response.choices[0], "finish_reason", None) == "length":
+                raise ValueError("模型输出被长度上限截断")
+            record_call(model_cfg.model_name, started, response=response)
             log.info(f"LLM 响应: {len(content)} 字符")
             return content
         except Exception as e:
+            record_call(model_cfg.model_name, started, response=response, error=e)
             last_error = e
             err_str = str(e)
             # 429/rate limit: 等久一点

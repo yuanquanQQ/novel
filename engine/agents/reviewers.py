@@ -3,6 +3,7 @@
 import json
 import logging
 from engine.proxy import config
+from engine.quality import validate_verdict
 
 log = logging.getLogger("reviewers")
 
@@ -20,17 +21,18 @@ class ReviewerAgent:
 
         prompt = self._build_immediate_prompt(draft, keeper_cache, scene,
                                               context_pack)
-        result = self._call_immediate_llm(prompt)
-
-        errors = result.get("errors", [])
-        if not isinstance(errors, list):
-            errors = []
-        errors = [error for error in errors if isinstance(error, dict)]
-        suggestions = self._format_suggestions(errors)
+        try:
+            result = validate_verdict(self._call_immediate_llm(prompt))
+        except Exception as exc:
+            log.warning("即时审阅不可用: %s", exc)
+            result = validate_verdict(None)
+        errors = result["errors"]
+        suggestions = self._format_suggestions(errors) or result.get("suggestions", "")
         return {
-            "passed": result.get("passed", False) is True,
+            "passed": result["passed"],
             "errors": errors,
             "suggestions": suggestions,
+            "unavailable": result.get("unavailable", False),
         }
 
     def _build_immediate_prompt(self, draft: str, keeper_cache: dict,
@@ -47,6 +49,7 @@ class ReviewerAgent:
         )
         if scene_type:
             prompt += f"\n\n【场景类型】{scene_type}"
+        prompt += "\n\n【本场景任务及起止状态】\n" + json.dumps(scene, ensure_ascii=False)
         if context_pack:
             chars = context_pack.get("relevant_characters", {})
             if chars:
@@ -87,6 +90,31 @@ class ReviewerAgent:
             plan_json=plan_str,
             full_chapter=full_chapter,
         )
+
+    def chapter_check(self, full_chapter: str, plan_json: dict,
+                      chapter_num: int, context_pack: dict) -> dict:
+        from engine.prompts_loader import get_prompt
+        from engine.llm_client import chat_json
+        system, _ = get_prompt("chapter_editor")
+        prompt = json.dumps({
+            "chapter": chapter_num, "plan": plan_json,
+            "prior_context": context_pack.get("story_continuity_warnings", ""),
+            "previous_chapter_tail": context_pack.get("previous_chapter_tail", ""),
+            "next_chapter_head": context_pack.get("next_chapter_head", ""),
+            "memory_notes": context_pack.get("memory_notes", ""),
+            "recent_chapters_summary": context_pack.get("recent_chapters_summary", ""),
+            "characters": context_pack.get("relevant_characters", {}),
+            "full_chapter": full_chapter,
+        }, ensure_ascii=False)
+        try:
+            result = validate_verdict(chat_json(
+                self.heavy_config, system_prompt=system, user_prompt=prompt))
+        except Exception as exc:
+            log.warning("整章编辑审阅不可用: %s", exc)
+            result = validate_verdict(None)
+        result["suggestions"] = (self._format_suggestions(result["errors"])
+                                 or result.get("suggestions", ""))
+        return result
 
     def _call_heavy_llm(self, prompt: str) -> dict:
         from engine.llm_client import chat_json

@@ -11,7 +11,8 @@ venv/
 !.env.example
 
 # Runtime data
-/runtime/tasks/
+/runtime/
+/novels/
 **/db/*.db
 **/db/*.sqlite*
 **/cache/
@@ -23,5 +24,6 @@ web/dist/
 # Editors and OS
 .vscode/
 .idea/
+/.claude/
 .DS_Store
 Thumbs.db

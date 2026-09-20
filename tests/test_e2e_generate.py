@@ -65,6 +65,7 @@ CH1_TEXT = SCENE1 + "\n\n" + SCENE2
 
 # (marker, 返回类型, handler)；marker 必须唯一标识一类 LLM 调用
 ROUTES = [
+    ("你是整章编辑", "json", lambda p, s: {"passed": True, "errors": [], "suggestions": ""}),
     ("番茄连载纪律", "chat", lambda p, s: CH1_TEXT),
     ("研究笔记", "chat", lambda p, s: "## 研究笔记\n- 沈渊在零号废墟。\n- 奇点炉外壳有裂缝。"),
     ("伏笔管家", "json", lambda p, s: {"operation_warnings": [], "overdue": [], "stale": [], "duplicates": []}),
@@ -75,6 +76,7 @@ ROUTES = [
             {"entity": "奇点炉", "attribute": "状态", "value": "外壳有裂缝"},
         ],
         "arc_updates": [], "new_questions": ["奇点炉从何而来"], "resolved_question_ids": [],
+        "chapter_hooks": PLAN["chapter_hooks"],
     }),
     ("记忆压缩器", "json", lambda p, s: {
         "plot_progress": "沈渊在零号废墟检查奇点炉，发现裂缝变宽，记下后离开。",
@@ -83,7 +85,7 @@ ROUTES = [
     }),
     ("声纹审计师", "json", lambda p, s: {"passed": True, "violations": []}),
     ("AI叙事", "json", lambda p, s: {"passed": True, "errors": []}),
-    ("挤地铁", "json", lambda p, s: {
+    ("连载读者", "json", lambda p, s: {
         "engagement_curve": [{"position": "0-600字", "understanding": 9, "interest": 8}],
         "confusion_points": [], "fatigue_points": [], "ai_suspect_points": [],
         "best_moment": "敲击奇点炉", "worst_moment": "", "would_continue": True,
@@ -92,6 +94,7 @@ ROUTES = [
     ("current_chapter_snapshots", "json", lambda p, s: {
         "character_updates": {"沈渊": {"status_change": "检查奇点炉后返回", "location": "零号废墟"}},
         "clue_updates": {},
+        "confirmed_clue_operations": [],
         "facts": [{"kind": "plot", "subject": "沈渊", "content": "在零号废墟检查奇点炉", "scene_id": 1}],
         "chapter_summary": "沈渊在零号废墟检查奇点炉，发现裂缝变宽，返回住处时门外响起敲门声。",
     }),
@@ -103,7 +106,7 @@ def _build_fake(captured):
     def fake_chat(model_cfg, system_prompt="", user_prompt="", response_json=False,
                   max_retries=5):
         for marker, kind, handler in ROUTES:
-            if marker in user_prompt:
+            if marker in user_prompt or marker in system_prompt:
                 captured["calls"].append(marker)
                 captured["prompts"].append((marker, user_prompt))
                 value = handler(user_prompt, system_prompt)
@@ -138,7 +141,7 @@ class TestEndToEndGenerate(unittest.TestCase):
 
     def test_two_chapters_pipeline_produces_all_storykeeper_artifacts(self):
         novel_creator.create_novel(
-            "e2e-book", "端到端验证书", 4, 1200, "科幻", "奇点炉与敲门声",
+            "e2e-book", "端到端验证书", 4, 420, "科幻", "奇点炉与敲门声",
             model_env={"API_BASE_URL": "http://127.0.0.1:9/v1"},
         )
         settings.set_novel("e2e-book")
@@ -193,7 +196,7 @@ class TestEndToEndGenerate(unittest.TestCase):
 
         # 全部 11 类 LLM 调用均被打桩路由，无一触达真实网络
         expected = {"设计大纲", "伏笔管家", "记忆压缩器", "AI叙事", "声纹审计师",
-                    "故事逻辑审稿人", "故事管理员", "挤地铁", "current_chapter_snapshots",
+                    "故事逻辑审稿人", "故事管理员", "连载读者", "current_chapter_snapshots",
                     "研究笔记", "番茄连载纪律"}
         self.assertTrue(
             expected <= set(self.captured["calls"]),

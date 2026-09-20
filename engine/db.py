@@ -303,9 +303,12 @@ class NovelDB:
             "INSERT INTO character_states(chapter,character,state_json) VALUES(?,?,?) "
             "ON CONFLICT(chapter,character) DO UPDATE SET state_json=excluded.state_json",
             (chapter, character, json.dumps(state, ensure_ascii=False)))
-        self.conn.execute(
-            "UPDATE characters SET updated_chapter=?, profile_json="
-            "COALESCE(profile_json,'{}') WHERE name=?", (chapter, character))
+        row = self.conn.execute("SELECT profile_json FROM characters WHERE name=?", (character,)).fetchone()
+        profile = json.loads(row[0] or "{}") if row else {}
+        from engine.authoring import STABLE_CHARACTER_FIELDS
+        profile.update({key: value for key, value in state.items()
+                        if key not in STABLE_CHARACTER_FIELDS or key not in profile})
+        self.upsert_character(character, profile, chapter=chapter, commit=False)
         if commit:
             self.conn.commit()
 

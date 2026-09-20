@@ -4,7 +4,7 @@ const http = axios.create({ baseURL: '/api', timeout: 30000 })
 
 export const api = {
   novels: () => http.get('/novels').then(r => r.data),
-  generateNovelThemes: (data) => http.post('/novel-themes/generate', data, { timeout: 90000 }).then(r => r.data),
+  generateNovelThemes: (data) => http.post('/novel-themes/generate', data, { timeout: 300000 }).then(r => r.data),
   createNovel: (data) => http.post('/novels', data).then(r => r.data),
   exportNovel: (n) => http.get(`/novels/${n}/export`, { responseType: 'blob' }).then(r => r.data),
   backupNovel: (n) => http.get(`/novels/${n}/backup`, { responseType: 'blob' }).then(r => r.data),
@@ -27,6 +27,11 @@ export const api = {
   saveChapter: (n, num, content) => http.put(`/novels/${n}/chapters/${num}`, { content }).then(r => r.data),
   scanChapter: (n, num) => http.get(`/novels/${n}/scan/${num}`).then(r => r.data),
   scanPreview: (text) => http.post('/scan-preview', { text }).then(r => r.data),
+
+  pendingList: (n) => http.get(`/novels/${n}/pending`).then(r => r.data),
+  pendingChapter: (n, num) => http.get(`/novels/${n}/pending/${num}`).then(r => r.data),
+  savePendingChapter: (n, num, content) => http.put(`/novels/${n}/pending/${num}`, { content }).then(r => r.data),
+  discardPending: (n, num) => http.delete(`/novels/${n}/pending/${num}`).then(r => r.data),
 
   bibleList: (n) => http.get(`/novels/${n}/bible`).then(r => r.data),
   bibleFile: (n, fn) => http.get(`/novels/${n}/bible/${fn}`, { responseType: 'text', transformResponse: [d => d] }).then(r => r.data),
@@ -55,7 +60,7 @@ export const api = {
   pipeline: (n) => http.get(`/novels/${n}/pipeline`).then(r => r.data),
   modelConfig: (n) => http.get(`/novels/${n}/model-config`).then(r => r.data),
   saveModelConfig: (n, body) => http.put(`/novels/${n}/model-config`, body).then(r => r.data),
-  testModelConfig: (n, body) => http.post(`/novels/${n}/model-config/test`, body).then(r => r.data),
+  testModelConfig: (n, body) => http.post(`/novels/${n}/model-config/test`, body, { timeout: 210000 }).then(r => r.data),
 }
 
 export function taskEventSource(tid) {

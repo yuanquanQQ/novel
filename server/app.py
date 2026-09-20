@@ -39,6 +39,7 @@ from engine.theme_generator import (  # noqa: E402
     generate_themes,
 )
 from engine import model_config  # noqa: E402
+from engine import pending  # noqa: E402
 from engine.db import NovelDB  # noqa: E402
 from engine.style_kit import scanner  # noqa: E402
 from server import tasks as T  # noqa: E402
@@ -63,10 +64,15 @@ def novel_dir(name: str) -> Path:
 
 @contextmanager
 def novel_operation(name: str):
+    from engine.locking import novel_lock, NovelBusyError
+    root = NOVELS_DIR.resolve()
+    target = (root / name).resolve()
+    if target.parent != root:
+        raise HTTPException(404, "无效的小说路径")
     try:
-        with T.novel_guard(name):
+        with T.novel_guard(name), novel_lock(target):
             yield
-    except T.BusyError as exc:
+    except (T.BusyError, NovelBusyError) as exc:
         raise HTTPException(409, "该小说已有任务或操作运行中") from exc
 
 
@@ -121,7 +127,7 @@ MAX_BACKUP_TOTAL_BYTES = 2 * 1024 * 1024 * 1024
 BACKUP_METADATA_FILE = "backup_metadata.json"
 _BACKUP_TOP_FILES = {BACKUP_METADATA_FILE, "novel_prompts.json", ".env.example"}
 _BACKUP_IMPORT_TOP_FILES = _BACKUP_TOP_FILES | {"config.py"}
-_BACKUP_DIRS = {"bible", "generated", "cache"}
+_BACKUP_DIRS = {"bible", "generated", "cache", "revision"}
 
 
 def _backup_file_allowed(relative: Path) -> bool:
@@ -590,9 +596,33 @@ def api_status(name: str):
             "SELECT * FROM chapter_log ORDER BY chapter").fetchall()]
     finally:
         db.close()
+
+    # 待人工修订队列 + 种子数据覆盖（人物/线索/母题为空时提醒）
+    queue = pending.list_pending(cfg)
+    seed_counts = {"characters": 0, "clues": 0, "motifs": 0}
+    seed_warnings = []
+    for fname, key in (("characters.json", "characters"),
+                       ("clues.json", "active_foreshadowing"),
+                       ("motif_bank.json", "motifs")):
+        sf = d / "bible" / fname
+        try:
+            data = json.loads(sf.read_text(encoding="utf-8")) if sf.exists() else {}
+            items = (data or {}).get(key, {})
+            count = len(items) if hasattr(items, "__len__") else 0
+        except Exception:
+            count, items = 0, {}
+        seed_counts[key] = count
+        if count == 0:
+            seed_warnings.append(f"{key} 为空")
+
     return {"title": cfg.story_title, "chapter_count": cfg.chapter_count,
             "written": len(gen), "volumes": vols, "db": st,
-            "chapter_log": log_rows}
+            "chapter_log": log_rows,
+            "pending_count": len(queue),
+            "seed_coverage": {"characters": seed_counts["characters"],
+                              "clues": seed_counts["clues"],
+                              "motifs": seed_counts["motifs"],
+                              "warnings": seed_warnings}}
 
 
 # --------------------------------------------------------------- outline/titles
@@ -662,16 +692,20 @@ def _chapter_metadata(d: Path):
     return titles, volumes, logs
 
 
-def _chapter_item(number, fp, titles, volumes, logs):
+def _chapter_item(number, fp, titles, volumes, logs, *,
+                  status=None, words=None, is_pending=False):
     log = logs.get(number, {})
-    words = log.get("words")
+    if words is None:
+        words = log.get("words")
     if words is None:
         words = len(fp.read_text(encoding="utf-8"))
-    status = log.get("status") or "generated"
+    if status is None:
+        status = log.get("status") or "generated"
     return {"num": number, "title": titles.get(number, ""), "words": words,
             "updated": fp.stat().st_mtime, "status": status,
             "volume": volumes.get(number),
-            "knowledge_stale": status == "knowledge_stale"}
+            "knowledge_stale": status == "knowledge_stale",
+            "pending": is_pending}
 
 
 @app.get("/api/novels/{name}/chapters")
@@ -695,24 +729,45 @@ def api_chapters_page(
     if chapter_from is not None and chapter_to is not None and chapter_from > chapter_to:
         raise HTTPException(422, "chapter_from 不能大于 chapter_to")
     d = novel_dir(name)
+    cfg = load_config(name)
     titles, volumes, logs = _chapter_metadata(d)
     needle = q.strip().casefold()
-    matched = []
+    # (number, fp, status, words, is_pending, title) 合并 generated + 待修订队列；
+    # 同章待修订稿覆盖旧发布稿（去重），丢弃后旧稿重新可见。
+    rows: dict[int, tuple] = {}
+    for item in pending.list_pending(cfg):
+        number = item["num"]
+        rows[number] = (number, pending.pending_path(cfg, number), "pending",
+                        item.get("words"), True, item.get("title") or "")
     for fp in chapter_files(d / "generated"):
         number = parse_chapter_number(fp)
-        chapter_status = logs.get(number, {}).get("status") or "generated"
+        if number in rows:
+            continue  # 待修订稿已覆盖旧发布稿
+        rows[number] = (number, fp, logs.get(number, {}).get("status") or "generated",
+                        None, False, titles.get(number, ""))
+    matched = []
+    for number in sorted(rows):
+        _, fp, chapter_status, ch_words, is_pending, title = rows[number]
         if chapter_from is not None and number < chapter_from:
             continue
         if chapter_to is not None and number > chapter_to:
             continue
-        if status and chapter_status != status:
+        if status == "pending":
+            if not is_pending:
+                continue
+        elif status and chapter_status != status:
             continue
-        if needle and needle not in str(number) and needle not in titles.get(number, "").casefold():
+        if needle and needle not in str(number) and needle not in title.casefold():
             continue
-        matched.append((number, fp))
+        matched.append((number, fp, chapter_status, ch_words, is_pending))
+    matched.sort(key=lambda row: row[0])
     page = matched[offset:offset + limit]
-    return {"items": [_chapter_item(number, fp, titles, volumes, logs)
-                      for number, fp in page], "total": len(matched)}
+    items = []
+    for number, fp, chapter_status, ch_words, is_pending in page:
+        items.append(_chapter_item(number, fp, titles, volumes, logs,
+                                   status=chapter_status, words=ch_words,
+                                   is_pending=is_pending))
+    return {"items": items, "total": len(matched)}
 
 
 @app.get("/api/novels/{name}/chapters/{num}")
@@ -737,7 +792,17 @@ async def api_chapter_save(name: str, num: int, body: ChapterContentBody):
         if not fp.is_file():
             raise HTTPException(404, f"第{num}章未生成")
         content = body.content
-        _atomic_write_text(fp, content)
+        if not content.strip():
+            raise HTTPException(422, "正文不能为空")
+        from engine.knowledge import transaction
+        # Retain a recoverable snapshot before invalidating published knowledge.
+        with transaction(d):
+            _atomic_write_text(fp, content)
+            stale = NovelDB(d)
+            try:
+                stale.invalidate_from(num)
+            finally:
+                stale.close()
         r = scanner.scan(content)
         db = NovelDB(d)
         try:
@@ -781,6 +846,67 @@ async def api_scan_preview(body: ScanPreviewBody):
     r = scanner.scan(body.text)
     return {"passed": r.passed, "metrics": r.metrics,
             "violations": r.violations, "warnings": r.warnings}
+
+
+# --------------------------------------------------------------- pending 待人工修订
+@app.get("/api/novels/{name}/pending")
+def api_pending_list(name: str):
+    return pending.list_pending(load_config(name))
+
+
+@app.get("/api/novels/{name}/pending/{num}")
+def api_pending_get(name: str, num: int):
+    if num <= 0:
+        raise HTTPException(400, "章号必须为正数")
+    entry = pending.load_pending(load_config(name), num)
+    if entry is None:
+        raise HTTPException(404, f"第{num}章不在待修订队列")
+    return {"num": num, "content": entry["content"],
+            "diagnostics": entry["diagnostics"] or {}}
+
+
+class PendingContentBody(BaseModel):
+    content: str = Field(default="", max_length=2 * 1024 * 1024)
+
+
+@app.put("/api/novels/{name}/pending/{num}")
+async def api_pending_save(name: str, num: int, body: PendingContentBody):
+    if num <= 0:
+        raise HTTPException(400, "章号必须为正数")
+    with novel_operation(name):
+        cfg = load_config(name)
+        entry = pending.load_pending(cfg, num)
+        if entry is None:
+            raise HTTPException(404, f"第{num}章不在待修订队列")
+        content = body.content
+        r = scanner.scan(content)
+        diag = dict(entry["diagnostics"] or {})
+        diag.pop("keeper_cache", None)
+        diag["edited_after_review"] = content != entry["content"] or diag.get("edited_after_review", False)
+        diag["words"] = len(content)
+        diag["reasons"] = dict(diag.get("reasons") or {})
+        diag["reasons"]["final_scan"] = [
+            {"category": item.get("category", ""), "pattern": item.get("pattern", ""),
+             "count": item.get("count", 0), "where": item.get("where", ""),
+             "hint": item.get("hint", "")}
+            for item in r.violations + r.warnings
+        ]
+        diag["scan_metrics"] = r.metrics
+        diag["style_hits"] = r.to_rows(num)
+        pending.save_pending(cfg, num, content, diag)
+        return {"ok": True, "words": len(content),
+                "scan": {"passed": r.passed, "violations": r.violations,
+                         "warnings": r.warnings}}
+
+
+@app.delete("/api/novels/{name}/pending/{num}")
+async def api_pending_delete(name: str, num: int):
+    if num <= 0:
+        raise HTTPException(400, "章号必须为正数")
+    with novel_operation(name):
+        if not pending.remove_pending(load_config(name), num):
+            raise HTTPException(404, f"第{num}章不在待修订队列")
+        return {"ok": True}
 
 
 # --------------------------------------------------------------------- bible
@@ -875,20 +1001,23 @@ async def api_bible_save(name: str, fn: str, body: BibleContentBody):
             _validate_bible_import(d, fn, body.content)
         except (OSError, ValueError, TypeError, KeyError, sqlite3.Error) as exc:
             raise HTTPException(422, f"Bible 数据无法导入: {exc}") from exc
-        fp = d / "bible" / fn
-        previous = fp.read_text(encoding="utf-8") if fp.exists() else None
-        _atomic_write_text(fp, body.content)
-        db = NovelDB(d, auto_import=False)
-        try:
-            synced = db.ensure_imported(force=True)
-        except (OSError, ValueError, TypeError, KeyError, sqlite3.Error) as exc:
-            if previous is None:
-                fp.unlink(missing_ok=True)
-            else:
-                _atomic_write_text(fp, previous)
-            raise HTTPException(422, f"Bible 数据无法导入: {exc}") from exc
-        finally:
-            db.close()
+        from engine.knowledge import transaction
+        from engine.authoring import record_edit, apply_edits
+        with transaction(d):
+            fp = d / "bible" / fn
+            previous = fp.read_text(encoding="utf-8") if fp.exists() else "{}"
+            _atomic_write_text(fp, body.content)
+            db = NovelDB(d, auto_import=False)
+            try:
+                synced = db.ensure_imported(force=True)
+            except (OSError, ValueError, TypeError, KeyError, sqlite3.Error) as exc:
+                raise HTTPException(422, f"Bible 数据无法导入: {exc}") from exc
+            finally:
+                db.close()
+            if fn in ("characters.json", "clues.json"):
+                record_edit(d, fn, json.loads(previous), json.loads(body.content))
+                last = max((parse_chapter_number(p) for p in chapter_files(d / "generated")), default=0)
+                apply_edits(d, last)
     return {"ok": True, "synced": synced}
 
 
@@ -960,6 +1089,21 @@ def _foreshadow_response(row) -> dict:
 
 
 def _patch_db_and_bible(d: Path, kind: str, item_id: str, changes: dict):
+    from engine.authoring import record_edit, apply_edits
+    from engine.knowledge import transaction
+    filename = "characters.json" if kind == "character" else "clues.json"
+    with transaction(d):
+        before = json.loads((d / "bible" / filename).read_text(encoding="utf-8"))
+        chapter = changes.get("chapter")
+        _apply_db_and_bible_patch(d, kind, item_id, changes)
+        after = json.loads((d / "bible" / filename).read_text(encoding="utf-8"))
+        record_edit(d, filename, before, after, chapter)
+        at = chapter if chapter is not None else max(
+            (parse_chapter_number(p) for p in chapter_files(d / "generated")), default=0)
+        apply_edits(d, at)
+
+
+def _apply_db_and_bible_patch(d: Path, kind: str, item_id: str, changes: dict):
     db = NovelDB(d)
     bible_file = d / "bible" / ("characters.json" if kind == "character" else "clues.json")
     original = bible_file.read_text(encoding="utf-8")
@@ -1261,7 +1405,17 @@ def api_pipeline(name: str):
             pending_summaries.append({"key": vk, "num": int(vnum), "name": v["name"]})
     vol_done = len([c for c in written if lo <= c <= hi])
 
-    if not outline_ready:
+    from engine.knowledge import stale_chapters
+    stale = stale_chapters(cfg)
+    pending_count = len(pending.list_pending(cfg))
+    interrupted = (d / "knowledge_transaction.json").exists()
+    if interrupted:
+        stage = "recover"
+    elif stale:
+        stage = "rebuild"
+    elif pending_count:
+        stage = "revision"
+    elif not outline_ready:
         stage = "outline"
     elif not titles_ready:
         stage = "titles"
@@ -1286,7 +1440,7 @@ def api_pipeline(name: str):
          "unit": "章名", "available": outline_ready},
         {"key": "write", "title": f"③ 逐章写作 · {vol['name']}", "file": "generated/",
          "done": next_chapter > cfg.chapter_count, "detected": len(written),
-         "unit": f"/ {cfg.chapter_count} 章", "available": outline_ready and titles_ready,
+         "unit": f"/ {cfg.chapter_count} 章", "available": outline_ready and titles_ready and not stale and not pending_count and not interrupted,
          "detail": {"volume": vol["name"], "range": [lo, hi], "volume_done": vol_done,
                     "volume_total": hi - lo + 1, "next_chapter": next_chapter,
                     "missing": missing[:20]}},
@@ -1303,7 +1457,9 @@ def api_pipeline(name: str):
     ]
     return {"stage": stage, "steps": steps, "next_chapter": next_chapter,
             "written": written[-1] if written else 0, "written_count": len(written),
-            "chapter_count": cfg.chapter_count, "current_volume": vol_key}
+            "chapter_count": cfg.chapter_count, "current_volume": vol_key,
+            "pending_count": pending_count, "stale_chapters": stale,
+            "interrupted_archive": interrupted}
 
 
 # -------------------------------------------------------------------- tasks
@@ -1317,7 +1473,7 @@ class TaskBody(BaseModel):
     outline_override: bool = False
 
 
-ALLOWED = {"outline", "titles", "generate", "revise", "summary", "db"}
+ALLOWED = {"outline", "titles", "generate", "revise", "summary", "db", "publish", "rebuild", "recover", "prepare"}
 
 
 @app.get("/api/novels/{name}/tasks")
@@ -1349,6 +1505,11 @@ async def api_task(name: str, action: str, body: TaskBody):
             raise HTTPException(409, "写作门禁：全书大纲未按章号完整覆盖")
         if not body.outline_override and not readiness["titles_ready"]:
             raise HTTPException(409, "写作门禁：章名未完整生成或仍含占位名")
+        from engine.knowledge import check_ready
+        try:
+            check_ready(cfg, start)
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
         suffix = (["-p", body.prompt] if body.prompt else [])
         if body.overwrite:
             suffix += ["--overwrite"]
@@ -1388,6 +1549,12 @@ async def api_task(name: str, action: str, body: TaskBody):
         if not (d / "bible" / "outline.md").exists():
             raise HTTPException(409, "缺少 outline.md，无法提取章名")
         args = ["-p", body.prompt] if body.prompt else []
+    elif action == "publish":
+        if body.chapter is None or body.chapter <= 0:
+            raise HTTPException(400, "chapter 必须为正数")
+        if not (d / "revision" / f"chapter_{body.chapter:02d}.md").exists():
+            raise HTTPException(404, f"第 {body.chapter} 章不在待修订队列")
+        args = [str(body.chapter)]
     elif action == "db":
         args = ["init"]
     try:

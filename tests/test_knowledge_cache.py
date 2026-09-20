@@ -48,6 +48,7 @@ class KeeperArchivistTests(unittest.TestCase):
                     json.loads(kwargs["user_prompt"])) or {
                         "character_updates": {}, "clue_updates": {}, "facts": [],
                         "chapter_summary": "本章摘要",
+                        "confirmed_clue_operations": [],
                     },
             ), patch.object(ArchivistAgent, "_sync_db"):
                 ok = ArchivistAgent().update_bible(2, {}, cache, "最终正文")

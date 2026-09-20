@@ -72,6 +72,14 @@ def load_config(name: str):
         model_config = getattr(config, attr, None)
         if model_config is not None and hasattr(model_config, "model_name"):
             model_config.model_name = root_env[key]
+    # 全局闸门模式：local .env 优先；否则注入 root .env（对旧小说 config.py 也生效）。
+    # pending=未过全部闸门转入待人工修订队列；abort=沿用旧版硬失败。
+    if "GATE_FAIL_MODE" not in local_env and root_env.get("GATE_FAIL_MODE"):
+        setattr(config, "gate_fail_mode", root_env["GATE_FAIL_MODE"])
+    call_limit = local_env.get("MAX_MODEL_CALLS_PER_TASK", root_env.get("MAX_MODEL_CALLS_PER_TASK"))
+    if call_limit is not None and (not str(call_limit).isdigit() or not 1 <= int(call_limit) <= 100000):
+        raise ValueError("MAX_MODEL_CALLS_PER_TASK 必须为 1 到 100000 的整数")
+    config.max_model_calls_per_task = int(call_limit) if call_limit is not None else None
     return config
 
 

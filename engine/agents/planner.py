@@ -79,6 +79,7 @@ class PlannerAgent:
 
     def __init__(self):
         self.model_config = config.planner_model
+        self.target_words = getattr(config, "words_per_chapter", 2500)
 
     def run(self, chapter_num: int, instruction: str,
             bible: dict, lessons: list, locked_title: str = "") -> dict:
@@ -185,12 +186,12 @@ class PlannerAgent:
             volume_emotion=volume.get("core_emotion", ""),
             volume_focus=volume.get("focus", ""),
         )
-        user += f"\n\n## outline.md 当前章上下文（必须遵循）\n{outline_context}"
+        user += f"\n\n## outline.md 当前章上下文（原计划，不能覆盖已定稿事实）\n{outline_context}"
 
         # 故事状态（开放问题/未回收承诺/角色弧线/连续性警告）——写作→规划的回路之一
         try:
             from engine.agents.story_keeper import planner_context, load_bare_state
-            story_text = planner_context(load_bare_state(config.bible_dir), chapter_num)
+            story_text = planner_context(load_bare_state(config.bible_dir), chapter_num, outline_context + instruction)
             user += f"\n\n## 故事状态（新章节必须顺应，禁止空降矛盾）\n{story_text}"
         except Exception as exc:
             log.warning(f"故事状态上下文注入失败: {exc}")
@@ -210,6 +211,8 @@ class PlannerAgent:
             tl_fp = config.bible_dir / "actual_timeline.md"
             if tl_fp.exists():
                 timeline = tl_fp.read_text(encoding="utf-8").strip()
+                timeline = "\n".join(line for line in timeline.splitlines()
+                    if (match := re.match(r"^- 第(\d+)章", line)) and int(match.group(1)) < chapter_num)
                 if timeline:
                     user += (
                         f"\n\n## 已实际发生的叙事轨迹（写出来的才算数——"
@@ -218,6 +221,23 @@ class PlannerAgent:
         except Exception as exc:
             log.warning(f"实际轨迹注入失败: {exc}")
 
+        budget = getattr(config, "words_per_chapter", 2500)
+        recent_plans = []
+        for number in range(max(1, chapter_num - 3), chapter_num):
+            path = config.bible_dir.parent / "cache" / f"archive_plan_{number:02d}.json"
+            if path.exists() and (config.generated_dir / f"chapter_{number:02d}.md").exists():
+                prior = json.loads(path.read_text(encoding="utf-8"))
+                recent_plans.append({"chapter": number, **{key: prior.get(key, "") for key in
+                    ("chapter_goal", "obstacle", "protagonist_action", "payoff", "carry_forward")}})
+        if recent_plans:
+            user += "\n\n【近期情节结构，避免换皮重复；实际发生内容以上方摘要为准】\n" + json.dumps(recent_plans, ensure_ascii=False)
+        user += (f"\n\n本章总预算约 {budget} 字，不是每场 {budget} 字。"
+                 "输出 chapter_goal、protagonist_action、obstacle、payoff、carry_forward；"
+                 "场景须有不同任务、start_state/end_state 和 target_words。"
+                 "另输出 editorial_contract 对象，包含 continuity_bridge（承接上章的因果）、"
+                 "new_value（相较最近情节的新变化）、opposition_logic（对手利益与反制筹码）、"
+                 "earned_progress（能力或关系变化的依据）、personal_stake（影响选择的私人牵挂）。"
+                 "无关项说明不适用原因，不为填字段添加剧情。")
         return system_filled + entities_contract + clue_contract + "\n\n" + user + title_hint
 
     def _get_volume_info(self, chapter_num: int) -> dict:
@@ -360,6 +380,8 @@ class PlannerAgent:
             plan["scene_outline"] = scenes
 
         for i, scene in enumerate(scenes):
+            if not isinstance(scene, dict):
+                raise PlanValidationError("scene_outline 的元素必须为对象")
             scene.setdefault("scene_id", i + 1)
             scene.setdefault("type", "high_conflict")
             scene.setdefault("target_emotion", 0.7)
@@ -367,6 +389,20 @@ class PlannerAgent:
             scene.setdefault("physical_mirror", "")
             scene.setdefault("narrative_mirror", "")
             scene.setdefault("sanity_score", 0.8)
+
+        budget = max(len(scenes), int(getattr(self, "target_words", 2500)))
+        weights = []
+        for scene in scenes:
+            value = scene.get("target_words", 1)
+            weights.append(float(value) if isinstance(value, (int, float)) and 0 < value < 100000 else 1)
+        remaining = budget - len(scenes)
+        allocated = [1 + int(remaining * weight / sum(weights)) for weight in weights]
+        allocated[-1] += budget - sum(allocated)
+        for i, (scene, target) in enumerate(zip(scenes, allocated)):
+            scene["scene_id"] = i + 1
+            scene["target_words"] = target
+            scene["is_final_scene"] = i == len(scenes) - 1
+        plan["target_words"] = budget
 
         return plan
 

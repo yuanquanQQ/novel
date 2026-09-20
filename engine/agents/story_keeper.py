@@ -1,6 +1,6 @@
 # Story Keeper — 作家笔记本：故事状态、连续性对账、角色弧线、悬念台账
 #
-# 职责（全流程非致命，任何失败只记警告，绝不阻断章节生成）：
+# 职责（审阅不可用不放行，发布阶段提取失败触发回滚）：
 #   1. 每章写完后抽出结构化事实，与历史事实做连续性对账，发现矛盾写进 continuity_warnings；
 #   2. 维护角色弧线（目标/恐惧/秘密/矛盾/关键变化）；
 #   3. 维护读者开放问题（悬念）与未回收承诺（伏笔台账）；
@@ -17,13 +17,10 @@ from engine.proxy import config
 
 log = logging.getLogger("story_keeper")
 
-# 硬属性：同一实体同一属性值不一致时判为 major 矛盾（位置/生死/身份等）
-HARD_ATTRIBUTES = {
-    "位置", "所在地", "生死", "死亡", "状态", "拥有", "持有", "身份",
-    "关系", "能力", "伤势", "年龄", "职业", "阵营", "结局", "目的",
-}
+# 固定事实才自动判矛盾，位置和伤势等动态属性允许随剧情变化。
+HARD_ATTRIBUTES = {"出生地", "出生日期", "血缘", "既往经历", "印记位置"}
 _MAX_WARNINGS = 12      # continuity_warnings 最多保留条数
-_MAX_QUESTIONS = 12     # open_questions 最多保留条数
+_MAX_CLOSED_QUESTIONS = 12  # 仅裁剪已解决的问题，未解决的悬念全部保留。
 _MAX_HOOK_LOG = 20
 
 
@@ -46,7 +43,7 @@ def _norm(text) -> str:
 class StoryKeeperAgent:
 
     def __init__(self):
-        # 全流程非致命：构造失败（如无小说上下文）也不允许阻断生成
+        # 支持离线人工归档；需要模型时由调用阶段报告不可用。
         try:
             self.model_config = (
                 getattr(config, "story_keeper_model", None)
@@ -95,22 +92,23 @@ class StoryKeeperAgent:
     # ---------------- 每章状态更新 ----------------
     def update_state(self, bible_dir, chapter_num: int,
                      plan_json: dict, keeper_cache: dict,
-                     full_chapter: str) -> dict:
+                     full_chapter: str, *, extraction=None) -> dict:
         """抽取本章故事要素 → 对账 → 合并 → 落盘。返回更新后的 state。"""
         state = self.load_state(bible_dir)
-        try:
+        if extraction is None:
             extraction = self._extract(bible_dir, chapter_num, plan_json, full_chapter, state)
-        except Exception as exc:
-            log.warning(f"StoryKeeper 抽取失败，跳过本章状态更新: {exc}")
-            extraction = {}
+        if not isinstance(extraction, dict) or not isinstance(extraction.get("facts"), list):
+            raise ValueError("故事状态抽取缺少 facts，不能标记为已更新")
         if isinstance(extraction, dict):
             self._merge_facts(state, chapter_num, extraction.get("facts", []))
             self._merge_arcs(state, chapter_num, extraction.get("arc_updates", []))
             self._merge_questions(state, chapter_num, extraction.get("new_questions", []),
                                   extraction.get("resolved_question_ids", []))
             self._sync_promises(state, bible_dir)
-            self._log_hooks(state, chapter_num, plan_json)
+            self._log_hooks(state, chapter_num, {"chapter_hooks": extraction.get("chapter_hooks", {})})
         state["last_updated"] = chapter_num
+        from engine.authoring import overlay_story
+        overlay_story(Path(bible_dir).parent, chapter_num, state)
         self.save_state(bible_dir, state)
         return state
 
@@ -148,7 +146,8 @@ class StoryKeeperAgent:
                 continue
             bucket = state["facts"].setdefault(entity, {})
             prior = bucket.get(attribute)
-            if prior is not None and _norm(prior.get("value")) != value:
+            if (prior is not None and _norm(prior.get("value")) != value
+                    and (attribute in HARD_ATTRIBUTES or fact.get("immutable") is True)):
                 self._record_warning(state, {
                     "chapter": chapter_num,
                     "entity": entity,
@@ -199,7 +198,8 @@ class StoryKeeperAgent:
                 if q.get("status") == "open" and q.get("id") in resolved:
                     q["status"] = "resolved"
                     q["resolved_chapter"] = chapter_num
-        state["open_questions"] = state["open_questions"][-_MAX_QUESTIONS:]
+        closed = [q for q in state["open_questions"] if q.get("status") != "open"][-_MAX_CLOSED_QUESTIONS:]
+        state["open_questions"] = [q for q in state["open_questions"] if q.get("status") == "open" or q in closed]
 
     def _sync_promises(self, state: dict, bible_dir):
         """以 clues.json 的 active_foreshadowing 为权威，重建未回收承诺台账。"""
@@ -221,6 +221,8 @@ class StoryKeeperAgent:
                 "planted_chapter": item.get("introduced_chapter"),
                 "status": item.get("status", "pending"),
                 "last_touched_chapter": item.get("last_hinted_chapter"),
+                "intended_payoff_chapter": item.get("intended_payoff_chapter"),
+                "payoff_end_chapter": item.get("payoff_end_chapter"),
             }
         # 保留已解决记录但不再进 planner/writer 上下文
         state["unresolved_promises"] = fresh
@@ -249,25 +251,27 @@ def load_bare_state(bible_dir) -> dict:
         return _empty_state()
 
 
-def planner_context(state: dict, chapter_num: int) -> str:
+def planner_context(state: dict, chapter_num: int, query=None) -> str:
     """给 planner 的故事状态上下文：承诺、开放问题、角色弧线、连续性警告。"""
+    from engine.memory import select_memory
+    state = select_memory(state, chapter_num, query)
     lines = []
     pending = [p for p in state.get("unresolved_promises", {}).values()
                if p.get("status") != "resolved"]
     if pending:
         lines.append("未回收承诺（读者在等）：")
-        for p in pending[-6:]:
+        for p in pending:
             planted = p.get("planted_chapter")
             lines.append(f"- {p.get('name', '')}（第{planted or '?'}章种下）")
     open_qs = [q for q in state.get("open_questions", [])
                if q.get("status") == "open"]
     if open_qs:
         lines.append("读者开放问题：")
-        lines += [f"- {q['text']}" for q in open_qs[-6:]]
+        lines += [f"- {q['text']}" for q in open_qs]
     arcs = state.get("character_arcs", {})
     if arcs:
         lines.append("角色弧线快照：")
-        for name, arc in list(arcs.items())[-6:]:
+        for name, arc in arcs.items():
             bits = []
             if arc.get("goal"): bits.append(f"目标:{arc['goal']}")
             if arc.get("fear"): bits.append(f"恐惧:{arc['fear']}")
@@ -281,18 +285,20 @@ def planner_context(state: dict, chapter_num: int) -> str:
     if warnings:
         lines.append("连续性警告：")
         lines += [f"- [第{w['chapter']}章] {w['entity']}·{w['attribute']}: "
-                  f"「{w['prior']}」→「{w['now']}」" for w in warnings[-4:]]
+                  f"「{w['prior']}」→「{w['now']}」" for w in warnings]
     return "\n".join(lines) if lines else "(尚无故事状态)"
 
 
-def writer_warnings(state: dict, chapter_num: int) -> str:
+def writer_warnings(state: dict, chapter_num: int, query=None) -> str:
     """给 writer 的连续性警告：只保留会对本章造成约束的最关键几条。"""
+    from engine.memory import select_memory
+    state = select_memory(state, chapter_num, query)
     parts = []
     warnings = [w for w in state.get("continuity_warnings", [])
                 if w.get("chapter", 0) < chapter_num]
     if warnings:
         parts.append("【故事连续性警告——本章写作必须处理或回避】")
-        for w in warnings[-5:]:
+        for w in warnings:
             tag = "严重矛盾" if w.get("severity") == "major" else "细节变化"
             parts.append(f"- [第{w['chapter']}章] {w['entity']}·{w['attribute']}: "
                          f"前文「{w['prior']}」→ 本章写「{w['now']}」（{tag}）")
@@ -300,13 +306,13 @@ def writer_warnings(state: dict, chapter_num: int) -> str:
                if q.get("status") == "open"]
     if open_qs:
         parts.append("【读者此刻在追问（本章应回应或推进）】")
-        parts += [f"- {q['text']}" for q in open_qs[-4:]]
+        parts += [f"- {q['text']}" for q in open_qs]
     pending = [p for p in state.get("unresolved_promises", {}).values()
                if p.get("status") != "resolved"]
     if pending:
         parts.append("【未回收承诺（读者在等）】")
         parts += [f"- {p.get('name', '')}（第{p.get('planted_chapter') or '?'}章种下）"
-                  for p in pending[-4:]]
+                  for p in pending]
     if state.get("hook_log"):
         last = state["hook_log"][-1]
         if last.get("chapter") == chapter_num - 1:
@@ -320,26 +326,27 @@ def story_check(state: dict, chapter_num: int, scene: dict,
                 draft: str, keeper_cache: dict) -> dict:
     """故事逻辑闸门：草稿是否与既有跨章事实矛盾、是否无视必须响应的承诺/钩子/开放问题。
 
-    与风格扫描、语义审、声纹审计并列的一道 LLM 闸门。fail-open：
-    任何异常（无小说上下文、无模型、网络失败）都放行，绝不阻断生成。
+    与风格扫描、语义审、声纹审计并列的一道 LLM 闸门。
+    无模型、网络异常或响应格式错误时不放行，交由待修订流程处理。
     """
-    state = state or {}
+    from engine.memory import select_memory
+    state = select_memory(state or {}, chapter_num, dict(scene, draft=draft))
     try:
         from engine.llm_client import chat_json
         from engine.prompts_loader import get_prompt
         system, _ = get_prompt("story_check")
         facts = state.get("facts", {})
         fact_lines = []
-        for entity, attrs in list(facts.items())[:30]:
-            for attr, v in list(attrs.items())[:5]:
+        for entity, attrs in facts.items():
+            for attr, v in attrs.items():
                 chapters = v.get("chapters", [])
                 fact_lines.append(
                     f"- {entity}·{attr}：{v.get('value', '')}（第{','.join(map(str, chapters))}章）"
                 )
         open_qs = [q.get("text", "") for q in state.get("open_questions", [])
-                   if q.get("status") == "open"][-5:]
+                   if q.get("status") == "open"]
         pending = [p.get("name", "") for p in state.get("unresolved_promises", {}).values()
-                   if p.get("status") != "resolved"][-5:]
+                   if p.get("status") != "resolved"]
         hook = ""
         if state.get("hook_log"):
             last = state["hook_log"][-1]
@@ -360,16 +367,12 @@ def story_check(state: dict, chapter_num: int, scene: dict,
             .replace("{draft}", draft)
         )
         result = chat_json(model, user_prompt=prompt)
-        if isinstance(result, dict):
-            return {
-                "passed": result.get("passed", False) is True,
-                "errors": result.get("errors", []) or [],
-                "suggestions": result.get("suggestions", ""),
-            }
-        return {"passed": True, "errors": [], "suggestions": ""}
+        from engine.quality import validate_verdict
+        return validate_verdict(result)
     except Exception as exc:
-        log.warning(f"StoryKeeper 故事逻辑闸门不可用，放行: {exc}")
-        return {"passed": True, "errors": [], "suggestions": ""}
+        log.warning(f"StoryKeeper 故事逻辑闸门不可用: {exc}")
+        return {"passed": False, "errors": [], "unavailable": True,
+                "suggestions": "故事逻辑审阅不可用，需要重新审阅。"}
 
 
 def record_actual_events(config, chapter_num: int, plan_json: dict,
@@ -401,8 +404,11 @@ def record_actual_events(config, chapter_num: int, plan_json: dict,
         fp.parent.mkdir(parents=True, exist_ok=True)
         lines = fp.read_text(encoding="utf-8").splitlines() if fp.exists() else []
         # 同章重写时原位替换，保持时间线稳定
-        lines = [ln for ln in lines if not ln.startswith(f"- 第{chapter_num}章")]
+        import re
+        lines = [ln for ln in lines if re.match(r"^- 第\d+章", ln)
+                 and not ln.startswith(f"- 第{chapter_num}章")]
         lines.append(entry)
+        lines.sort(key=lambda ln: int(re.match(r"^- 第(\d+)章", ln).group(1)))
         body = "## 已实际发生的叙事轨迹\n" + "\n".join(lines) + "\n"
         fp.write_text(body, encoding="utf-8")
     except OSError as exc:

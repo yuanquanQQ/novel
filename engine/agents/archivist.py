@@ -52,7 +52,7 @@ class ArchivistAgent:
         log.info(f"章节保存: {out_file}")
 
     def update_bible(self, chapter_num: int, plan_json: dict,
-                     keeper_cache: dict, full_chapter: str) -> bool:
+                     keeper_cache: dict, full_chapter: str, *, extraction=None) -> bool:
         from engine.llm_client import chat_json
         from engine.prompts_loader import get_prompt
         system, _ = get_prompt("archivist")
@@ -67,18 +67,27 @@ class ArchivistAgent:
             "full_chapter": full_chapter,
         }, ensure_ascii=False, indent=2)
         try:
-            extracted = chat_json(
+            extracted = extraction if extraction is not None else chat_json(
                 self.model_config, system_prompt=system, user_prompt=prompt,
             )
             if not isinstance(extracted, dict) or not extracted.get("chapter_summary"):
                 raise ValueError("Archivist 返回缺少 chapter_summary")
+            ops = extracted.get("confirmed_clue_operations")
+            if not isinstance(ops, list):
+                raise ValueError("Archivist 缺少已核实伏笔操作 confirmed_clue_operations")
+            for op in ops:
+                if not isinstance(op, dict) or not op.get("evidence") or op["evidence"] not in full_chapter:
+                    raise ValueError("伏笔操作缺少正文证据")
+            archive_plan = dict(plan_json, clue_operations=ops)
             keeper_cache["character_delta"] = extracted.get("character_updates", {})
             keeper_cache["clue_delta"] = extracted.get("clue_updates", {})
-            updates = self._prepare_file_updates(chapter_num, plan_json, keeper_cache)
+            updates = self._prepare_file_updates(chapter_num, archive_plan, keeper_cache)
             self._commit_archive(
                 chapter_num, keeper_cache, extracted,
-                plan_json.get("clue_operations", []), full_chapter, updates,
+                ops, full_chapter, updates,
             )
+            from engine.authoring import apply_edits
+            apply_edits(self.bible_dir.parent, chapter_num)
         except Exception as exc:
             log.error(f"Archivist 归档失败: {exc}")
             return False
@@ -93,7 +102,12 @@ class ArchivistAgent:
             delta = (keeper_cache.get("character_delta")
                      or keeper_cache.get("characters", {}))
             for name, state in delta.items():
-                chars.setdefault("characters", {}).setdefault(name, {}).update(state)
+                if not isinstance(state, dict):
+                    raise ValueError("人物更新必须为对象")
+                profile = chars.setdefault("characters", {}).setdefault(name, {})
+                from engine.authoring import STABLE_CHARACTER_FIELDS
+                profile.update({key: value for key, value in state.items()
+                                if key not in STABLE_CHARACTER_FIELDS or key not in profile})
             if delta:
                 updates[characters_file] = json.dumps(chars, ensure_ascii=False, indent=2)
 

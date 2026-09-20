@@ -16,7 +16,7 @@ TASKS_DIR = ROOT / "runtime" / "tasks"
 MAX_LOG_LINES = 5000
 ATOMIC_REPLACE_RETRIES = 5
 ATOMIC_REPLACE_DELAY = 0.02
-TERMINAL_STATUSES = {"done", "failed", "error", "orphaned", "cancelled"}
+TERMINAL_STATUSES = {"done", "failed", "error", "orphaned", "cancelled", "needs_revision"}
 
 _TASKS: dict = {}
 _LOCKS: dict = {}
@@ -281,6 +281,10 @@ def _worker(tid: str):
                 _set(t, status="cancelled")
                 return
             if rc != 0:
+                if rc == 2 and step["action"] in ("generate", "revise"):
+                    _append(t, "[待修订] 本章尚未定稿，后续批量步骤已停止。\n")
+                    _set(t, status="needs_revision", failed_step=i)
+                    return
                 if total > 1 and i < total:
                     _append(t, f"[停止] 第 {i} 步失败（exit {rc}），剩余 {total - i} 步未执行\n")
                 _set(t, status="failed", failed_step=i)

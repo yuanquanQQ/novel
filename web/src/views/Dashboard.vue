@@ -15,6 +15,9 @@
         <el-button :loading="loading" @click="load"><el-icon><Refresh /></el-icon>刷新数据</el-button>
       </header>
       <el-alert v-if="error" type="error" :title="error" show-icon :closable="false" class="section-gap" />
+      <el-alert v-if="seedWarnings.length" type="warning" show-icon :closable="false" class="section-gap" :title="`种子数据待补充：${seedWarnings.join('；')}`">
+        <template #default><el-button link type="primary" @click="goto('bible')">去补充 →</el-button></template>
+      </el-alert>
 
       <div v-loading="loading">
         <div v-if="status" class="stat-grid">
@@ -22,6 +25,7 @@
           <div class="stat-card"><span class="stat-label">累计字数</span><strong>{{ totalWords.toLocaleString() }}</strong><span class="stat-note">已生成章节总字数</span></div>
           <div class="stat-card"><span class="stat-label">伏笔回收</span><strong>{{ status.db.foreshadow_resolved }}<small>/ {{ status.db.foreshadow_total }}</small></strong><span class="stat-note">已回收 / 总伏笔</span></div>
           <div class="stat-card"><span class="stat-label">跨章事实</span><strong>{{ status.db.facts }}</strong><span class="stat-note">知识库记忆条目</span></div>
+          <div class="stat-card"><span class="stat-label">待人工修订</span><strong>{{ status.pending_count || 0 }}</strong><span class="stat-note">未通过全部质量闸门的章节</span></div>
         </div>
 
         <section v-if="status" class="content-card section-gap">
@@ -51,10 +55,12 @@
 
 <script setup>
 import { computed, ref, watch } from 'vue'
+import { useRouter } from 'vue-router'
 import { useNovelStore } from '../stores/novel'
 import { api } from '../api'
 
 defineEmits(['create-novel'])
+const router = useRouter()
 const store = useNovelStore()
 const status = ref(null)
 const styleHits = ref({ patterns: [] })
@@ -63,6 +69,8 @@ const error = ref('')
 let seq = 0
 const scored = computed(() => (status.value?.chapter_log || []).filter(c => c.reader_score != null).slice(-8).reverse())
 const totalWords = computed(() => (status.value?.chapter_log || []).reduce((sum, row) => sum + (row.words || 0), 0))
+const seedWarnings = computed(() => status.value?.seed_coverage?.warnings || [])
+const goto = (view) => router.push({ name: view, params: { name: store.current } })
 const bookPct = computed(() => status.value?.chapter_count ? Math.round(status.value.written * 100 / status.value.chapter_count) : 0)
 const pct = (volume) => Math.round(volume.done * 100 / Math.max(1, volume.hi - volume.lo + 1))
 

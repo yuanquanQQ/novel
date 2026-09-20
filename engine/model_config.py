@@ -33,7 +33,7 @@ AGENT_ROLES = [
     {"attr": "marketer_model", "env": "MARKETER_MODEL", "label": "Marketer · 宣传文案", "default": "deepseek-chat"},
 ]
 ENV_BY_ATTR = {r["attr"]: r["env"] for r in AGENT_ROLES}
-ALLOWED_ENVS = {ENV_API_KEY, ENV_BASE_URL, ENV_THEME_MODEL} | set(ENV_BY_ATTR.values())
+ALLOWED_ENVS = {ENV_API_KEY, ENV_BASE_URL, ENV_THEME_MODEL, "GATE_FAIL_MODE"} | set(ENV_BY_ATTR.values())
 _VALUE_RE = re.compile(r"^[^\r\n=]{1,200}$")
 
 MODEL_CONFIG_DEFAULTS = {
@@ -247,7 +247,9 @@ def test_connection(novel_dir_: Path, model: str, api_key: str = "",
     from openai import OpenAI
     started = time.time()
     try:
-        client = OpenAI(api_key=api_key, base_url=base_url, timeout=20, max_retries=0)
+        # Ark 上的首个请求经常需要二十秒以上；测试超时必须长于前端的
+        # 普通接口超时，否则会把“模型冷启动较慢”误报成“连接失败”。
+        client = OpenAI(api_key=api_key, base_url=base_url, timeout=180, max_retries=0)
         completion = client.chat.completions.create(
             model=model,
             messages=[{"role": "user", "content": "ping，请只回复两个字"}],

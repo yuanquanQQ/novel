@@ -1,0 +1,46 @@
+{
+  "1": {
+    "plan": {
+      "chapter_title": "废铁场", "target_words": 3000,
+      "chapter_goal": "清出军港卸货车道并保住当月结算",
+      "protagonist_action": "发现异常冷却管、安排隔离；脱困后试探能力边界，配合吊架完成清场并单独结算",
+      "obstacle": "隐瞒改装的废船坍塌，事故可能导致扣款；能力消耗体力",
+      "payoff": "活着脱困、获得左掌星环、挣到八十信用点，发现污染残渣能转化为含能晶砂",
+      "carry_forward": "取最小一块反应芯验证能源用途",
+      "clue_operations": [{"action":"plant","clue_id":"F001","name":"零号星环","description":"黑色方碑连接沈渊左掌星环，可以处理污染材料","method":"坍塌中连接，清场时试用"}]
+    },
+    "snapshot": {"plot_progress":"沈渊在废船坍塌中接触方碑，左掌得到星环，消解受污染卡箍脱困；利用工程吊装清场，收到八十信用点。", "emotion_state":"从保住工钱转向主动试验能力，仍谨慎保密。", "env_and_clue":"第一日夜，西角工具舱；方碑消失，F001星环反应有材料与体力限制；军港送来废反应芯。"},
+    "archive": {
+      "character_updates": {"沈渊":{"location":"零号废墟西角工具舱","status_change":"清场完成，获得八十信用点；计划检验最小碎芯","injury_ability_item":"肩伤与脸部擦伤；左掌伤口愈合，星环留在左掌；备用靴、损坏割枪"},"老赵":{"location":"零号废墟废铁场","status_change":"救出沈渊，完成吊装与清场验收"}},
+      "clue_updates": {},
+      "facts": [{"kind":"plot","subject":"沈渊","content":"从业七年，来零号废墟一个月"},{"kind":"injury","subject":"沈渊","content":"坍塌肩伤；左掌伤口因方碑连接愈合"},{"kind":"object","subject":"星环","content":"位于左掌，六个暗点环绕"},{"kind":"plot","subject":"清场","content":"星环消解污染卡箍，吊架拖走护板"},{"kind":"info","subject":"报酬","content":"清场八十信用点已到账"},{"kind":"info","subject":"能力边界","content":"普通扳手、干净铜板无反应；连续使用消耗体力"},{"kind":"object","subject":"晶砂","content":"污染残渣变为微量含能晶砂"}],
+      "chapter_summary":"沈渊在坍塌中连接方碑，左掌得到星环。他用能力配合工程手段脱困清场，拿到八十信用点，发现污染物能转为能源。",
+      "confirmed_clue_operations": [{"action":"plant","clue_id":"F001","name":"零号星环","description":"方碑消失，左掌获得可消解污染材料的星环","method":"事故连接后试用","evidence":"零号，连接完成。"}]
+    },
+    "story": {"facts":[{"entity":"沈渊","attribute":"位置","value":"西角工具舱"},{"entity":"沈渊","attribute":"既往经历","value":"废弃物处理七年，来零号废墟一个月","immutable":true},{"entity":"沈渊","attribute":"印记位置","value":"左掌","immutable":true},{"entity":"沈渊","attribute":"伤势","value":"肩伤和脸部擦伤，左掌伤口已愈合"}],"arc_updates":[{"character":"沈渊","goal":"买下工具舱，靠自己的炉子修件赚钱","change":"发现回收污染材料的新办法"}],"new_questions":["零号星环的来源与边界是什么"],"resolved_question_ids":[],"chapter_hooks":{"light_hook":"明早找最小碎芯验证能源转化","dark_hook":"方碑连接零号，军港送来危险废料"}}
+  },
+  "2": {
+    "plan": {"chapter_title":"第一颗星核","target_words":3000,"chapter_goal":"给电绞盘供能，完成八点前的护板清运","protagonist_action":"留存军用品混入民用清单的证据，登记取样，在屏蔽柜内分次提炼，逐级测试输出","obstacle":"普通晶砂供能不足，整芯负载过大，工单限时","payoff":"获得第一颗星核；炉子和绞盘运转，挣一百二十，首付三百买下工具舱","carry_forward":"银线异变需研究，穆辛上门质询","clue_operations":[{"action":"plant","clue_id":"F002","name":"炉中银线","description":"星核运行后，旧炉裂纹长出银线并发出叹息","method":"赢得第一笔能源收益后停机检修"}]},
+    "snapshot":{"plot_progress":"沈渊登记最小碎芯，分次提炼星核，启动旧炉和绞盘，按时清走护板，得一百二十信用点；付三百首款买下工具舱，尾款三百。","emotion_state":"有具体收益，开始经营自己的生产设备；面对异常会停机检查。","env_and_clue":"第二日傍晚工具舱。炉内银线搭接裂纹，星核被取出收进屏蔽袋；穆辛改分类，沈渊留备份后开门。"},
+    "archive":{
+      "character_updates":{"沈渊":{"location":"西角工具舱门口","status_change":"星核点炉、清场到账一百二十；支付三百首付购舱，尾款三百两个月内付；穆辛上门","injury_ability_item":"左掌星环、肩伤、第一颗星核在内衬屏蔽袋、工具舱钥匙、取样单"},"老独眼":{"location":"零号废墟","status_change":"提供屏蔽柜并免租，按六百总价签订工具舱转让单"},"老韩":{"location":"生活区","status_change":"搬运车电池由沈渊充满，送热粥"},"穆辛":{"location":"西角工具舱外","status_change":"傍晚签署军用品重新分类封存通知，上门质询"}},
+      "clue_updates":{},
+      "facts":[{"kind":"plot","subject":"取样","content":"七点十二分按三级民用废料登记取最小碎芯"},{"kind":"info","subject":"能力边界","content":"整芯负载过大；提炼可中止，消耗体力"},{"kind":"object","subject":"星核","content":"碎芯化为可供能晶体，原污染读数下降"},{"kind":"plot","subject":"清场","content":"星核供旧炉驱动绞盘，八点前完成六块护板清运"},{"kind":"info","subject":"收入产权","content":"挣一百二十，工具舱总价六百首付三百尾款两月"},{"kind":"object","subject":"旧炉","content":"裂纹长银线并发出叹息；星核取出后不再生长"},{"kind":"info","subject":"分类单","content":"穆辛傍晚六点将民用残件改为军用危险品"},{"kind":"info","subject":"备份","content":"沈渊把取样单和车号照片交老赵留底"}],
+      "chapter_summary":"沈渊提炼第一颗星核，点炉驱动绞盘挣到清场费，付首款买下工具舱。炉内长出银线；穆辛更改废料分类并上门，沈渊已留存单据。",
+      "confirmed_clue_operations":[{"action":"hint","clue_id":"F001","method":"验证材料转化与负载限制","evidence":"能停。"},{"action":"plant","clue_id":"F002","name":"炉中银线","description":"星核运行后旧炉裂纹长出银线并发出叹息","method":"停炉取芯时发现","evidence":"听见炉心传出一声叹息。"}]
+    },
+    "story":{"facts":[{"entity":"沈渊","attribute":"位置","value":"工具舱门口"},{"entity":"沈渊","attribute":"拥有","value":"一枚星核和工具舱钥匙；工具舱尾款三百"},{"entity":"动力炉","attribute":"状态","value":"停机、星核已取出；内壁留有未知银线"}],"arc_updates":[{"character":"沈渊","goal":"靠自己的设备接活，弄清星核输出和风险","change":"从取样验证走到有收入的生产"}],"new_questions":["炉中银线和叹息是什么","穆辛为何事后改动货物分类"],"resolved_question_ids":[],"chapter_hooks":{"light_hook":"穆辛已到门外，沈渊持单据开门","dark_hook":"炉内银线会继续怎样变化"}}
+  },
+  "3": {
+    "plan":{"chapter_title":"巡检官","target_words":3000,"chapter_goal":"保住星核、工具舱与自由，救济受伤邻居","protagonist_action":"展示取样证据，判断审讯意图，利用电极供能和旧椅缺陷挣脱，再用单据和技术价值谈判","obstacle":"穆辛封存设备并电击逼问提炼方法","payoff":"取回星核、钥匙和注销回执，解除封存；老韩医疗费入执法出勤记录","carry_forward":"不再回不安全的工具舱，去废弃信标站找独立落脚点；穆辛秘密报S级","clue_operations":[{"action":"plant","clue_id":"F003","name":"S级观测序列","description":"穆辛使用泰坦特批权限报S级，得到保持活动、记录能源节点的指令","method":"沈渊离站后切到穆辛办公室"}]},
+    "snapshot":{"plot_progress":"穆辛带走沈渊、推伤老韩。审讯中沈渊使受激金属结晶挣脱，凭货单备份和技术价值谈判，取回星核与钥匙，解除封存并取得老韩医费承诺。","emotion_state":"认识到产权仍受权力威胁，决定建立可自主开门的落脚点。","env_and_clue":"第二日晚，沈渊离巡检站去垃圾带外废弃信标站，尚未遇到邝伯、阿澈；穆辛秘密登记S级并接到泰坦观测指令。"},
+    "archive":{
+      "character_updates":{"沈渊":{"location":"离开巡检站，前往垃圾带外废弃信标站途中","status_change":"取回星核、钥匙、注销回执与解除封存单；托老赵看炉，决定寻找独立落脚点","injury_ability_item":"肩伤加重，电击后体力透支；左掌星环未移动；星核在屏蔽袋内"},"穆辛":{"location":"巡检站二楼办公室","status_change":"私报S级异常，收到保持目标活动、记录下处能源节点的命令；取消二次传唤","injury_ability_item":"泰坦特批黑色密钥、审讯椅结晶样本"},"老韩":{"location":"医疗站","status_change":"胸口受撞，检查未骨折；费用挂巡检出勤记录"},"老赵":{"location":"零号废墟","status_change":"持有取样与货单备份，受托代看停机旧炉"}},
+      "clue_updates":{},
+      "facts":[{"kind":"info","subject":"沈渊","content":"从业七年，到零号废墟一个月"},{"kind":"plot","subject":"拘留","content":"穆辛索要星核处理方法，私自关闭记录"},{"kind":"plot","subject":"应激","content":"星环吸收电极能量，审讯椅结晶；沈渊借力挣脱"},{"kind":"info","subject":"能力限制","content":"仍遭电击痛苦，脱身后体力透支，不能无限吸收"},{"kind":"plot","subject":"谈判","content":"凭原始货单备份和技术价值换回物品、解封与老韩医费"},{"kind":"location","subject":"沈渊","content":"离站后直接前往废弃信标站，不回工具舱"},{"kind":"object","subject":"动力炉","content":"老赵代看；不得通电或动银线"},{"kind":"info","subject":"穆辛","content":"私报S级并收到泰坦保持目标活动的指令，沈渊不知"}],
+      "chapter_summary":"沈渊遭穆辛审讯，以星环和工程经验挣脱，再凭单据与技术价值取回自由和财物。他去废弃信标站另找落脚点；穆辛秘密登记S级异常。",
+      "confirmed_clue_operations":[{"action":"hint","clue_id":"F001","method":"受激电极材料也可响应","evidence":"金属表面长出透明的晶纹"},{"action":"plant","clue_id":"F003","name":"S级观测序列","description":"穆辛以泰坦特批权限上报S级，获保持活动并记录能源节点的命令","method":"办公室保密上报","evidence":"保持目标活动。记录下一处能源节点。"}]
+    },
+    "story":{"facts":[{"entity":"沈渊","attribute":"位置","value":"巡检站外，前往废弃信标站途中"},{"entity":"沈渊","attribute":"印记位置","value":"左掌","immutable":true},{"entity":"沈渊","attribute":"伤势","value":"肩伤加重，电击与能力使用后虚弱"},{"entity":"老韩","attribute":"状态","value":"医疗站检查未骨折"},{"entity":"穆辛","attribute":"状态","value":"秘密上报S级，按泰坦指令观测下一处能源节点"}],"arc_updates":[{"character":"沈渊","goal":"寻找能自主控制出入、安放炉子的生存地","change":"从买设备自立转向摆脱巡检任意封存"},{"character":"穆辛","goal":"按上级指令追踪能源节点","change":"从逼问方法转为保密跟踪"}],"new_questions":["泰坦为何要记录下一处能源节点"],"resolved_question_ids":["Q00203"],"chapter_hooks":{"light_hook":"沈渊正去废弃信标站，准备寻找独立落脚点","dark_hook":"S级秘密观测将跟着他的新能源节点"}}
+  }
+}

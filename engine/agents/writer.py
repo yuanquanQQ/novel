@@ -41,7 +41,7 @@ class WriterAgent:
         research_ctx = self._format_research_context(context_pack)
         hooks = self._format_chapter_hooks(
             context_pack.get("_plan", {})
-        )
+        ) if scene.get("is_final_scene", True) else "本场不是章末，交接给下一场，不另设硬钩。"
 
         special = self._build_special_condition(scene, scene_type, feedback)
         feedback_block = self._build_feedback_block(feedback)
@@ -63,6 +63,16 @@ class WriterAgent:
         if story_block:
             base_prompt = base_prompt + "\n\n" + story_block
         # feedback_block 追加在末尾——模型对 prompt 末尾注意力最高
+        previous = keeper_cache.get("all_scenes", [])
+        tail = previous[-1][-1600:] if previous else context_pack.get("previous_chapter_tail", "")
+        if tail:
+            base_prompt += "\n\n【已完成正文的末段，只承接，不重演】\n" + tail
+        base_prompt += f"\n本场约 {scene.get('target_words', 1000)} 字，按场景起止状态推进。"
+        contract = context_pack.get("_plan", {}).get("editorial_contract")
+        if contract:
+            base_prompt += "\n\n【本章因果、变化与人物选择依据】\n" + json.dumps(contract, ensure_ascii=False)
+        if context_pack.get("revision_draft"):
+            base_prompt += "\n\n【上一稿，针对反馈修订】\n" + context_pack["revision_draft"]
         return base_prompt + feedback_block
 
     def _format_research_context(self, context_pack: dict) -> str:
@@ -72,7 +82,7 @@ class WriterAgent:
             parts.append(notes)
         mem = context_pack.get("memory_notes", "")
         if mem:
-            parts.append("## 运行时知识库（与正文冲突时以此为准）\n" + mem)
+            parts.append("## 运行时知识库（与定稿正文冲突时以正文为准，指出冲突）\n" + mem)
         clues = context_pack.get("relevant_clues", {})
         if clues:
             parts.append("## 活跃线索\n" + json.dumps(
@@ -96,8 +106,7 @@ class WriterAgent:
         parts = []
         if scene_type == "breathable":
             parts.append(
-                "本场景为 breathable（低对白缓冲）：允许完全无对话或仅有少量自然对话，"
-                "不要求达到普通场景30-45%的对话占比。重点写环境、光影、微动作与内心流动。"
+                "本场景为缓冲场景，可以无对白，但须推进人物决定、关系或下一步准备。"
             )
         sanity = scene.get("sanity_score", 0.8)
         if sanity < 0.6:
@@ -126,8 +135,7 @@ class WriterAgent:
         for i, item in enumerate(items, 1):
             lines.append(f"  {i}. {item}")
         lines.append(
-            "\n修完后自查：上面每条都改了吗？"
-            "有没有顺手把禁用词（然而/因此/于是/不禁/愈发/深邃/宛若/在这一刻）带回来？"
+            "\n修完后自查：问题是否解决，是否保留人物意图、因果和已有结果？"
         )
         lines.append("════════════════════════════════")
         return "\n".join(lines)
@@ -152,15 +160,17 @@ class WriterAgent:
             return full_chapter
         log.info(f"Writer — 应用 {len(patch_instructions)} 条修订指示")
 
-        from engine.prompts_loader import _banned_words_inline
+        from engine.prompts_loader import _banned_words_inline, _style_file
         instructions_text = "\n".join(f"{i+1}. {p}" for i, p in enumerate(patch_instructions))
         prompt = (
+            "【本章计划与预算】\n" + json.dumps(plan_json, ensure_ascii=False) + "\n\n" +
             "你是有十年经验的网文作者，现在在番茄连载。请根据以下【修改清单】逐条修订正文，"
             "每一条都必须执行，不得跳过。只改清单涉及的部分，其余保留原文。\n\n"
             "【修改清单】\n"
             + instructions_text +
             "\n\n【铁律——修改时同样适用】\n"
             + _banned_words_inline() +
+            "\n" + _style_file("story_rules.md") +
             "\n修订后不得引入新的机械违规（扫描器会复检）。\n\n"
             f"【原文】\n{full_chapter}\n\n"
             "输出修订后的完整正文，不要任何说明或注释。"

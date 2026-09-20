@@ -60,6 +60,7 @@ class PipelineTestCase(unittest.TestCase):
         out = self.client.get("/api/novels/pipe/pipeline").json()
         self.assertEqual(out["stage"], "outline")
         self.assertEqual(out["next_chapter"], 1)
+        self.assertEqual(out["pending_count"], 0)  # 待人工修订队列为空
         self.assertFalse(self.step(out, "outline")["done"])
         self.assertFalse(self.step(out, "titles")["available"])  # 依赖大纲
 
@@ -141,6 +142,8 @@ class BatchTaskShapeTests(unittest.TestCase):
         self.client.post("/api/novels", json={
             "id": "batch", "title": "批量", "chapter_count": 30, "words_per_chapter": 2000})
         book = self.novels_dir / "batch"
+        for chapter in (1, 2):
+            (book / "generated" / f"chapter_{chapter:02d}.md").write_text("定稿正文", encoding="utf-8")
         outline = "\n".join(
             f"- **第{n}章 名{n}**：剧情。*功能：推进；伏笔：无*"
             for n in range(1, 31))

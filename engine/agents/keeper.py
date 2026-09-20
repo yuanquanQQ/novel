@@ -55,6 +55,8 @@ class KeeperAgent:
         system, _ = get_prompt("keeper")
         prompt = system.format(scene_draft=draft, scene_id=scene_id)
         result = self._call_llm(prompt)
+        if not isinstance(result, dict) or not str(result.get("plot_progress", "")).strip():
+            raise ValueError("记忆压缩结果缺少 plot_progress")
         result.update({
             "chapter_num": chapter_num,
             "scene_id": scene_id,
@@ -91,6 +93,7 @@ class KeeperAgent:
         keeper_cache["all_scenes"] = [full_chapter]
         keeper_cache["scene_count"] = 1
         keeper_cache["current_chapter_snapshots"] = [snapshot]
+        keeper_cache["source_hash"] = hashlib.sha256(full_chapter.encode("utf-8")).hexdigest()
         keeper_cache["running_context"] = self._build_running_context(
             keeper_cache.get("carry_context", []), [snapshot],
         )
@@ -100,6 +103,7 @@ class KeeperAgent:
         cache_file = self.cache_dir / f"keeper_cache_{chapter_num:02d}.json"
         current = keeper_cache.get("current_chapter_snapshots", [])
         save_data = {
+            "source_hash": keeper_cache.get("source_hash", ""),
             "chapter": keeper_cache.get("chapter", chapter_num),
             "carry_context": keeper_cache.get("carry_context", []),
             "current_chapter_snapshots": current,
@@ -109,9 +113,8 @@ class KeeperAgent:
             "characters": keeper_cache.get("characters", {}),
             "clues": keeper_cache.get("clues", {}),
         }
-        cache_file.write_text(
-            json.dumps(save_data, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
+        from engine.pending import _atomic_write
+        _atomic_write(cache_file, json.dumps(save_data, ensure_ascii=False, indent=2))
         log.info(f"Keeper 缓存已保存: {cache_file}")
 
     def invalidate_from(self, chapter_num: int) -> int:

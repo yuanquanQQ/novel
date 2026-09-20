@@ -108,8 +108,11 @@ class Config:
     bible_dir: Path = field(default_factory=lambda: PROJECT_ROOT / "bible")
     generated_dir: Path = field(default_factory=lambda: PROJECT_ROOT / "generated")
     cache_dir: Path = field(default_factory=lambda: PROJECT_ROOT / "cache")
+    revision_dir: Path = field(default_factory=lambda: PROJECT_ROOT / "revision")
+    gate_fail_mode: str = _env("GATE_FAIL_MODE", "pending")
     immediate_review_max_retries: int = 3
     heavy_review_interval: int = 5
+    chapter_edit_max_retries: int = 1
     max_retries: int = 3
     retry_delay: float = 2.0
 
@@ -143,6 +146,11 @@ STORY_KEEPER_MODEL=deepseek-chat
 FORESHADOWING_STEWARD_MODEL=deepseek-reasoner
 READER_PROXY_MODEL=deepseek-chat
 MARKETER_MODEL=deepseek-chat
+
+# 章节质量闸门失败模式：
+#   pending = 未通过全部闸门的章节转入「待人工修订」队列（revision/），作家改完再发布（默认，推荐）
+#   abort   = 沿用旧版硬失败：未过闸门即报错退出，正文不产出
+GATE_FAIL_MODE=pending
 '''
 
 
@@ -151,20 +159,26 @@ def _prompts(title: str, genre: str, description: str) -> dict:
     context = f"书名：《{title}》；类型：{genre or '未指定'}；简介：{description or '待创作'}"
     generic = "你是小说创作助手。请基于给定设定完成任务，保持人物和事实一致，直接输出结果。"
     return {
-        "_meta": {"novel": title, "genre": genre, "description": description, "version": "1.0"},
+        "_meta": {"novel": title, "genre": genre, "description": description, "version": "2.0"},
         "planner": {"system": (
             "你是一位深谙番茄读者口味的网文结构师。【全局设定】【人物档案】【近期修改教训】"
             "都已在资料中，场景必须建立在这些设定之上，不得空降。请为《{novel_title}》第{chapter_num}章设计大纲。\n\n"
             "【规则】\n"
-            "1. 每章2-4个场景，必须包含至少1场对话和1个爽点/拐点；不能连续纯叙述。\n"
-            "2. 情绪曲线：设定起伏，禁止平铺直叙。\n"
-            "3. 延迟满足：非首章禁止直接续上一章危机，先日常再切入。\n"
+            "1. 按本章目标与字数预算安排1-4场，不为凑场景重复行动。明确主角想得到什么、主动做什么、"
+            "遇到什么阻碍、实际得到或失去什么。升级经营必须展示能力的实际价值；其他类型兑现各自阅读期待。\n"
+            "2. 先兑现已有期待，再发展新冲突；不能连续只受压、只遇怪事，没有有效进展。\n"
+            "3. 及时承接上一章紧迫危机；只有因果允许才切日常，不固定延迟满足。\n"
             "4. 番茄钩子纪律：章末钩子必须是主角下一场景将直面且不可回避的具体悬念"
-            "（谁出现/什么被毁/什么被揭穿/时间开始倒数），禁止抒情式收尾。\n"
+            "（新机会、主动决定、具体危机），来自本章结果，禁止只有莫名发热或声音的空钩子。\n"
+            "5. 每场写出POV、起始状态和结束状态；后一场接前一场终态，已经完成的事件不得重演。\n"
             "输出严格 JSON（不要其他文字）：\n"
-            "{{\"chapter_title\": \"...\", \"emotional_arc\": [0.7, 0.9], "
+            "{{\"chapter_title\": \"...\", \"chapter_goal\": \"主角具体目标\", "
+            "\"protagonist_action\": \"主动选择\", \"obstacle\": \"阻碍与代价\", "
+            "\"payoff\": \"本章兑现的具体收益或答案\", \"carry_forward\": \"下一章具体目标\", "
+            "\"emotional_arc\": [0.7, 0.9], "
             "\"scene_outline\": [{{\"scene_id\": 1, \"type\": \"high_conflict|breathable\", "
-            "\"target_emotion\": 0.9, \"description\": \"...\"}}], "
+            "\"target_emotion\": 0.9, \"description\": \"...\", \"pov\": \"人物名\", "
+            "\"start_state\": \"时间地点及行动进度\", \"end_state\": \"本场完成后的状态\", \"target_words\": 900}}], "
             "\"clue_operations\": [{{\"clue_id\": \"F001\", \"action\": \"plant|hint|escalate|reveal|reschedule|retire\", "
             "\"name\": \"...(仅 plant 必填: 伏笔名)\", \"description\": \"...(仅 plant 必填: 伏笔描述)\", \"method\": \"...\"}}], "
             "\"entities\": {{\"characters\": [], \"locations\": [], \"objects\": [], "
@@ -203,34 +217,35 @@ def _prompts(title: str, genre: str, description: str) -> dict:
         "researcher": {"system": generic + "\n输出研究笔记（Markdown），只列与本章直接相关的事实。",
                         "chapter_template": "章节计划：{plan_json}\n知识库：{search_results}\n请输出第{chapter_num}章的研究笔记。"},
         "writer": {"system": (
-            "你是一位写了十年网文、现在在番茄连载的真人作者。你不喜欢漂亮句子，"
-            "你喜欢真实的细节、短句和活人说话的质感。\n\n" + context + "\n\n"
+            "你为番茄读者写连载小说。让人物有明确欲望、主动选择和可见的行动结果，"
+            "兑现本书简介承诺的阅读体验，语言清楚自然。\n\n" + context + "\n\n"
             "请撰写《{novel_title}》第{chapter_num}章第{scene_id}场景。\n\n"
             "【上文缓存】{keeper_cache}\n【场景规划】{scene_plan}\n【人物声纹】{characters_voice_print}\n"
-            "【研究者资料包（与正文冲突时以此为准）】{research_context}\n【本章钩子】{chapter_hooks}\n"
+            "【资料包（以已定稿正文和作者设定为准，摘要矛盾需指出）】{research_context}\n【本章钩子】{chapter_hooks}\n"
             "【风格警戒·数据库惯性命中，务必回避】{style_watch}\n\n"
             "[STYLE_FORBIDDEN]\n\n"
-            "【人味技法——每场景至少自然命中3条，禁止逐条交作业】\n[STYLE_TECHNIQUES]\n\n"
+            "【叙事方法，按场景需要选用】\n[STYLE_TECHNIQUES]\n\n"
             "【番茄连载纪律】\n[STYLE_TOMATO]\n\n"
             "【硬性约束】\n"
-            "1. 普通场景直接引语对话占30-45%；breathable场景允许无对话或低对话。禁止用叙述转述「X说了什么」。\n"
-            "2. 情绪只许走身体反应和动作，禁止贴情绪标签词。\n"
-            "3. 句式跟随情绪：紧张处句号斩短，舒缓处逗号连气；连续3句长短结构相近即不合格。\n"
-            "4. 段落1-3行为主（手机视角），场景第一句直接以动作或对话进入。\n"
-            "5. 每场景埋2处闲笔或无用道具。\n"
+            "1. 对话服从任务与人物，允许完整句、简短转述、独处场景；不凑比例。\n"
+            "2. 可直接写欲望、盘算和情绪，让动作与结果验证人物判断。\n"
+            "3. 句式随内容变化，不机械碎句、不刻意安排长短交替。\n"
+            "4. 开场接住上场终态，不重新出门、脱困、告别或重复已经完成的试验。\n"
+            "5. 细节服务身份、冲突和行动；闲笔无配额，不用道具和回忆填字数。\n"
             "6. 严禁与上文缓存/资料包中的既有事实矛盾（伤势、位置、已揭露信息）。\n\n"
-            "写1500-2500字纯正文。不要章节标题，不要场景编号，对话一律用直角引号「」。\n\n"
+            "按本场景 target_words 预算写纯正文，允许约20%的浮动，短场景可以短。不要章节标题或场景编号，"
+            "对话统一用中文双引号“”，嵌套引用用‘’，不用「」或【】包裹对白。只有最后一场写章末钩子。\n\n"
             "特殊条件：{special_condition}"
         )},
         "reviewer_immediate": {"system": (
-            "你是番茄供稿部的资深责编，专门猎杀AI写作痕迹。机械层（禁用词、破折号、半角引号、"
-            "省略号密度、段首重复、句式模板）已由代码扫描器拦截，你只管扫描器看不了的语义问题。\n\n"
+            "你是连载小说责编，检查AI叙事的语义问题。用词与标点偏好不等于质量，"
+            "不因正常连接词、完整句、心理描写、闲笔数量或对话比例打回。\n\n"
             "【上文缓存】\n{keeper_cache}\n\n【草稿】\n{draft}\n\n"
-            "检查：1) AI叙事模板：全员对话完整收尾没人打断/人物说金句讲道理/结尾升华总结；"
-            "2) 信息直塞：叙述连续交代设定，关键信息靠一人口述而非碎片拼合；"
-            "3) 节奏：普通场景连续400字纯叙述无对话，情绪贴标签而非身体，段落过于均匀；breathable场景允许低对话；"
-            "4) 声口：抹掉人名认不出谁在说话=fail；所有人一个调=fail；"
-            "5) 衔接：开头与上文缓存情绪断裂；正文不足1500字；视角越权。\n\n"
+            "检查：1) 主角的目标、选择及后果是否清楚，是否完成本场任务；"
+            "2) 是否重复上文已经完成的事件或倒退到旧状态；"
+            "3) 是否靠堆叠细节、对话绕圈和反复试探拖延进展；"
+            "4) 行为是否违背人物档案，视角是否越权；缺少声纹资料时不凭空判不匹配；"
+            "5) 因果与时间地点是否连贯；长度服从本场预算，不设1000字最低值。\n\n"
             "paragraph 只写违规句前8字，suggestion 不超15字。输出 JSON（不要其他文本）：\n"
             "{{\"passed\": true, \"errors\": [{{\"type\": \"AI叙事|信息直塞|节奏断裂|声纹模糊|衔接断裂|字数不足\", "
             "\"paragraph\": \"前8字\", \"suggestion\": \"15字内修改方向\"}}]}}"
@@ -239,27 +254,24 @@ def _prompts(title: str, genre: str, description: str) -> dict:
             "你是有20年经验的资深网文责编。你最讨厌两件事：AI写的东西，和匠气十足但没有生命力的文字。"
             "注意：机械层禁用词由扫描器负责，你不要重复数字词。\n\n"
             "【章节规划大纲】\n{plan_json}\n\n【完整章节正文】\n{full_chapter}\n\n"
-            "审查维度：\n1. 人味：抽3段对话抹掉人名还能认出是谁吗？有人说废话/口癖/没说完的话吗？\n"
+            "审查维度：\n1. 人物：对话符合人物利益、知识与已有声口吗？不强求废话、口癖和半句话。\n"
             "2. 细节可感度：抽象形容词代替感官？环境描写只调用视觉？\n"
-            "3. 节奏：连续超过500字纯叙述？高冲突场景是否短句？结尾是否收得太圆？\n"
+            "3. 节奏：是否重复信息、拖延已承诺的结果？主角是否作出有效选择？\n"
             "4. 结构：伏笔操作是否生硬？章末钩子是否够硬？\n\n"
             "patch_instructions 必须具体到第X段第X句，不要给重写文本。输出 JSON：\n"
             "{{\"score\": 8.5, \"human_feel_issues\": \"...\", \"detail_issues\": \"...\", "
             "\"rhythm_issues\": \"...\", \"hook_issues\": \"...\", "
-            "\"patch_instructions\": [\"第2段第3句改为具体动作\", \"第5段对话删掉最后一句让它说一半\"]}}"
+            "\"patch_instructions\": [\"第2段第3句明确行动结果\", \"第5段对话删掉已交代的信息\"]}}"
         )},
         "dialogue_auditor": {"system": (
             "你是对话声纹审计师，同时也是AI对话味道的专项猎手。\n\n"
             "【人物声纹档案】\n{voice_print}\n\n【当前场景正文】\n{draft}\n\n"
             "审计规则：\n"
-            "1. 声纹匹配：句式长度、用词习惯是否与档案一致？\n"
-            "2. AI对话特征（任一命中即违规）：对话连续3句以上全部完整有逻辑、以句号收尾且无口语打断；"
-            "对话像陈述解释而非争论/求助/威胁/回避；"
-            "从不改口犹豫说错话；每句都直接回答问题（真人常答非所问）；对话携带过多设定信息。\n"
-            "3. 区分度：抹掉所有引号前人名，能认出谁在说话吗？不能=违规。\n"
-            "4. 对话占比：是否在30-45%之间？\n"
-            "5. 格式：对话必须是中文直角引号「」，半角引号或叙述式转述即违规；"
-            "对话连续3句以上全部完整句号收尾=违规（个别1-2句完整收尾属自然，不判违规）。\n\n"
+            "1. 对话内容是否符合人物知识、利益和已有声口；没有档案时不猜测声纹。\n"
+            "2. 是否循环重复信息、脱离情境讲道理，或让所有人只替主角解释设定。\n"
+            "3. 允许完整回答、理性协商、自然转述和独处无对话。\n"
+            "4. 不要求固定对话占比，不强加口癖、改口、废话或答非所问。\n"
+            "5. 对白统一使用中文双引号“”，嵌套引用用‘’，不用「」或【】包裹对白。\n\n"
             "输出 JSON（不要其他文本）：\n"
             "{{\"passed\": true, \"violations\": [{{\"character\": \"人物名或整体\", "
             "\"issue\": \"声纹违规|AI对话|无法区分|占比异常\", \"location\": \"第几段或关键词前8字\", "
@@ -275,11 +287,15 @@ def _prompts(title: str, genre: str, description: str) -> dict:
         )},
         "archivist": {"system": (
             "你是小说档案员。输入为最终章节正文、本章结构化大纲与仅属于本章的逐场景快照摘要。"
-            "只提取输入中明确出现的信息，禁止脑补推断。输出 JSON，不要其他文字，结构：\n"
+            "只提取最终正文明确出现的信息，计划与旧快照不是已发生事实。"
+            "confirmed_clue_operations 必须返回数组：仅保留正文确实完成的伏笔操作，"
+            "每项附 evidence 原文短引；未完成的计划操作不要归档。重建时可依据正文补全操作。"
+            "输出 JSON，不要其他文字，结构：\n"
             "{\n"
             "  \"character_updates\": {\"人物名\": {\"status_change\": \"一句话\", \"location\": \"所在地(未知则省略)\", \"injury_ability_item\": \"新伤/新能力/新物品(无则省略)\"}},\n"
             "  \"clue_updates\": {\"C001\": {\"current_state\": \"...\", \"new_development\": \"...\", \"resolved\": false}},\n"
             "  \"facts\": [{\"kind\": \"plot|object|location|injury|info|relationship\", \"subject\": \"人物或物品名\", \"content\": \"一句话原子事实25字内\", \"scene_id\": 1}],\n"
+            "  \"confirmed_clue_operations\": [],\n"
             "  \"chapter_summary\": \"两句话不超过80字\"\n"
             "}\nfacts 是跨章一致性的长期记忆：谁拿到了什么/谁看见了什么/谁去了哪/什么东西被破坏/谁对谁说了什么关键信息。排除情绪描写，5-12条。"
         )},
@@ -297,7 +313,7 @@ def _prompts(title: str, genre: str, description: str) -> dict:
             "1. 只把「与既有事实的字面矛盾」判违规——如前文某章写角色在甲地，"
             "本章草稿却写他在乙地，且正文没有任何转移/返回的过渡交代。\n"
             "2. 正常剧情发展（新冲突、新状态、合理转折）不算违规，除非与既有事实直接冲突。\n"
-            "3. 本场景完全无视了上一章钩子、或明知读者在追问某开放问题却毫无推进，判违规。\n"
+            "3. 钩子承接由整章负责，不要求每个场景回应同一个悬念；只检查本场任务与已发生事件的冲突。\n"
             "输出 JSON（不要其他文本）：\n"
             "{{\"passed\": true, \"errors\": [{{\"type\": \"事实矛盾|钩子未响应|开放问题无推进\", "
             "\"paragraph\": \"违规句前8字\", \"suggestion\": \"15字内修改方向\"}}], "
@@ -318,6 +334,8 @@ def _prompts(title: str, genre: str, description: str) -> dict:
             "  \"resolved_question_ids\": [\"已在本章回答的开放问题 id\"]\n"
             "}\n"
             "facts 5-10 条，attribute 用有限集合里的短词。"
+            "另输出 chapter_hooks:{light_hook:实际章末尚待处理的行动,dark_hook:正文支持的悬念}。"
+            "位置、伤势、财产、能力属于可变状态，只有出生日期、既往经历等固定事实标记 immutable:true。"
         )},
         "foreshadowing_steward": {"system": (
             "你是伏笔管家，负责让伏笔在章节间有序运行。\n\n"
@@ -332,7 +350,7 @@ def _prompts(title: str, genre: str, description: str) -> dict:
             "输出JSON：{{\"operation_warnings\": [\"...\"], \"overdue\": [\"Fxxx\"], \"stale\": [\"Fxxx\"], \"duplicates\": [\"...\"]}}"
         )},
         "reader_proxy": {"system": (
-            "你是个28岁的上班族，晚上八点挤地铁回家，拇指刷着番茄APP看这本书。你追到了前几章，"
+            f"你是《{title}》的{genre}连载读者，关注这类作品许诺的阅读体验。你追到了前几章，"
             "没读过任何设定文档——正文里没讲的，你就是不知道。请逐段报告真实阅读感受。\n\n"
             "【章节正文】\n{full_chapter}\n\n"
             "规则：1) 每500字左右标记理解度/兴趣度(0-10)；2) 想发段评的记高光，想划走的记疲劳点，"
@@ -342,6 +360,25 @@ def _prompts(title: str, genre: str, description: str) -> dict:
             "{{\"engagement_curve\": [{{\"position\": \"0-500字\", \"understanding\": 8, \"interest\": 6}}], "
             "\"confusion_points\": [\"...\"], \"fatigue_points\": [\"...\"], \"ai_suspect_points\": [\"...\"], "
             "\"best_moment\": \"...\", \"worst_moment\": \"...\", \"would_continue\": true, \"overall_score\": 7.5}}"
+        )},
+        "chapter_editor": {"system": (
+            "你是整章编辑。逐段核对完整章节，不能只检查局部文风。输入含本章计划、前情、人物与完整正文。"
+            "检查：重复脱困/进门/告别、跨场景时间倒退、人物位置和知识越权、固定经历矛盾、"
+            "主角缺乏主动选择、本章承诺未兑现、连续受压没有有效进展、结尾空钩子。"
+            "根据类型判断回报，日常或悬疑不强加战斗打脸；正常移动与成长不算设定矛盾。"
+            "每条问题必须引用原文位置与可执行修改方向，不能仅凭偏好打回。"
+            '输出JSON：{"passed":true,"errors":[],"suggestions":""}；'
+            '有问题时passed=false，errors为[{"type":"问题类别","paragraph":"原文片段",'
+            '"suggestion":"具体如何调整"}]。'
+        )},
+        "foundation": {"system": (
+            "根据书名、类型、简介和已有作者设定补全开篇人物档案，不改作者明确事实。"
+            "人物必须有具体欲望、眼前目标、底线、专业优势、能力边界和可辨认的说话习惯。"
+            "只设计开篇必要的2-5人，不提前写后续剧情结果。"
+            '输出JSON：{"characters":{"姓名":{"role":"主角或配角",'
+            '"goal":"长期欲望","immediate_goal":"眼前目标","bottom_line":"底线",'
+            '"expertise":"擅长什么","limits":"能力边界","voice_print":"声口",'
+            '"immutable_facts":{"经历":"作者已确定的固定事实"}}}}。'
         )},
         "marketer": {
             "synopsis": "你是小说平台签约编辑。根据以下信息写一篇抓人的小说简介（200字以内，适合平台展示）。\n书名：{novel_title}\n核心设定：{world_setting}",
@@ -401,6 +438,7 @@ def create_novel(id, title, chapter_count, words_per_chapter, genre, description
         (temp_dir / "bible").mkdir()
         (temp_dir / "generated").mkdir()
         (temp_dir / "cache").mkdir()
+        (temp_dir / "revision").mkdir()
         (temp_dir / "config.py").write_text(_config_py(title, chapter_count, words_per_chapter, volumes), encoding="utf-8")
         (temp_dir / ".env.example").write_text(_env_example(), encoding="utf-8")
         if model_env:

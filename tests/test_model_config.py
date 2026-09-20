@@ -7,6 +7,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -219,14 +220,14 @@ class TestFactoryPrompts(ModelConfigTestCase):
         from engine import prompts_loader
         prompts_loader.reload()
         system, _ = prompts_loader.get_prompt("writer")
-        self.assertIn("句式情绪同步", system)
+        self.assertIn("句长服从语意", system)
         self.assertIn("番茄连载纪律", system)
         out = system.format(novel_title="T", chapter_num=1, scene_id=1,
                             keeper_cache="K", scene_plan="S",
                             characters_voice_print="V", research_context="R",
                             chapter_hooks="H", special_condition="X",
                             style_watch="W")
-        self.assertIn("句式情绪同步", out)
+        self.assertIn("句长服从语意", out)
         self.assertNotIn("[STYLE_FORBIDDEN]", out)
         self.assertNotIn("{keeper_cache}", out)
 
@@ -269,6 +270,26 @@ class TestFactoryPrompts(ModelConfigTestCase):
         self.assertIn("ok", body)
         self.assertFalse(body["ok"])
         self.assertTrue(body.get("error"))
+
+    def test_connection_allows_slow_model_cold_start(self):
+        path = novel_creator.create_novel(
+            "slow-book", "慢启动模型", 3, 1000, "都市", "简介")
+        completion = SimpleNamespace(choices=[SimpleNamespace(
+            message=SimpleNamespace(content="正常"))])
+        with patch("openai.OpenAI") as openai_client:
+            openai_client.return_value.chat.completions.create.return_value = completion
+            result = model_config.test_connection(
+                path, "slow-model", api_key="sk-test", base_url="https://example.test/v1")
+
+        self.assertTrue(result["ok"])
+        openai_client.assert_called_once_with(
+            api_key="sk-test", base_url="https://example.test/v1",
+            timeout=180, max_retries=0)
+        openai_client.return_value.chat.completions.create.assert_called_once_with(
+            model="slow-model",
+            messages=[{"role": "user", "content": "ping，请只回复两个字"}],
+            max_tokens=8, temperature=0,
+        )
 
 
 if __name__ == "__main__":
